@@ -842,7 +842,7 @@ func TestPrepareStartCandidate_UsesAssignedWorkSnapshotForTaskWorkDir(t *testing
 		Agents: []config.Agent{
 			{Name: "worker", Dir: "frontend", MinActiveSessions: intPtr(1), MaxActiveSessions: intPtr(2)},
 		},
-	}, nil, store, &clock.Fake{Time: time.Date(2026, 3, 8, 12, 0, 0, 0, time.UTC)}, nil, newAssignedTaskWorkDirResolver("", []beads.Bead{task}))
+	}, nil, store, beads.WorkStore{Store: store}, &clock.Fake{Time: time.Date(2026, 3, 8, 12, 0, 0, 0, time.UTC)}, nil, newAssignedTaskWorkDirResolver("", []beads.Bead{task}))
 	if err != nil {
 		t.Fatalf("prepareStartCandidateForCity: %v", err)
 	}
@@ -3740,7 +3740,7 @@ func TestCommitAsyncStartResult_IgnoresCommandChangedDuringStartup(t *testing.T)
 	}
 }
 
-func TestCommitAsyncStartResult_PreservesRuntimeWhenRefreshFails(t *testing.T) {
+func TestCommitAsyncStartResult_PreservesRuntimeAndLeaseWhenRefreshFails(t *testing.T) {
 	store := &getErrorStore{MemStore: beads.NewMemStore()}
 	clk := &clock.Fake{Time: time.Date(2026, 4, 26, 12, 2, 50, 0, time.UTC)}
 	session, err := store.Create(beads.Bead{
@@ -3797,8 +3797,11 @@ func TestCommitAsyncStartResult_PreservesRuntimeWhenRefreshFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := updated.Metadata["last_woke_at"]; got != "" {
-		t.Fatalf("last_woke_at = %q, want cleared so the next tick can recover or retry", got)
+	if got, want := updated.Metadata["last_woke_at"], session.Metadata["last_woke_at"]; got != want {
+		t.Fatalf("last_woke_at = %q, want authoritative read failure to leave lease %q untouched", got, want)
+	}
+	if updated.Revision != session.Revision {
+		t.Fatalf("revision = %d, want %d after authoritative read failure", updated.Revision, session.Revision)
 	}
 }
 
@@ -4416,6 +4419,7 @@ func TestRefreshConfiguredNamedStartCandidateAddsCurrentSkillFingerprint(t *test
 		cfg,
 		runtime.NewFake(),
 		store,
+		beads.WorkStore{Store: store},
 		&clock.Fake{Time: time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC)},
 		ioDiscard{},
 	)

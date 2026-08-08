@@ -237,8 +237,35 @@ func ResolveTmuxAlias(cityPath, cityName string, a config.Agent, rigs []config.R
 }
 
 // ResolveWorkDirPathStrict returns the effective session working directory and
-// surfaces work_dir template errors to callers that need to fail closed.
-func ResolveWorkDirPathStrict(cityPath, cityName, qualifiedName string, a config.Agent, rigs []config.Rig) (string, error) {
+// surfaces work_dir template errors to callers that need to fail closed. An
+// agent that forbids project hooks must supply at least one locally attested
+// provider discovery root; the resolver then applies the external,
+// per-instance isolation fence and returns the canonical filesystem path.
+// Supplying roots explicitly retains the same isolation option for callers
+// whose policy is represented outside config.Agent.
+func ResolveWorkDirPathStrict(cityPath, cityName, qualifiedName string, a config.Agent, rigs []config.Rig, forbiddenDiscoveryRoots ...string) (string, error) {
+	path, err := resolveWorkDirPathStrict(cityPath, cityName, qualifiedName, a, rigs)
+	if err != nil {
+		return path, err
+	}
+	if a.ForbidsProjectHooks() && len(forbiddenDiscoveryRoots) == 0 {
+		return "", fmt.Errorf("agent %q: project hook isolation requires at least one attested provider discovery root", a.QualifiedName())
+	}
+	if len(forbiddenDiscoveryRoots) == 0 {
+		return path, nil
+	}
+	return validateForbiddenProjectHooksWorkDir(
+		cityPath,
+		cityName,
+		qualifiedName,
+		a,
+		rigs,
+		path,
+		forbiddenDiscoveryRoots,
+	)
+}
+
+func resolveWorkDirPathStrict(cityPath, cityName, qualifiedName string, a config.Agent, rigs []config.Rig) (string, error) {
 	if a.WorkDir == "" {
 		if rigName := ConfiguredRigName(cityPath, a, rigs); rigName != "" {
 			if rigRoot := RigRootForName(rigName, rigs); rigRoot != "" {
@@ -255,12 +282,25 @@ func ResolveWorkDirPathStrict(cityPath, cityName, qualifiedName string, a config
 	return ResolveDirPath(cityPath, expanded), nil
 }
 
+// ResolveConfiguredWorkDirPath returns the effective work directory described
+// by configuration without attesting provider discovery roots or touching the
+// filesystem. It is only for read-only projections of an existing session;
+// callers that can launch a session must use ResolveWorkDirPathStrict.
+func ResolveConfiguredWorkDirPath(cityPath, cityName, qualifiedName string, a config.Agent, rigs []config.Rig) (string, error) {
+	return resolveWorkDirPathStrict(cityPath, cityName, qualifiedName, a, rigs)
+}
+
 // ResolveWorkDirPath returns the effective session working directory for an
 // agent. When work_dir is unset, rig-scoped agents continue to use their rig
-// root for backward compatibility.
+// root for backward compatibility. A forbid-policy agent returns an empty path
+// when the strict isolation contract cannot be attested; callers that can
+// launch sessions must use ResolveWorkDirPathStrict and handle its error.
 func ResolveWorkDirPath(cityPath, cityName, qualifiedName string, a config.Agent, rigs []config.Rig) string {
 	path, err := ResolveWorkDirPathStrict(cityPath, cityName, qualifiedName, a, rigs)
 	if err != nil {
+		if a.ForbidsProjectHooks() {
+			return ""
+		}
 		ctx := PathContextForQualifiedName(cityPath, cityName, qualifiedName, a, rigs)
 		return ResolveDirPath(cityPath, ExpandTemplate(a.WorkDir, ctx))
 	}

@@ -1,0 +1,24 @@
+[pack]
+name = "masontopia"
+# Compatibility projection only: the byte-exact preserved candidate's inline
+# [[agent]] tables are rejected beside Masontopia's real schema-2 city pack.
+schema = 1
+
+[imports.bd]
+source = "./fixture-packs/bd"
+
+[imports.core]
+source = "./fixture-packs/core"
+
+[imports.gascity]
+source = "./fixture-packs/gascity"
+
+[imports.gc]
+source = "./fixture-packs/gascity/roles"
+
+[imports.superpowers]
+source = "./fixture-packs/superpowers"
+
+[[named_session]]
+template = "mayor"
+mode = "always"

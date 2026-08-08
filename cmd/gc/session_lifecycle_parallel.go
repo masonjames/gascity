@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/agentutil"
 	"github.com/gastownhall/gascity/internal/api"
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
@@ -164,6 +165,93 @@ type startCandidate struct {
 	info  sessionpkg.Info
 	tp    TemplateParams
 	order int
+	// strictLaunch carries the policy decision captured with expectedWitness.
+	// currentProcessingBeadID is deferred for every bead-backed automatic
+	// candidate until the same under-lock witness validation that gates every
+	// other wake-preparation mutation.
+	strictLaunch            bool
+	capturedRevision        int64
+	revisionCaptured        bool
+	expectedWitness         sessionpkg.LiveBoundaryWitness
+	currentProcessingBeadID string
+	policyErr               error
+}
+
+// captureStartCandidateForWake is the sole production constructor for a
+// reconciler wake candidate. A complete persisted trigger pair is captured for
+// every policy so routed inherit sessions cannot silently adopt a repointed
+// trigger at later live-action boundaries. Strict policy additionally defers
+// current-work mutation until preparation revalidates that pair under the
+// session mutation lock.
+func captureStartCandidateForWake(
+	info sessionpkg.Info,
+	tp TemplateParams,
+	order int,
+	cfg *config.City,
+	currentProcessingBeadID string,
+	revisions ...int64,
+) startCandidate {
+	candidate := startCandidate{
+		info:                    info,
+		tp:                      tp,
+		order:                   order,
+		currentProcessingBeadID: strings.TrimSpace(currentProcessingBeadID),
+	}
+	if len(revisions) > 0 {
+		candidate.capturedRevision = revisions[0]
+		candidate.revisionCaptured = true
+	}
+	triggerID := strings.TrimSpace(info.TriggerBeadID)
+	triggerStoreRef := strings.TrimSpace(info.TriggerBeadStoreRef)
+	if triggerID != "" || triggerStoreRef != "" {
+		candidate.expectedWitness = sessionpkg.LiveBoundaryWitness{
+			TriggerBeadID:       triggerID,
+			TriggerBeadStoreRef: triggerStoreRef,
+		}
+	}
+	resolution, err := agentutil.ResolvePersistedSessionAgent(cfg, info)
+	if err != nil {
+		candidate.policyErr = err
+		candidate.strictLaunch = true
+		return candidate
+	}
+	if !resolution.Strict {
+		return candidate
+	}
+	candidate.strictLaunch = true
+	return candidate
+}
+
+// validateAutomaticWakeCurrent applies the automatic controller truth table
+// captured with a start candidate: partial trigger pairs are invalid, an
+// unbound candidate remains valid only while the current row is also unbound,
+// and a complete pair must still match exactly. Strict candidates additionally
+// require a complete pair even when both captured fields were absent.
+func (c startCandidate) validateAutomaticWakeCurrent(current sessionpkg.Info) error {
+	if c.policyErr != nil {
+		return c.policyErr
+	}
+	expectedID := strings.TrimSpace(c.expectedWitness.TriggerBeadID)
+	expectedStoreRef := strings.TrimSpace(c.expectedWitness.TriggerBeadStoreRef)
+	if (expectedID == "") != (expectedStoreRef == "") {
+		return fmt.Errorf("%w: automatic start requires a complete trigger pair", sessionpkg.ErrLiveBoundaryWitnessMismatch)
+	}
+	if c.strictLaunch && expectedID == "" {
+		return fmt.Errorf("%w: strict automatic start requires a trigger pair", sessionpkg.ErrLiveBoundaryWitnessMismatch)
+	}
+	return sessionpkg.ValidateReconcilerWakeInfo(current, c.expectedWitness)
+}
+
+func (c startCandidate) mutationBoundary() reconcilerMutationBoundary {
+	return reconcilerMutationBoundary{
+		captured:         c.info,
+		capturedRevision: c.capturedRevision,
+		revisionCaptured: c.revisionCaptured,
+		expected:         c.expectedWitness,
+		strict:           c.strictLaunch,
+		enforce:          strings.TrimSpace(c.info.ID) != "",
+		policyErr:        c.policyErr,
+	}
 }
 
 // name reads the RAW session_name metadata off the typed twin
@@ -313,6 +401,7 @@ type startExecutionOptions struct {
 	// deferred under storeQueryPartial today.
 	deferSessionClosesOnBoot bool
 	readyAssignedFlags       []bool
+	canonicalCityWorkStore   beads.WorkStore
 }
 
 type startExecutionOption func(*startExecutionOptions)
@@ -373,6 +462,12 @@ func withTaskWorkDirResolver(resolver taskWorkDirResolver) startExecutionOption 
 	}
 }
 
+func withCanonicalCityWorkStore(store beads.WorkStore) startExecutionOption {
+	return func(opts *startExecutionOptions) {
+		opts.canonicalCityWorkStore = store
+	}
+}
+
 func withStartStabilityWaiter(waiter startStabilityWaiter) startExecutionOption {
 	return func(opts *startExecutionOptions) {
 		opts.stabilityWaiter = waiter
@@ -418,6 +513,7 @@ type asyncStartTracker struct {
 	mu               sync.Mutex
 	wg               sync.WaitGroup
 	stopping         bool
+	barrier          bool
 	drainAckStopKeys sync.Map
 }
 
@@ -427,11 +523,50 @@ func (t *asyncStartTracker) start() (func(), bool) {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.stopping {
+	if t.stopping || t.barrier {
 		return nil, false
 	}
 	t.wg.Add(1)
 	return t.wg.Done, true
+}
+
+// beginBarrier prevents new tracked automatic actions and waits for every
+// action already admitted to finish. Config/provider reload holds this barrier
+// through the live pointer swap, so a detached action can never execute against
+// the prior controller generation after the replacement becomes authoritative.
+func (t *asyncStartTracker) beginBarrier(ctx context.Context) (func(), bool) {
+	if t == nil {
+		return func() {}, true
+	}
+	t.mu.Lock()
+	if t.stopping || t.barrier {
+		t.mu.Unlock()
+		return nil, false
+	}
+	t.barrier = true
+	t.mu.Unlock()
+
+	release := func() {
+		t.mu.Lock()
+		t.barrier = false
+		t.mu.Unlock()
+	}
+	done := make(chan struct{})
+	go func() {
+		t.wg.Wait()
+		close(done)
+	}()
+	if ctx == nil {
+		<-done
+		return release, true
+	}
+	select {
+	case <-done:
+		return release, true
+	case <-ctx.Done():
+		release()
+		return nil, false
+	}
 }
 
 func (t *asyncStartTracker) startDrainAckStop(key string) (func(), bool) {
@@ -702,7 +837,7 @@ func dependencyTemplateAlive(
 			if dependencySessionStartInFlight(store, name, cfg, clk) {
 				continue
 			}
-			if alive, err := workerSessionTargetAliveWithConfig(store, sp, cfg, name, tp.Hints.ProcessNames); err == nil && alive {
+			if obs, err := workerObserveReconcilerTargetWithWitness("", store, sp, cfg, name, tp.Hints.ProcessNames); err == nil && obs.Alive {
 				return true
 			}
 		}
@@ -712,8 +847,8 @@ func dependencyTemplateAlive(
 		return false
 	}
 	depTP := desiredState[sessionName]
-	alive, err := workerSessionTargetAliveWithConfig(store, sp, cfg, sessionName, depTP.Hints.ProcessNames)
-	return err == nil && alive
+	obs, err := workerObserveReconcilerTargetWithWitness("", store, sp, cfg, sessionName, depTP.Hints.ProcessNames)
+	return err == nil && obs.Alive
 }
 
 func dependencySessionStartInFlight(store beads.Store, sessionName string, cfg *config.City, clk clock.Clock) bool {
@@ -820,7 +955,7 @@ func prepareStartCandidate(
 	store beads.Store,
 	clk clock.Clock,
 ) (*preparedStart, error) {
-	return prepareStartCandidateForCity(candidate, "", "", cfg, nil, store, clk, io.Discard, nil)
+	return prepareStartCandidateForCity(candidate, "", "", cfg, nil, store, beads.WorkStore{Store: store}, clk, io.Discard, nil)
 }
 
 func prepareStartCandidateForCity(
@@ -830,10 +965,54 @@ func prepareStartCandidateForCity(
 	cfg *config.City,
 	sp runtime.Provider,
 	store beads.Store,
+	canonicalCityWorkStore beads.WorkStore,
 	clk clock.Clock,
 	stderr io.Writer,
 	workDirResolver taskWorkDirResolver,
+	lockedBeforeWake ...func(sessionpkg.Info) error,
 ) (*preparedStart, error) {
+	expectedID := strings.TrimSpace(candidate.expectedWitness.TriggerBeadID)
+	expectedStoreRef := strings.TrimSpace(candidate.expectedWitness.TriggerBeadStoreRef)
+	if candidate.strictLaunch || expectedID != "" || expectedStoreRef != "" {
+		id := strings.TrimSpace(candidate.info.ID)
+		if id == "" || store == nil || expectedID == "" || expectedStoreRef == "" || !candidate.revisionCaptured {
+			return nil, fmt.Errorf("%w: witnessed start preparation requires a bead-backed session and complete trigger pair", worker.ErrLaunchUnauthorized)
+		}
+		var prepared *preparedStart
+		boundary := captureReconcilerMutationBoundary(candidate.info, cfg, candidate.capturedRevision)
+		boundary.expected = candidate.expectedWitness
+		boundary.strict = candidate.strictLaunch
+		boundary.enforce = true
+		boundary.policyErr = candidate.policyErr
+		boundary = boundary.withRevisionSink(func(revision int64) {
+			candidate.capturedRevision = revision
+			candidate.revisionCaptured = true
+		})
+		_, err := boundary.runPersisted(store, nil, func(current sessionpkg.Info, _ sessionpkg.PersistedResponse, sessFront *sessionpkg.Store) error {
+			if len(lockedBeforeWake) > 0 && lockedBeforeWake[0] != nil {
+				if err := lockedBeforeWake[0](current); err != nil {
+					return err
+				}
+			}
+			if fold := recordCurrentBeadIDOnWake(current, sessFront, candidate.currentProcessingBeadID, stderr); fold != nil {
+				current = current.ApplyPatch(fold)
+			}
+			_, _, fold, err := preWakeCommit(current, sessFront, clk)
+			if err != nil {
+				return err
+			}
+			candidate.info = current.ApplyPatch(fold)
+			leasedStore := sessFront.Store().Store
+			candidate = refreshConfiguredNamedStartCandidate(candidate, cityPath, cityName, cfg, sp, leasedStore, canonicalCityWorkStore, clk, stderr)
+			prepared, _, err = buildPreparedStartWithWorkDirResolver(candidate, cityPath, cfg, leasedStore, workDirResolver)
+			return err
+		})
+		if prepared != nil {
+			prepared.candidate.capturedRevision = candidate.capturedRevision
+			prepared.candidate.revisionCaptured = candidate.revisionCaptured
+		}
+		return prepared, err
+	}
 	if id := strings.TrimSpace(candidate.info.ID); id != "" && store != nil {
 		if err := sessionpkg.WithSessionMutationLock(id, func() error {
 			sessFront := sessionFrontDoor(store)
@@ -850,6 +1029,17 @@ func prepareStartCandidateForCity(
 			if err != nil {
 				return err
 			}
+			if err := candidate.validateAutomaticWakeCurrent(current); err != nil {
+				return err
+			}
+			if len(lockedBeforeWake) > 0 && lockedBeforeWake[0] != nil {
+				if err := lockedBeforeWake[0](current); err != nil {
+					return err
+				}
+			}
+			if fold := recordCurrentBeadIDOnWake(current, sessFront, candidate.currentProcessingBeadID, stderr); fold != nil {
+				current = current.ApplyPatch(fold)
+			}
 			// preWakeCommit persists its PreWakePatch through the front door and returns
 			// the batch; folding it onto the freshly re-read Info keeps the twin
 			// byte-coherent with the persisted state without a second Get. It shares
@@ -864,12 +1054,21 @@ func prepareStartCandidateForCity(
 		}); err != nil {
 			return nil, err
 		}
+	} else if len(lockedBeforeWake) > 0 && lockedBeforeWake[0] != nil {
+		if err := lockedBeforeWake[0](candidate.info); err != nil {
+			return nil, err
+		}
+		_, _, fold, err := preWakeCommit(candidate.info, sessionFrontDoor(store), clk)
+		if err != nil {
+			return nil, err
+		}
+		candidate.info = candidate.info.ApplyPatch(fold)
 	} else if _, _, fold, err := preWakeCommit(candidate.info, sessionFrontDoor(store), clk); err != nil {
 		return nil, err
 	} else {
 		candidate.info = candidate.info.ApplyPatch(fold)
 	}
-	candidate = refreshConfiguredNamedStartCandidate(candidate, cityPath, cityName, cfg, sp, store, clk, stderr)
+	candidate = refreshConfiguredNamedStartCandidate(candidate, cityPath, cityName, cfg, sp, store, canonicalCityWorkStore, clk, stderr)
 	// buildPreparedStart folds its own post-append mutations (stale-resume clears,
 	// session_key / instance_token mints) onto candidate.info at their write sites, so
 	// the returned prepared.candidate.info stays coherent with the store WITHOUT a
@@ -888,6 +1087,7 @@ func refreshConfiguredNamedStartCandidate(
 	cfg *config.City,
 	sp runtime.Provider,
 	store beads.Store,
+	canonicalCityWorkStore beads.WorkStore,
 	clk clock.Clock,
 	stderr io.Writer,
 ) startCandidate {
@@ -904,7 +1104,7 @@ func refreshConfiguredNamedStartCandidate(
 		}
 		return candidate
 	}
-	refreshed, err := resolvePreservedConfiguredNamedSessionTemplate(cityPath, cityName, cfg, sp, store, snapshot.OpenInfos(), candidate.info, clk, stderr)
+	refreshed, err := resolvePreservedConfiguredNamedSessionTemplate(cityPath, cityName, cfg, sp, store, canonicalCityWorkStore, snapshot.OpenInfos(), candidate.info, clk, stderr)
 	if err != nil {
 		if stderr != nil {
 			fmt.Fprintf(stderr, "session reconciler: refreshing named session start %s: %v\n", candidate.name(), err) //nolint:errcheck
@@ -981,10 +1181,27 @@ func buildPreparedStartWithWorkDirResolver(
 	}
 
 	preOverrideWorkDir := agentCfg.WorkDir
+	resolvedWorkDir := ""
 	if wd := resolvePreparedTaskWorkDir(candidate, cityPath, cfg, store, workDirResolver); wd != "" {
-		agentCfg.WorkDir = wd
+		resolvedWorkDir = wd
 	} else if wd := candidate.info.WorkDir; wd != "" {
-		agentCfg.WorkDir = resolveWorkDirAgainstCity(cityPath, wd)
+		resolvedWorkDir = resolveWorkDirAgainstCity(cityPath, wd)
+	}
+	if resolvedWorkDir != "" {
+		if agentCfg.ProjectHooksForbidden {
+			if !samePath(preOverrideWorkDir, resolvedWorkDir) {
+				return nil, candidate.info, fmt.Errorf(
+					"project hook isolation: refusing work_dir override from attested %q to %q",
+					preOverrideWorkDir,
+					resolvedWorkDir,
+				)
+			}
+			// Keep the already-attested canonical bootstrap path. A symlink
+			// spelling may identify the same directory here, but the runtime's
+			// final preflight deliberately rejects non-canonical lexical paths.
+			resolvedWorkDir = preOverrideWorkDir
+		}
+		agentCfg.WorkDir = resolvedWorkDir
 	}
 	// The task work_dir override above can replace agentCfg.WorkDir after
 	// template resolution already rendered PreStart commands (materialize-
@@ -1415,7 +1632,21 @@ func runPreparedStartCandidate(
 	defer cancel()
 	var phases startPhaseTimings
 	startCallBegin := time.Now()
-	startedFresh, err := startPreparedStartCandidate(startCtx, item, cityPath, store, sp, cfg, &phases, sessionStaleKeyDetectionWaiter)
+	startOutcome, err := startPreparedStartCandidateWithCommit(startCtx, item, cityPath, store, sp, cfg, &phases, sessionStaleKeyDetectionWaiter)
+	startedFresh := startOutcome.Attempted
+	if startOutcome.Commit.Info.ID != "" {
+		advanced, advanceErr := item.candidate.mutationBoundary().afterAutomaticRuntimeCommit(startOutcome.Commit)
+		if advanceErr != nil {
+			if err == nil {
+				err = advanceErr
+			}
+		} else {
+			item.candidate.info = advanced.captured
+			item.candidate.capturedRevision = advanced.capturedRevision
+			item.candidate.revisionCaptured = advanced.revisionCaptured
+			result.prepared = item
+		}
+	}
 	startCtxErr := startCtx.Err()
 	// Split start_call into provider.Start and the ErrStateSync recovery
 	// branch (gc-9ha). The recovery branch hits the worker observation
@@ -1424,7 +1655,18 @@ func runPreparedStartCandidate(
 	// zero on the happy path.
 	if err != nil && errors.Is(err, sessionpkg.ErrStateSync) {
 		recoveryBegin := time.Now()
-		obs, runningErr := workerObserveSessionTargetWithRuntimeHintsWithConfig(cityPath, store, sp, cfg, item.candidate.name(), item.cfg.ProcessNames)
+		var (
+			obs        worker.LiveObservation
+			runningErr error
+		)
+		if store == nil || strings.TrimSpace(item.candidate.info.ID) == "" {
+			obs, runningErr = workerObserveSessionTargetWithRuntimeHintsWithConfig(cityPath, store, sp, cfg, item.candidate.name(), item.cfg.ProcessNames)
+		} else {
+			obs, runningErr = workerObserveReconcilerSessionWithWitness(
+				cityPath, store, sp, cfg, item.candidate.info, item.cfg.ProcessNames,
+				item.candidate.mutationBoundary(),
+			)
+		}
 		phases.StateSyncRecovery = time.Since(recoveryBegin)
 		if runningErr == nil && runtimeObservationLive(obs) {
 			err = nil
@@ -1445,7 +1687,10 @@ func runPreparedStartCandidate(
 				running, alive = observeRuntimeProviderLiveness(sp, item.candidate.name(), item.cfg.ProcessNames)
 			} else {
 				var obs worker.LiveObservation
-				obs, err = workerObserveSessionTargetWithRuntimeHintsWithConfig(cityPath, store, sp, cfg, item.candidate.name(), item.cfg.ProcessNames)
+				obs, err = workerObserveReconcilerSessionWithWitness(
+					cityPath, store, sp, cfg, item.candidate.info, item.cfg.ProcessNames,
+					item.candidate.mutationBoundary(),
+				)
 				running = obs.Running
 				alive = obs.Alive
 			}
@@ -1487,7 +1732,18 @@ func runPreparedStartCandidate(
 	case err == nil:
 		outcome = TraceOutcomeSuccess
 	case errors.Is(err, runtime.ErrSessionExists):
-		obs, runningErr := workerObserveSessionTargetWithRuntimeHintsWithConfig(cityPath, store, sp, cfg, item.candidate.name(), item.cfg.ProcessNames)
+		var (
+			obs        worker.LiveObservation
+			runningErr error
+		)
+		if store == nil || strings.TrimSpace(item.candidate.info.ID) == "" {
+			obs, runningErr = workerObserveSessionTargetWithRuntimeHintsWithConfig(cityPath, store, sp, cfg, item.candidate.name(), item.cfg.ProcessNames)
+		} else {
+			obs, runningErr = workerObserveReconcilerSessionWithWitness(
+				cityPath, store, sp, cfg, item.candidate.info, item.cfg.ProcessNames,
+				item.candidate.mutationBoundary(),
+			)
+		}
 		switch {
 		case runningErr != nil || !runtimeObservationLive(obs):
 			outcome = TraceOutcomeProviderError
@@ -1554,15 +1810,32 @@ func startupRateLimitScreenDetected(
 	if _, err := time.Parse(time.RFC3339, lastWoke); err != nil {
 		return false
 	}
-	content, err := workerSessionTargetPeekWithConfig(
-		cityPath,
-		store,
-		sp,
-		cfg,
-		item.candidate.name(),
-		rateLimitPeekLines,
-		item.cfg.ProcessNames,
-	)
+	var content string
+	var err error
+	if store == nil {
+		// Runtime-only compatibility tests and legacy callers have no persisted
+		// row to witness. Production bead-backed starts always pass the session
+		// store and take the exact reconciler peek boundary below.
+		content, err = workerSessionTargetPeekWithConfig(
+			cityPath,
+			store,
+			sp,
+			cfg,
+			item.candidate.name(),
+			rateLimitPeekLines,
+			item.cfg.ProcessNames,
+		)
+	} else {
+		content, err = workerPeekReconcilerSessionWithWitness(
+			cityPath,
+			store,
+			sp,
+			cfg,
+			item.candidate.info,
+			rateLimitPeekLines,
+			item.candidate.mutationBoundary(),
+		)
+	}
 	return err == nil && runtime.ContainsProviderRateLimitScreen(content)
 }
 
@@ -1607,7 +1880,7 @@ func enqueuePreparedStartWaveForCity(
 				defer release()
 			}
 			result := runPreparedStartCandidate(ctx, item, cityPath, sp, store, cfg, startupTimeout, stabilityWaiter, sessionStaleKeyDetectionWaiter)
-			commitAsyncStartResultWithContext(ctx, result, sp, store, clk, rec, wave, stdout, stderr, trace)
+			commitAsyncStartResultWithContext(ctx, result, sp, store, clk, rec, wave, stdout, stderr, trace, cfg)
 			if asyncFollowUp != nil {
 				asyncFollowUp()
 			}
@@ -1630,6 +1903,55 @@ func commitAsyncStartResultWithContext(
 	wave int,
 	stdout, stderr io.Writer,
 	trace *sessionReconcilerTraceCycle,
+	configs ...*config.City,
+) (committed bool) {
+	if result.prepared.candidate.strictLaunch || result.prepared.candidate.policyErr != nil {
+		var cfg *config.City
+		if len(configs) > 0 {
+			cfg = configs[0]
+		}
+		if store == nil {
+			return false
+		}
+		return commitStrictSuccessfulStartResult(
+			result, sp, sessionFrontDoor(store), cfg, clk, rec, wave, stdout, stderr, trace,
+		)
+	}
+	id := strings.TrimSpace(result.prepared.candidate.info.ID)
+	if id != "" {
+		if store == nil {
+			return false
+		}
+		if err := sessionpkg.WithSessionMutationLock(id, func() error {
+			current, _, err := sessionFrontDoor(store).GetPersistedResponse(id)
+			if err != nil {
+				return err
+			}
+			if err := result.prepared.candidate.validateAutomaticWakeCurrent(current); err != nil {
+				return err
+			}
+			committed = commitAsyncStartResultWithContextLocked(ctx, result, sp, store, clk, rec, wave, stdout, stderr, trace, true)
+			return nil
+		}); err != nil {
+			fmt.Fprintf(stderr, "session reconciler: refusing async start commit %s: %v\n", result.prepared.candidate.name(), err) //nolint:errcheck
+			return false
+		}
+		return committed
+	}
+	return commitAsyncStartResultWithContextLocked(ctx, result, sp, store, clk, rec, wave, stdout, stderr, trace, true)
+}
+
+func commitAsyncStartResultWithContextLocked(
+	ctx context.Context,
+	result startResult,
+	sp runtime.Provider,
+	store beads.Store,
+	clk clock.Clock,
+	rec events.Recorder,
+	wave int,
+	stdout, stderr io.Writer,
+	trace *sessionReconcilerTraceCycle,
+	witnessAuthorized bool,
 ) (committed bool) {
 	name := result.prepared.candidate.name()
 	template := result.prepared.candidate.tp.TemplateName
@@ -1647,7 +1969,9 @@ func commitAsyncStartResultWithContext(
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			err := fmt.Errorf("panic during async start commit: %v\n%s", recovered, debug.Stack())
-			clearPendingStartInFlightLease(result.prepared.candidate.info.ID, sessFront, stderr)
+			if witnessAuthorized {
+				clearPendingStartInFlightLease(result.prepared.candidate.info.ID, sessFront, stderr)
+			}
 			fmt.Fprintf(stderr, "session reconciler: committing async start %s: %s\n", name, formatLifecycleError(err)) //nolint:errcheck
 			// Pass the pre-refresh phases so commit-time panic diagnostics
 			// still show start_call / post_start_observe timings; commit_refresh
@@ -1665,16 +1989,21 @@ func commitAsyncStartResultWithContext(
 	// runPreparedStartCandidate. Both flow into the lifecycle log.
 	refreshed.phases.CommitRefresh = commitRefreshElapsed
 	if !ok {
+		beadBacked := strings.TrimSpace(result.prepared.candidate.info.ID) != "" && store != nil
+		if beadBacked && !cleanupRuntime {
+			logLifecycleOutcome(stderr, "start", wave, name, template, "witnessed_async_refresh_rejected", result.started, time.Now(), nil, refreshed.phases)
+			return false
+		}
 		// refreshAsyncStartResult returns result unchanged on every !ok
 		// branch (store.Get error, stale prepared command, stale runtime
 		// session), so refreshed.phases already carries the original
 		// start_call / post_start_observe; only commit_refresh was
 		// stamped above. No restore needed.
-		if cleanupRuntime {
+		if cleanupRuntime && witnessAuthorized {
 			stopStaleAsyncStartRuntime(result, sp, stderr)
 		}
 		outcome := "stale_async_start"
-		if releaseInFlight {
+		if releaseInFlight && witnessAuthorized {
 			clearPendingStartInFlightLease(result.prepared.candidate.info.ID, sessFront, stderr)
 			outcome = "async_start_refresh_failed"
 		}
@@ -1688,7 +2017,7 @@ func commitAsyncStartResultWithContext(
 	}
 	if ctx != nil && ctx.Err() != nil {
 		if refreshed.err != nil && refreshed.rollbackPending {
-			return commitStartResultTraced(refreshed, sessFront, clk, rec, wave, stdout, stderr, trace)
+			return commitStartResultTracedLocked(refreshed, sessFront, clk, rec, wave, stdout, stderr, trace)
 		}
 		if refreshed.err == nil && shouldRollbackPendingCreateInfo(refreshed.prepared.candidate.info) {
 			stopStaleAsyncStartRuntime(refreshed, sp, stderr)
@@ -1700,7 +2029,7 @@ func commitAsyncStartResultWithContext(
 	if sp != nil && refreshed.err == nil && refreshed.outcome != TraceOutcomeSessionInitializing {
 		_ = clearReconcilerDrainAckMetadata(sp, refreshed.prepared.candidate.name())
 	}
-	return commitStartResultTraced(refreshed, sessFront, clk, rec, wave, stdout, stderr, trace)
+	return commitStartResultTracedLocked(refreshed, sessFront, clk, rec, wave, stdout, stderr, trace)
 }
 
 // refreshAsyncStartResult re-reads the session bead just before commit so the async
@@ -1732,6 +2061,12 @@ func refreshAsyncStartResult(result startResult, store beads.Store, stderr io.Wr
 	if err != nil {
 		fmt.Fprintf(stderr, "session reconciler: refreshing async start %s: %v\n", result.prepared.candidate.name(), err) //nolint:errcheck
 		return result, false, false, true
+	}
+	if strings.TrimSpace(result.prepared.candidate.info.ID) != "" {
+		if err := result.prepared.candidate.validateAutomaticWakeCurrent(currentInfo); err != nil {
+			fmt.Fprintf(stderr, "session reconciler: ignoring unauthorized async start result for %s: %v\n", result.prepared.candidate.name(), err) //nolint:errcheck
+			return result, false, false, false
+		}
 	}
 	if asyncStartPreparedCommandStaleInfo(result.prepared, currentInfo) {
 		fmt.Fprintf(stderr, "session reconciler: ignoring stale async start result for %s: desired command changed during startup\n", result.prepared.candidate.name()) //nolint:errcheck
@@ -1766,6 +2101,25 @@ func clearPendingStartInFlightLease(handle string, sessFront *sessionpkg.Store, 
 		return
 	}
 	setMeta(sessFront, handle, "last_woke_at", "", stderr) //nolint:errcheck
+}
+
+// clearPendingStartInFlightLeaseForCandidate clears a failed automatic
+// preparation lease only while the candidate's original zero-or-exact witness
+// and wake eligibility still hold. A trigger repoint, suspension, or read
+// failure leaves the row untouched for the next authoritative owner/tick.
+func clearPendingStartInFlightLeaseForCandidate(candidate startCandidate, store beads.Store, stderr io.Writer) {
+	id := strings.TrimSpace(candidate.info.ID)
+	if id == "" || store == nil {
+		return
+	}
+	_, err := candidate.mutationBoundary().runPersisted(store, func(current sessionpkg.Info, _ sessionpkg.PersistedResponse) (bool, error) {
+		return strings.TrimSpace(current.LastWokeAt) != "", nil
+	}, func(current sessionpkg.Info, _ sessionpkg.PersistedResponse, front *sessionpkg.Store) error {
+		return front.SetMarker(current.ID, "last_woke_at", "")
+	})
+	if err != nil && stderr != nil {
+		fmt.Fprintf(stderr, "session reconciler: refusing failed-start lease cleanup %s: %v\n", candidate.name(), err) //nolint:errcheck
+	}
 }
 
 func stopStaleAsyncStartRuntime(result startResult, sp runtime.Provider, stderr io.Writer) {
@@ -1829,15 +2183,78 @@ func startPreparedStartCandidate(
 	phases *startPhaseTimings,
 	staleKeyDetectionWaiter sessionpkg.StaleKeyDetectionWaiter,
 ) (bool, error) {
+	result, err := startPreparedStartCandidateWithCommit(
+		ctx, item, cityPath, store, sp, cfg, phases, staleKeyDetectionWaiter,
+	)
+	return result.Attempted, err
+}
+
+func startPreparedStartCandidateWithCommit(
+	ctx context.Context,
+	item preparedStart,
+	cityPath string,
+	store beads.Store,
+	sp runtime.Provider,
+	cfg *config.City,
+	phases *startPhaseTimings,
+	staleKeyDetectionWaiter sessionpkg.StaleKeyDetectionWaiter,
+) (worker.PreparedStartResult, error) {
+	if item.cfg.ProjectHooksForbidden && (store == nil || strings.TrimSpace(item.candidate.info.ID) == "") {
+		return worker.PreparedStartResult{}, fmt.Errorf("%w: project-hook-isolated prepared start requires a bead-backed session", worker.ErrLaunchUnauthorized)
+	}
 	name := item.candidate.name()
+	expectedID := strings.TrimSpace(item.candidate.expectedWitness.TriggerBeadID)
+	expectedStoreRef := strings.TrimSpace(item.candidate.expectedWitness.TriggerBeadStoreRef)
+	beadBackedID := strings.TrimSpace(item.candidate.info.ID)
+	beadBacked := beadBackedID != "" && store != nil
+	if (item.candidate.strictLaunch || expectedID != "" || expectedStoreRef != "") && !beadBacked {
+		return worker.PreparedStartResult{}, fmt.Errorf("%w: witnessed prepared start requires a bead-backed session", worker.ErrLaunchUnauthorized)
+	}
+	if beadBacked {
+		if (expectedID == "") != (expectedStoreRef == "") || (item.candidate.strictLaunch && expectedID == "") {
+			return worker.PreparedStartResult{}, fmt.Errorf("%w: %w: witnessed prepared start requires a complete trigger pair", worker.ErrLaunchUnauthorized, sessionpkg.ErrLiveBoundaryWitnessMismatch)
+		}
+		if item.candidate.strictLaunch || item.candidate.policyErr != nil {
+			decision, err := item.candidate.mutationBoundary().automaticRuntimeDecision()
+			if err != nil {
+				return worker.PreparedStartResult{}, err
+			}
+			factory, err := workerFactoryWithStaleKeyDetectionWaiter(
+				cityPath, store, canonicalSessionWorkStore(store, cfg), sp, cfg, staleKeyDetectionWaiter,
+			)
+			if err != nil {
+				return worker.PreparedStartResult{}, err
+			}
+			result, err := factory.StartPreparedForReconciler(
+				ctx, beadBackedID, item.cfg.Command, item.cfg, decision,
+			)
+			if phases != nil {
+				phases.ZombieRecycle = result.RecycleDuration
+			}
+			return result, err
+		}
+		handle, err := workerHandleForSessionWithStaleKeyDetectionWaiter(cityPath, store, sp, cfg, beadBackedID, staleKeyDetectionWaiter)
+		if err != nil {
+			return worker.PreparedStartResult{}, err
+		}
+		preparedHandle, ok := handle.(worker.PreparedLifecycleHandle)
+		if !ok {
+			return worker.PreparedStartResult{}, fmt.Errorf("%w: prepared start boundary unavailable", worker.ErrOperationUnsupported)
+		}
+		result, err := preparedHandle.StartPreparedResolved(ctx, item.cfg.Command, item.cfg, item.candidate.expectedWitness)
+		if phases != nil {
+			phases.ZombieRecycle = result.RecycleDuration
+		}
+		return result, err
+	}
 	if sp != nil {
 		running, alive := observeRuntimeProviderLiveness(sp, name, item.cfg.ProcessNames)
 		if running {
 			if alive {
 				if shouldRollbackPendingCreateInfo(item.candidate.info) && !runningSessionMatchesPendingCreateInfo(item.candidate.info, name, sp) {
-					return false, fmt.Errorf("%w: session %q", runtime.ErrSessionExists, name)
+					return worker.PreparedStartResult{}, fmt.Errorf("%w: session %q", runtime.ErrSessionExists, name)
 				}
-				return false, nil
+				return worker.PreparedStartResult{}, nil
 			}
 			// Zombie: the runtime container (e.g. tmux pane) is up but the
 			// agent process is gone — typically a session that survived a
@@ -1856,7 +2273,7 @@ func startPreparedStartCandidate(
 				phases.ZombieRecycle = time.Since(recycleBegin)
 			}
 			if stopErr != nil && !runtime.IsSessionGone(stopErr) {
-				return false, fmt.Errorf("recycling session %q with dead agent process: %w", name, stopErr)
+				return worker.PreparedStartResult{}, fmt.Errorf("recycling session %q with dead agent process: %w", name, stopErr)
 			}
 		}
 	}
@@ -1872,15 +2289,15 @@ func startPreparedStartCandidate(
 			nil,
 		)
 		if err != nil {
-			return false, err
+			return worker.PreparedStartResult{}, err
 		}
-		return true, handle.StartResolved(ctx, item.cfg.Command, item.cfg)
+		return worker.PreparedStartResult{Attempted: true}, handle.StartResolved(ctx, item.cfg.Command, item.cfg)
 	}
 	handle, err := workerHandleForSessionWithStaleKeyDetectionWaiter(cityPath, store, sp, cfg, item.candidate.info.ID, staleKeyDetectionWaiter)
 	if err != nil {
-		return true, err
+		return worker.PreparedStartResult{Attempted: true}, err
 	}
-	return true, handle.StartResolved(ctx, item.cfg.Command, item.cfg)
+	return worker.PreparedStartResult{Attempted: true}, handle.StartResolved(ctx, item.cfg.Command, item.cfg)
 }
 
 func runtimeObservationLive(obs worker.LiveObservation) bool {
@@ -2026,6 +2443,134 @@ func clearStaleResumeKeyMetadata(handle string, sessFront *sessionpkg.Store) map
 	return patch
 }
 
+func commitSyncStartResultTraced(
+	result startResult,
+	sp runtime.Provider,
+	sessFront *sessionpkg.Store,
+	clk clock.Clock,
+	rec events.Recorder,
+	wave int,
+	stdout, stderr io.Writer,
+	trace *sessionReconcilerTraceCycle,
+	configs ...*config.City,
+) bool {
+	if result.prepared.candidate.strictLaunch || result.prepared.candidate.policyErr != nil {
+		var cfg *config.City
+		if len(configs) > 0 {
+			cfg = configs[0]
+		}
+		return commitStrictSuccessfulStartResult(
+			result, sp, sessFront, cfg, clk, rec, wave, stdout, stderr, trace,
+		)
+	}
+	commit := func() bool {
+		if trace != nil {
+			trace.RecordOperation(TraceSiteLifecycleStartRun, TraceReasonStart, result.outcome, "", result.prepared.candidate.tp.TemplateName, result.prepared.candidate.name(), result.finished.Sub(result.started), traceRecordPayload{
+				"rollback_pending": result.rollbackPending,
+				"duration_ms":      result.finished.Sub(result.started).Milliseconds(),
+			})
+		}
+		if result.err == nil && result.outcome != TraceOutcomeSessionInitializing {
+			_ = clearReconcilerDrainAckMetadata(sp, result.prepared.candidate.name())
+		}
+		return commitStartResultTracedLocked(result, sessFront, clk, rec, wave, stdout, stderr, trace)
+	}
+	id := strings.TrimSpace(result.prepared.candidate.info.ID)
+	if id == "" {
+		return commit()
+	}
+	if sessFront == nil {
+		return false
+	}
+	committed := false
+	if err := sessionpkg.WithSessionMutationLock(id, func() error {
+		current, _, err := sessFront.GetPersistedResponse(id)
+		if err != nil {
+			return err
+		}
+		if err := result.prepared.candidate.validateAutomaticWakeCurrent(current); err != nil {
+			return err
+		}
+		result.prepared.candidate.info = current
+		committed = commit()
+		return nil
+	}); err != nil {
+		fmt.Fprintf(stderr, "session reconciler: refusing synchronous start commit %s: %v\n", result.prepared.candidate.name(), err) //nolint:errcheck
+		return false
+	}
+	return committed
+}
+
+func commitStrictSuccessfulStartResult(
+	result startResult,
+	sp runtime.Provider,
+	sessFront *sessionpkg.Store,
+	cfg *config.City,
+	clk clock.Clock,
+	rec events.Recorder,
+	wave int,
+	stdout, stderr io.Writer,
+	trace *sessionReconcilerTraceCycle,
+) bool {
+	if result.prepared.candidate.policyErr != nil {
+		fmt.Fprintf(stderr, "session reconciler: refusing strict start %s: %v\n", result.prepared.candidate.name(), result.prepared.candidate.policyErr) //nolint:errcheck
+		return false
+	}
+	if result.err != nil {
+		fmt.Fprintf(stderr, "session reconciler: strict start %s: %s\n", result.prepared.candidate.name(), formatLifecycleError(result.err)) //nolint:errcheck
+		return false
+	}
+	if result.outcome == TraceOutcomeSessionInitializing || sessFront == nil || cfg == nil {
+		return false
+	}
+	store := sessFront.Store().Store
+	boundary := result.prepared.candidate.mutationBoundary().lifecycleMutation()
+	var err error
+	for _, key := range []string{"GC_DRAIN_ACK", reconcilerDrainAckSourceKey, reconcilerDrainAckReasonKey, reconcilerDrainAckGenerationKey} {
+		boundary, err = mutateStrictRuntimeMetadataAtBoundary(store, sp, cfg, boundary, key, "", true)
+		if err != nil {
+			fmt.Fprintf(stderr, "session reconciler: refusing strict start drain cleanup %s: %v\n", result.prepared.candidate.name(), err) //nolint:errcheck
+			return false
+		}
+	}
+	result.prepared.candidate.info = boundary.captured
+	result.prepared.candidate.capturedRevision = boundary.capturedRevision
+	result.prepared.candidate.revisionCaptured = true
+	metadata, err := successfulStartCommitMetadata(result, clk)
+	if err != nil {
+		fmt.Fprintf(stderr, "session reconciler: encoding strict start metadata for %s: %v\n", result.prepared.candidate.name(), err) //nolint:errcheck
+		return false
+	}
+	if err := sessionpkg.PersistRuntimeMCPServersSnapshot(
+		result.prepared.cfg.Env["GC_CITY_PATH"], result.prepared.candidate.info.ID, result.prepared.cfg.MCPServers,
+	); err != nil {
+		fmt.Fprintf(stderr, "session reconciler: storing strict runtime MCP snapshot for %s: %v\n", result.prepared.candidate.name(), err) //nolint:errcheck
+		return false
+	}
+	committed, err := boundary.runPersisted(
+		store,
+		func(current sessionpkg.Info, _ sessionpkg.PersistedResponse) (bool, error) {
+			if asyncStartPreparedCommandStaleInfo(result.prepared, current) ||
+				!asyncStartSessionStillCurrentInfo(result.prepared.candidate.info, current) {
+				return false, nil
+			}
+			return true, nil
+		},
+		func(current sessionpkg.Info, _ sessionpkg.PersistedResponse, front *sessionpkg.Store) error {
+			result.prepared.candidate.info = current
+			return front.ApplyPatch(current.ID, metadata)
+		},
+	)
+	if err != nil || !committed {
+		if err != nil {
+			fmt.Fprintf(stderr, "session reconciler: refusing strict synchronous start commit %s: %v\n", result.prepared.candidate.name(), err) //nolint:errcheck
+		}
+		return false
+	}
+	recordSuccessfulStartCommit(result, rec, wave, stdout, stderr, trace)
+	return true
+}
+
 func commitStartResult(
 	result startResult,
 	sessFront *sessionpkg.Store,
@@ -2059,6 +2604,40 @@ func commitStartResultTraced(
 	stdout, stderr io.Writer,
 	trace *sessionReconcilerTraceCycle,
 ) bool {
+	if id := strings.TrimSpace(result.prepared.candidate.info.ID); id != "" {
+		if sessFront == nil {
+			return false
+		}
+		committed := false
+		if err := sessionpkg.WithSessionMutationLock(id, func() error {
+			current, _, err := sessFront.GetPersistedResponse(id)
+			if err != nil {
+				return err
+			}
+			if err := result.prepared.candidate.validateAutomaticWakeCurrent(current); err != nil {
+				return err
+			}
+			result.prepared.candidate.info = current
+			committed = commitStartResultTracedLocked(result, sessFront, clk, rec, wave, stdout, stderr, trace)
+			return nil
+		}); err != nil {
+			fmt.Fprintf(stderr, "session reconciler: refusing start commit %s: %v\n", result.prepared.candidate.name(), err) //nolint:errcheck
+			return false
+		}
+		return committed
+	}
+	return commitStartResultTracedLocked(result, sessFront, clk, rec, wave, stdout, stderr, trace)
+}
+
+func commitStartResultTracedLocked(
+	result startResult,
+	sessFront *sessionpkg.Store,
+	clk clock.Clock,
+	rec events.Recorder,
+	wave int,
+	stdout, stderr io.Writer,
+	trace *sessionReconcilerTraceCycle,
+) bool {
 	// info is the refreshed typed twin (async: refreshAsyncStartResult's currentInfo;
 	// sync: prepareStartCandidateForCity's coherence refresh) — the sole commit-time
 	// read surface now that the raw candidate.session pointer is gone (WI-6 R4). Its
@@ -2066,6 +2645,10 @@ func commitStartResultTraced(
 	info := result.prepared.candidate.info
 	name := result.prepared.candidate.name()
 	tp := result.prepared.candidate.tp
+	if result.err != nil && (errors.Is(result.err, worker.ErrLaunchUnauthorized) || errors.Is(result.err, sessionpkg.ErrLiveBoundaryWitnessMismatch)) {
+		logLifecycleOutcome(stderr, "start", wave, name, tp.TemplateName, "unauthorized", result.started, result.finished, result.err, result.phases)
+		return false
+	}
 	// Session still starting up — back off silently without recording failure.
 	// The reconciler will retry on the next patrol tick.
 	if result.outcome == TraceOutcomeSessionInitializing {
@@ -2077,70 +2660,18 @@ func commitStartResultTraced(
 		commitStartFailure(result, sessFront, clk, rec, wave, stderr, trace)
 		return false
 	}
-	coreBreakdown := ""
-	if bdj, err := json.Marshal(result.prepared.coreBreakdown); err == nil {
-		coreBreakdown = string(bdj)
-	}
-	// Transition creating/asleep/drained beads to active once the runtime
-	// spawn has confirmed. Folded into this metadata batch so the state
-	// write is atomic with the hash writes, the pending_create_claim
-	// clear, and the creation_complete_at marker. This prevents the sweep
-	// from observing a transient state where the claim is gone but the
-	// post-create marker hasn't landed yet. See confirmPendingStart for
-	// the state gate.
-	// S19 priming confirmation pair (write-only in Stage 2): stamped only when
-	// this incarnation delivered the rendered startup prompt. result.err == nil
-	// here, so "start succeeded" already holds — the (Delivered && start
-	// succeeded) signal. Zero values ⇒ CommitStartedPatch emits no priming keys.
-	primedAt := time.Time{}
-	promptHash := ""
-	if result.prepared.promptDelivered {
-		primedAt = clk.Now()
-		promptHash = result.prepared.promptHash
-	}
-	metadata := sessionpkg.CommitStartedPatch(sessionpkg.CommitStartedPatchInput{
-		CoreHash:                result.prepared.coreHash,
-		LiveHash:                result.prepared.liveHash,
-		ProvisionHash:           result.prepared.provisionHash,
-		LaunchHash:              result.prepared.launchHash,
-		CoreBreakdown:           coreBreakdown,
-		ConfirmState:            confirmPendingStart(info.MetadataState),
-		ClearSleepReason:        info.SleepReason != "",
-		ClearPendingCreateClaim: shouldRollbackPendingCreateInfo(info),
-		// A confirmed transition out of a dormant/creating state opens a new
-		// awake interval — stamp a fresh compute-usage epoch for it.
-		StartsAwakeInterval: confirmPendingStart(info.MetadataState),
-		Now:                 clk.Now(),
-		PrimedAt:            primedAt,
-		PromptHash:          promptHash,
-	})
-	storedMCPSnapshot, err := sessionpkg.EncodeMCPServersSnapshot(result.prepared.cfg.MCPServers)
+	metadata, err := successfulStartCommitMetadata(result, clk)
 	if err != nil {
 		clearPendingStartInFlightLease(info.ID, sessFront, stderr)
 		fmt.Fprintf(stderr, "session reconciler: encoding MCP snapshot for %s: %v\n", name, err) //nolint:errcheck
 		logLifecycleOutcome(stderr, "start", wave, name, tp.TemplateName, "metadata_encode_failed", result.started, result.finished, err, result.phases)
 		return false
 	}
-	if storedMCPSnapshot != "" || info.MCPServersSnapshot != "" {
-		metadata[sessionpkg.MCPServersSnapshotMetadataKey] = storedMCPSnapshot
-	}
 	if err := sessionpkg.PersistRuntimeMCPServersSnapshot(result.prepared.cfg.Env["GC_CITY_PATH"], info.ID, result.prepared.cfg.MCPServers); err != nil {
 		clearPendingStartInFlightLease(info.ID, sessFront, stderr)
 		fmt.Fprintf(stderr, "session reconciler: storing runtime MCP snapshot for %s: %v\n", name, err) //nolint:errcheck
 		logLifecycleOutcome(stderr, "start", wave, name, tp.TemplateName, "runtime_mcp_snapshot_failed", result.started, result.finished, err, result.phases)
 		return false
-	}
-	if result.prepared.candidate.tp.IsACP ||
-		info.MCPIdentity != "" ||
-		info.MCPServersSnapshot != "" {
-		storedMCPIdentity := firstNonEmptyGCString(
-			info.MCPIdentity,
-			info.ConfiguredNamedIdentity,
-			info.AgentName,
-		)
-		if storedMCPIdentity != "" || info.MCPIdentity != "" {
-			metadata[sessionpkg.MCPIdentityMetadataKey] = storedMCPIdentity
-		}
 	}
 	if err := sessFront.ApplyPatch(info.ID, metadata); err != nil {
 		clearPendingStartInFlightLease(info.ID, sessFront, stderr)
@@ -2162,10 +2693,62 @@ func commitStartResultTraced(
 		logLifecycleOutcome(stderr, "start", wave, name, tp.TemplateName, "metadata_batch_failed", result.started, result.finished, err, result.phases)
 		return false
 	}
-	// Announce the wake only after the metadata batch has durably landed.
-	// Emitting earlier lets a subscriber observe a session.woke for a start
-	// whose commit then fails — a fact the store never recorded, since the
-	// failure paths above report the start as failed and retry (ga-kmoj9c).
+	recordSuccessfulStartCommit(result, rec, wave, stdout, stderr, trace)
+	return true
+}
+
+func successfulStartCommitMetadata(result startResult, clk clock.Clock) (map[string]string, error) {
+	info := result.prepared.candidate.info
+	coreBreakdownJSON, err := json.Marshal(result.prepared.coreBreakdown)
+	if err != nil {
+		return nil, err
+	}
+	primedAt := time.Time{}
+	promptHash := ""
+	if result.prepared.promptDelivered {
+		primedAt = clk.Now()
+		promptHash = result.prepared.promptHash
+	}
+	metadata := sessionpkg.CommitStartedPatch(sessionpkg.CommitStartedPatchInput{
+		CoreHash:                result.prepared.coreHash,
+		LiveHash:                result.prepared.liveHash,
+		ProvisionHash:           result.prepared.provisionHash,
+		LaunchHash:              result.prepared.launchHash,
+		CoreBreakdown:           string(coreBreakdownJSON),
+		ConfirmState:            confirmPendingStart(info.MetadataState),
+		ClearSleepReason:        info.SleepReason != "",
+		ClearPendingCreateClaim: shouldRollbackPendingCreateInfo(info),
+		StartsAwakeInterval:     confirmPendingStart(info.MetadataState),
+		Now:                     clk.Now(),
+		PrimedAt:                primedAt,
+		PromptHash:              promptHash,
+	})
+	storedMCPSnapshot, err := sessionpkg.EncodeMCPServersSnapshot(result.prepared.cfg.MCPServers)
+	if err != nil {
+		return nil, err
+	}
+	if storedMCPSnapshot != "" || info.MCPServersSnapshot != "" {
+		metadata[sessionpkg.MCPServersSnapshotMetadataKey] = storedMCPSnapshot
+	}
+	if result.prepared.candidate.tp.IsACP || info.MCPIdentity != "" || info.MCPServersSnapshot != "" {
+		storedMCPIdentity := firstNonEmptyGCString(info.MCPIdentity, info.ConfiguredNamedIdentity, info.AgentName)
+		if storedMCPIdentity != "" || info.MCPIdentity != "" {
+			metadata[sessionpkg.MCPIdentityMetadataKey] = storedMCPIdentity
+		}
+	}
+	return metadata, nil
+}
+
+func recordSuccessfulStartCommit(
+	result startResult,
+	rec events.Recorder,
+	wave int,
+	stdout, stderr io.Writer,
+	trace *sessionReconcilerTraceCycle,
+) {
+	info := result.prepared.candidate.info
+	name := result.prepared.candidate.name()
+	tp := result.prepared.candidate.tp
 	fmt.Fprintf(stdout, "Woke session '%s'\n", tp.DisplayName()) //nolint:errcheck
 	rec.Record(events.Event{
 		Type:      events.SessionWoke,
@@ -2184,7 +2767,6 @@ func commitStartResultTraced(
 		})
 	}
 	logLifecycleOutcome(stderr, "start", wave, name, tp.TemplateName, string(result.outcome), result.started, result.finished, nil, result.phases)
-	return true
 }
 
 // commitStartFailure performs the failure-path side effects for a start that
@@ -2297,10 +2879,36 @@ func recoverRunningPendingCreate(
 	store beads.Store,
 	clk clock.Clock,
 	trace *sessionReconcilerTraceCycle,
+	boundaries ...reconcilerMutationBoundary,
 ) (bool, map[string]string) {
 	if strings.TrimSpace(info.ID) == "" || store == nil {
 		return false, nil
 	}
+	var (
+		recovered bool
+		fold      map[string]string
+	)
+	boundary := selectedReconcilerMutationBoundary(info, cfg, boundaries...)
+	_, err := boundary.runPersisted(store, func(current sessionpkg.Info, _ sessionpkg.PersistedResponse) (bool, error) {
+		return shouldRollbackPendingCreateInfo(current), nil
+	}, func(current sessionpkg.Info, _ sessionpkg.PersistedResponse, front *sessionpkg.Store) error {
+		recovered, fold = recoverRunningPendingCreateCurrent(current, tp, cfg, front.Store().Store, clk, trace)
+		return nil
+	})
+	if err != nil {
+		return false, nil
+	}
+	return recovered, fold
+}
+
+func recoverRunningPendingCreateCurrent(
+	info sessionpkg.Info,
+	tp TemplateParams,
+	cfg *config.City,
+	store beads.Store,
+	clk clock.Clock,
+	trace *sessionReconcilerTraceCycle,
+) (bool, map[string]string) {
 	// buildPreparedStart reads template_overrides / trigger-bead env + the
 	// start-prep metadata off the candidate's typed twin, so thread the caller's
 	// coherent infoByID snapshot in. It returns the post-mutation Info even on error:
@@ -2609,6 +3217,11 @@ func rollbackPendingCreateClearingClaim(info sessionpkg.Info, sessFront *session
 	return batch
 }
 
+var (
+	errStartCircuitOpen     = errors.New("start circuit is open")
+	errStartCircuitMetadata = errors.New("recording start circuit metadata")
+)
+
 func executePlannedStarts(
 	ctx context.Context,
 	candidates []startCandidate,
@@ -2744,9 +3357,15 @@ func executePlannedStartsTraced(
 					logLifecycleOutcome(stderr, "start", wave, candidate.name(), candidate.logicalTemplate(cfg), "blocked_on_dependencies", time.Time{}, time.Time{}, nil)
 					continue
 				}
+				// Strict automatic starts must finish before this serial reconcile
+				// tick returns. Otherwise the next tick may hot-swap the controller's
+				// config/provider while the detached goroutine still authorizes against
+				// the captured prior generation. Inherit candidates retain the async
+				// throughput path.
+				candidateAsync := startOpts.async && !candidate.strictLaunch && candidate.policyErr == nil
 				var release func()
 				var done func()
-				if startOpts.async {
+				if candidateAsync {
 					var tracking bool
 					done, tracking = startOpts.asyncTracker.start()
 					if !tracking {
@@ -2762,71 +3381,86 @@ func executePlannedStartsTraced(
 						continue
 					}
 				}
-				if cbEnabled {
-					identity := namedSessionIdentityInfo(candidate.info)
-					if identity != "" {
-						cbNow := clk.Now().UTC()
-						if cb.IsOpen(identity, cbNow) {
-							if release != nil {
-								release()
-							}
-							if done != nil {
-								done()
-							}
-							if err := persistSessionCircuitBreakerMetadata(sessFront, candidate.info.ID, cb, identity, cbNow); err != nil {
-								fmt.Fprintf(stderr, "session reconciler: %v\n", err) //nolint:errcheck // best-effort stderr
-							}
-							cb.LogOpenOnce(identity, stderr)
-							if trace != nil {
-								trace.RecordDecision(TraceSiteReconcilerCircuitOpen, TraceReasonCircuitOpen, TraceOutcomeSkipped, candidate.tp.TemplateName, candidate.name(), traceRecordPayload{
-									"identity": identity,
-								})
-							}
-							continue
+				runCircuitGate := func(current sessionpkg.Info) error {
+					if !cbEnabled {
+						return nil
+					}
+					identity := namedSessionIdentityInfo(current)
+					if identity == "" {
+						return nil
+					}
+					cbNow := clk.Now().UTC()
+					if cb.IsOpen(identity, cbNow) {
+						if err := persistSessionCircuitBreakerMetadata(sessFront, current.ID, cb, identity, cbNow); err != nil {
+							fmt.Fprintf(stderr, "session reconciler: %v\n", err) //nolint:errcheck // best-effort stderr
 						}
-						state, err := recordSessionCircuitBreakerRestart(sessFront, candidate.info.ID, cb, identity, cbNow)
-						if err != nil {
-							if release != nil {
-								release()
-							}
-							if done != nil {
-								done()
-							}
+						cb.LogOpenOnce(identity, stderr)
+						if trace != nil {
+							trace.RecordDecision(TraceSiteReconcilerCircuitOpen, TraceReasonCircuitOpen, TraceOutcomeSkipped, candidate.tp.TemplateName, candidate.name(), traceRecordPayload{
+								"identity": identity,
+							})
+						}
+						return errStartCircuitOpen
+					}
+					state, err := recordSessionCircuitBreakerRestart(sessFront, current.ID, cb, identity, cbNow)
+					if err != nil {
+						return fmt.Errorf("%w: %w", errStartCircuitMetadata, err)
+					}
+					if state == circuitOpen {
+						cb.LogOpenOnce(identity, stderr)
+						if trace != nil {
+							trace.RecordDecision(TraceSiteReconcilerCircuitTrip, TraceReasonCircuitTrip, TraceOutcomeSkipped, candidate.tp.TemplateName, candidate.name(), traceRecordPayload{
+								"identity": identity,
+							})
+						}
+						return errStartCircuitOpen
+					}
+					return nil
+				}
+				beadBacked := strings.TrimSpace(candidate.info.ID) != "" && store != nil
+				if !beadBacked {
+					if err := runCircuitGate(candidate.info); err != nil {
+						if release != nil {
+							release()
+						}
+						if done != nil {
+							done()
+						}
+						if errors.Is(err, errStartCircuitMetadata) {
 							fmt.Fprintf(stderr, "session reconciler: %v\n", err) //nolint:errcheck // best-effort stderr
 							logLifecycleOutcome(stderr, "start", wave, candidate.name(), candidate.logicalTemplate(cfg), "circuit_metadata_failed", time.Time{}, time.Time{}, err)
-							continue
 						}
-						if state == circuitOpen {
-							if release != nil {
-								release()
-							}
-							if done != nil {
-								done()
-							}
-							cb.LogOpenOnce(identity, stderr)
-							if trace != nil {
-								trace.RecordDecision(TraceSiteReconcilerCircuitTrip, TraceReasonCircuitTrip, TraceOutcomeSkipped, candidate.tp.TemplateName, candidate.name(), traceRecordPayload{
-									"identity": identity,
-								})
-							}
-							continue
-						}
+						continue
 					}
 				}
-				item, err := prepareStartCandidateForCity(candidate, cityPath, cityName, cfg, sp, store, clk, stderr, startOpts.workDirResolver)
+				var lockedBeforeWake []func(sessionpkg.Info) error
+				if beadBacked {
+					lockedBeforeWake = append(lockedBeforeWake, runCircuitGate)
+				}
+				item, err := prepareStartCandidateForCity(candidate, cityPath, cityName, cfg, sp, store, startOpts.canonicalCityWorkStore, clk, stderr, startOpts.workDirResolver, lockedBeforeWake...)
 				if err != nil {
-					clearPendingStartInFlightLease(candidate.info.ID, sessFront, stderr)
 					if release != nil {
 						release()
 					}
 					if done != nil {
 						done()
 					}
+					if errors.Is(err, errStartCircuitOpen) {
+						continue
+					}
+					if errors.Is(err, errStartCircuitMetadata) {
+						fmt.Fprintf(stderr, "session reconciler: %v\n", err) //nolint:errcheck // best-effort stderr
+						logLifecycleOutcome(stderr, "start", wave, candidate.name(), candidate.logicalTemplate(cfg), "circuit_metadata_failed", time.Time{}, time.Time{}, err)
+						continue
+					}
+					if !errors.Is(err, sessionpkg.ErrLiveBoundaryWitnessMismatch) && !errors.Is(err, worker.ErrLaunchUnauthorized) {
+						clearPendingStartInFlightLeaseForCandidate(candidate, store, stderr)
+					}
 					fmt.Fprintf(stderr, "session reconciler: pre-wake %s: %s\n", candidate.name(), formatLifecycleError(err)) //nolint:errcheck
 					logLifecycleOutcome(stderr, "start", wave, candidate.name(), candidate.logicalTemplate(cfg), "failed", time.Time{}, time.Time{}, err)
 					continue
 				}
-				if startOpts.async {
+				if candidateAsync {
 					asyncPrepared = append(asyncPrepared, asyncPreparedStart{item: *item, release: release, done: done})
 				} else {
 					prepared = append(prepared, *item)
@@ -2837,13 +3471,8 @@ func executePlannedStartsTraced(
 			if ctx != nil && ctx.Err() != nil {
 				return wakeCount
 			}
-			if startOpts.async {
-				results = enqueuePreparedStartWaveForCity(ctx, asyncPrepared, cityPath, sp, store, cfg, clk, rec, startupTimeout, wave, stdout, stderr, trace, startOpts.asyncFollowUp, stabilityWaiter, sessionStaleKeyDetectionWaiter)
-				if len(results) > 0 && asyncStartBatchNeedsFollowUp(batchCandidates, cfg) {
-					asyncFollowUpRequired = true
-				}
-			} else {
-				results = executePreparedStartWaveForCity(
+			if len(prepared) > 0 {
+				results = append(results, executePreparedStartWaveForCity(
 					ctx,
 					prepared,
 					cityPath,
@@ -2854,24 +3483,28 @@ func executePlannedStartsTraced(
 					batchSize,
 					withStartStabilityWaiter(stabilityWaiter),
 					withSessionStaleKeyDetectionWaiter(sessionStaleKeyDetectionWaiter),
-				)
+				)...)
+			}
+			if len(asyncPrepared) > 0 {
+				asyncResults := enqueuePreparedStartWaveForCity(ctx, asyncPrepared, cityPath, sp, store, cfg, clk, rec, startupTimeout, wave, stdout, stderr, trace, startOpts.asyncFollowUp, stabilityWaiter, sessionStaleKeyDetectionWaiter)
+				results = append(results, asyncResults...)
+				if len(asyncResults) > 0 && asyncStartBatchNeedsFollowUp(batchCandidates, cfg) {
+					asyncFollowUpRequired = true
+				}
 			}
 			for _, result := range results {
-				if trace != nil {
-					trace.RecordOperation(TraceSiteLifecycleStartRun, TraceReasonStart, result.outcome, "", result.prepared.candidate.tp.TemplateName, result.prepared.candidate.name(), result.finished.Sub(result.started), traceRecordPayload{
-						"rollback_pending": result.rollbackPending,
-						"duration_ms":      result.finished.Sub(result.started).Milliseconds(),
-					})
-				}
 				if result.outcome == TraceOutcomeStartEnqueued {
+					if trace != nil {
+						trace.RecordOperation(TraceSiteLifecycleStartRun, TraceReasonStart, result.outcome, "", result.prepared.candidate.tp.TemplateName, result.prepared.candidate.name(), result.finished.Sub(result.started), traceRecordPayload{
+							"rollback_pending": result.rollbackPending,
+							"duration_ms":      result.finished.Sub(result.started).Milliseconds(),
+						})
+					}
 					logLifecycleOutcome(stderr, "start", wave, result.prepared.candidate.name(), result.prepared.candidate.logicalTemplate(cfg), string(result.outcome), result.started, result.finished, nil)
 					wakeCount++
 					continue
 				}
-				if result.err == nil && result.outcome != TraceOutcomeSessionInitializing {
-					_ = clearReconcilerDrainAckMetadata(sp, result.prepared.candidate.name())
-				}
-				if commitStartResultTraced(result, sessFront, clk, rec, wave, stdout, stderr, trace) {
+				if commitSyncStartResultTraced(result, sp, sessFront, clk, rec, wave, stdout, stderr, trace, cfg) {
 					wakeCount++
 				}
 			}

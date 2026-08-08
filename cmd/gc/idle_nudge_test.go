@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
@@ -12,6 +13,23 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/runtime"
 )
+
+type driftTriggerAfterBackstopReserveStore struct {
+	*beads.MemStore
+	sessionID string
+	drifted   bool
+}
+
+func (s *driftTriggerAfterBackstopReserveStore) SetMetadataBatch(id string, kvs map[string]string) error {
+	if err := s.MemStore.SetMetadataBatch(id, kvs); err != nil {
+		return err
+	}
+	if id == s.sessionID && kvs[idleClaimNudgeCountKey] == "1" && !s.drifted {
+		s.drifted = true
+		return s.MemStore.SetMetadataBatch(id, map[string]string{testTriggerBeadIDKey: "work-repointed"})
+	}
+	return nil
+}
 
 const (
 	testTriggerBeadIDKey       = "gc.trigger_bead_id"
@@ -90,6 +108,54 @@ func TestNudgeStalledPoolClaims_NudgesAfterGrace(t *testing.T) {
 	}
 }
 
+func TestNudgeStalledPoolClaimsTriggerRepointAfterReserveDoesNotDeliver(t *testing.T) {
+	cityPath := t.TempDir()
+	workRoot := t.TempDir()
+	maxSessions := 1
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "fixture-city"},
+		Providers: map[string]config.ProviderSpec{"codex": {Command: "codex", PathCheck: "true"}},
+		Agents: []config.Agent{{
+			Name:              "agent-a",
+			Provider:          "codex",
+			WorkDir:           filepath.Join(workRoot, "{{.AgentBase}}"),
+			ProjectHooks:      config.ProjectHooksForbid,
+			MaxActiveSessions: &maxSessions,
+			Nudge:             "claim now",
+		}},
+	}
+	sessionBead := idleClaimPoolSession()
+	sessionBead.Metadata["state"] = "active"
+	sessionBead.Metadata["provider"] = "codex"
+	sessionBead.Metadata["command"] = "codex"
+	sessionBead.Metadata["work_dir"] = filepath.Join(workRoot, "agent-a")
+	sessionBead.Metadata["agent_name"] = "agent-a"
+	sessionBead.Metadata[testTriggerBeadStoreRefKey] = "city:fixture-city"
+	sessionBead.Metadata[idleClaimNudgeTriggerKey] = "work-a"
+	sessionBead.Metadata[idleClaimNudgeTriggerStoreRefKey] = "city:fixture-city"
+	sessionBead.Metadata[idleClaimNudgeCountKey] = "0"
+	sessionBead.Metadata[idleClaimNudgeAtKey] = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).Format(time.RFC3339)
+	backing := beads.NewMemStoreFrom(0, []beads.Bead{sessionBead}, nil)
+	store := &driftTriggerAfterBackstopReserveStore{MemStore: backing, sessionID: sessionBead.ID}
+	sp := &projectHookIsolationWorkerProvider{Fake: runningIdleClaimFake(t, "session-a"), supported: true}
+	var out bytes.Buffer
+
+	nudgeStalledPoolClaims(
+		sp,
+		cfg,
+		store,
+		[]beads.Bead{sessionBead},
+		[]beads.Bead{{ID: "work-a", Status: "open"}},
+		[]string{"city:fixture-city"},
+		time.Date(2026, 1, 1, 0, 2, 0, 0, time.UTC),
+		&out,
+		cityPath,
+	)
+	if got := sp.CountCalls("Nudge", "session-a"); got != 0 {
+		t.Fatalf("Nudge calls = %d, want 0 after trigger repoint", got)
+	}
+}
+
 // Two stores can hold beads with the same ID, so the backstop must resolve the
 // slot's trigger through the store ref it was bound to. Here the rig-scoped
 // copy is still open (nudge-worthy) while the city-scoped copy of the same ID
@@ -101,6 +167,7 @@ func TestNudgeStalledPoolClaims_MatchesTriggerStoreRefForDuplicateIDs(t *testing
 	session := idleClaimPoolSession()
 	session.Metadata[testTriggerBeadStoreRefKey] = "rig:fixture"
 	session.Metadata[idleClaimNudgeTriggerKey] = "work-a"
+	session.Metadata[idleClaimNudgeTriggerStoreRefKey] = "rig:fixture"
 	session.Metadata[idleClaimNudgeCountKey] = "0"
 	session.Metadata[idleClaimNudgeAtKey] = base.Format(time.RFC3339)
 	work := []beads.Bead{
@@ -114,7 +181,7 @@ func TestNudgeStalledPoolClaims_MatchesTriggerStoreRefForDuplicateIDs(t *testing
 
 	nudgeStalledPoolClaims(sp, cfg, store, []beads.Bead{session}, work, storeRefs, clk.Now(), &out)
 	if got := sp.CountCalls("Nudge", "session-a"); got != 1 {
-		t.Fatalf("Nudge calls = %d, want 1 for the open rig-scoped trigger", got)
+		t.Fatalf("Nudge calls = %d, want 1 for the open rig-scoped trigger; output=%s", got, out.String())
 	}
 	session = mustGetTestBead(t, store, session.ID)
 	if got := session.Metadata[idleClaimNudgeCountKey]; got != "1" {

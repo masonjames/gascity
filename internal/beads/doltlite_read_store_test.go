@@ -117,6 +117,27 @@ func TestDoltliteReadStoreReadyUsesDoltlite(t *testing.T) {
 	}
 }
 
+func TestDoltliteReadStoreReadyExcludeLabelsUsesOneSQLSnapshot(t *testing.T) {
+	store := newDoltliteStoreWithIssues(t, []testDoltliteIssue{
+		{ID: "held-mayor", Title: "held mayor", Status: "open", IssueType: "task", Labels: []string{"hold:mayor"}},
+		{ID: "held-external", Title: "held external", Status: "open", IssueType: "task", Labels: []string{"hold:external"}},
+		{ID: "held-both", Title: "held both", Status: "open", IssueType: "task", Labels: []string{"hold:mayor", "hold:external"}},
+		{ID: "unrelated", Title: "unrelated", Status: "open", IssueType: "task", Labels: []string{"priority:high"}},
+		{ID: "unheld", Title: "unheld", Status: "open", IssueType: "task"},
+	})
+	rows, err := store.Ready(ReadyQuery{ExcludeLabels: []string{"hold:mayor", "hold:external"}})
+	if err != nil {
+		t.Fatalf("Ready: %v", err)
+	}
+	got := make([]string, len(rows))
+	for i := range rows {
+		got[i] = rows[i].ID
+	}
+	if want := []string{"unrelated", "unheld"}; !slices.Equal(got, want) {
+		t.Fatalf("Ready IDs = %v, want %v", got, want)
+	}
+}
+
 func TestDoltliteReadStoreReadyBlocksWorkflowDependencyTypes(t *testing.T) {
 	store, closeStore := newTestDoltliteReadStore(t)
 	defer closeStore()

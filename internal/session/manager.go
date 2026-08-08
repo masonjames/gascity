@@ -815,6 +815,20 @@ func NewManagerWithOptions(store beads.Store, sp runtime.Provider, opts ...Manag
 	return m
 }
 
+// startProvider is the sole Manager boundary into runtime.Provider.Start. It
+// finalizes the fully merged launch config before any provider can stage files,
+// run pre-start commands, or create a process.
+func (m *Manager) startProvider(ctx context.Context, sessName string, cfg runtime.Config) error {
+	finalized, err := runtime.FinalizeProjectHookIsolatedConfig(cfg)
+	if err != nil {
+		return err
+	}
+	if err := runtime.MaterializeProjectHookIsolatedConfigRoots(finalized); err != nil {
+		return err
+	}
+	return m.sp.Start(ctx, sessName, finalized)
+}
+
 // CreateSession is the single entry point for creating a session. It reads a
 // field-named CreateOptions and either starts the runtime immediately or, when
 // spec.BeadOnly is set, creates a start-pending bead for the reconciler to
@@ -993,7 +1007,7 @@ func (m *Manager) createStarted(ctx context.Context, spec CreateOptions) (Info, 
 			}
 			return fmt.Errorf("pre-start orphan cleanup: %w", orphanErr)
 		}
-		if err := m.sp.Start(ctx, sessName, cfg); err != nil {
+		if err := m.startProvider(ctx, sessName, cfg); err != nil {
 			if runtimeSessionMatchesBead(m.sp, sessName, b.ID, meta["instance_token"]) {
 				if metaErr := m.confirmStartedRuntimeMetadata(b.ID, &b); metaErr != nil {
 					return metaErr
@@ -1183,8 +1197,13 @@ func (m *Manager) createBeadOnly(spec CreateOptions) (Info, error) {
 // suspended, it is resumed first using resumeCommand. If the tmux session
 // died (active bead but no process), it is restarted.
 func (m *Manager) Attach(ctx context.Context, id string, resumeCommand string, hints runtime.Config) error {
+	return m.AttachWithWitness(ctx, id, resumeCommand, hints, LiveBoundaryWitness{})
+}
+
+// AttachWithWitness attaches only while the authorized trigger remains current.
+func (m *Manager) AttachWithWitness(ctx context.Context, id string, resumeCommand string, hints runtime.Config, witness LiveBoundaryWitness) error {
 	return withSessionMutationLock(id, func() error {
-		b, sessName, err := m.sessionBead(id)
+		b, sessName, err := m.sessionBeadWithWitness(id, witness)
 		if err != nil {
 			return err
 		}
@@ -1305,51 +1324,88 @@ func (m *Manager) CloseDetailed(id string) (CloseResult, error) {
 		if err != nil {
 			return err
 		}
-		if b.Status == "closed" {
-			_ = clearRuntimeMCPServersSnapshot(m.cityPath, id)
-			return nil // idempotent: already closed
-		}
-		// CmdClose is legal from any non-none state; this is effectively a
-		// documentation check that will catch future table changes. The
-		// canonicalizer treats empty metadata state as StateActive for
-		// bootstrap beads and the reconciler's StateAwake alias as StateActive
-		// so already-awake beads can close cleanly.
-		current := canonicalLifecycleState(State(b.Metadata["state"]))
-		if _, err := Transition(current, CmdClose); err != nil {
-			return err
-		}
-
-		// Stop the live runtime before marking the bead closed. Stop is
-		// idempotent for an already-gone session (returns nil), which also lets
-		// auto.Provider discard stale ACP route entries for suspended sessions.
-		// A genuine terminate failure must propagate and leave the bead open
-		// rather than report a "closed but still running" session — swallowing
-		// it here previously masked exactly that wedge.
-		if err := m.sp.Stop(sessName); err != nil {
-			return fmt.Errorf("stopping runtime for session %s: %w", id, err)
-		}
-		nudgeIDs, capped, err := NewStore(beads.SessionStore{Store: m.store}).CancelWaits(id, time.Now().UTC())
-		if err != nil {
-			log.Printf("session %s: closing after wait cancellation lookup failed: %v", id, err)
-		}
-		if capped {
-			log.Printf("session %s: closing after capped wait cancellation lookup", id)
-		}
-		result.WaitNudgeIDs = append(result.WaitNudgeIDs, nudgeIDs...)
-		if err := m.clearWakeAndHoldOverrides(id); err != nil {
-			return err
-		}
-		if err := m.retireConfiguredNamedSessionIdentifiers(id, b); err != nil {
-			return err
-		}
-
-		if err := m.store.Close(id); err != nil {
-			return err
-		}
-		_ = clearRuntimeMCPServersSnapshot(m.cityPath, id)
-		return nil
+		result, err = m.closeDetailedLocked(id, b, sessName)
+		return err
 	})
 	return result, err
+}
+
+// CloseDetailedForLifecycleWithWitness closes only the exact persisted session
+// incarnation captured by an automatic or ownership-sensitive caller. The raw
+// row is reloaded and validated under the per-session mutation lock before any
+// type repair, ACP routing, provider stop, wait cancellation, or row mutation.
+// It returns the authoritative pre-close persisted projections so callers can
+// choose a matching post-close conditional work-release policy.
+func (m *Manager) CloseDetailedForLifecycleWithWitness(
+	id string,
+	witness LiveBoundaryWitness,
+) (CloseResult, Info, PersistedResponse, error) {
+	var (
+		result    CloseResult
+		info      Info
+		persisted PersistedResponse
+	)
+	err := withSessionMutationLock(id, func() error {
+		b, sessName, err := m.reconcilerLifecycleSessionBeadWithWitness(id, witness)
+		if err != nil {
+			return err
+		}
+		info = infoFromPersistedBead(b)
+		info.SessionName = sessName
+		persisted = PersistedResponseFromBead(b)
+		result, err = m.closeDetailedLocked(id, b, sessName)
+		return err
+	})
+	return result, info, persisted, err
+}
+
+// closeDetailedLocked performs the close after the caller has loaded and
+// authorized b while holding the session mutation lock.
+func (m *Manager) closeDetailedLocked(id string, b beads.Bead, sessName string) (CloseResult, error) {
+	result := CloseResult{}
+	if b.Status == "closed" {
+		_ = clearRuntimeMCPServersSnapshot(m.cityPath, id)
+		return result, nil // idempotent: already closed
+	}
+	// CmdClose is legal from any non-none state; this is effectively a
+	// documentation check that will catch future table changes. The
+	// canonicalizer treats empty metadata state as StateActive for
+	// bootstrap beads and the reconciler's StateAwake alias as StateActive
+	// so already-awake beads can close cleanly.
+	current := canonicalLifecycleState(State(b.Metadata["state"]))
+	if _, err := Transition(current, CmdClose); err != nil {
+		return result, err
+	}
+
+	// Stop the live runtime before marking the bead closed. Stop is
+	// idempotent for an already-gone session (returns nil), which also lets
+	// auto.Provider discard stale ACP route entries for suspended sessions.
+	// A genuine terminate failure must propagate and leave the bead open
+	// rather than report a "closed but still running" session — swallowing
+	// it here previously masked exactly that wedge.
+	if err := m.sp.Stop(sessName); err != nil {
+		return result, fmt.Errorf("stopping runtime for session %s: %w", id, err)
+	}
+	nudgeIDs, capped, err := NewStore(beads.SessionStore{Store: m.store}).CancelWaits(id, time.Now().UTC())
+	if err != nil {
+		log.Printf("session %s: closing after wait cancellation lookup failed: %v", id, err)
+	}
+	if capped {
+		log.Printf("session %s: closing after capped wait cancellation lookup", id)
+	}
+	result.WaitNudgeIDs = append(result.WaitNudgeIDs, nudgeIDs...)
+	if err := m.clearWakeAndHoldOverrides(id); err != nil {
+		return result, err
+	}
+	if err := m.retireConfiguredNamedSessionIdentifiers(id, b); err != nil {
+		return result, err
+	}
+
+	if err := m.store.Close(id); err != nil {
+		return result, err
+	}
+	_ = clearRuntimeMCPServersSnapshot(m.cityPath, id)
+	return result, nil
 }
 
 func (m *Manager) clearWakeAndHoldOverrides(id string) error {

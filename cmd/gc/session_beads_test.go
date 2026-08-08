@@ -2032,7 +2032,7 @@ func TestRetireRemovedConfiguredNamedSessionBead_StopFailureKeepsRuntimeOwner(t 
 	}
 
 	var stderr bytes.Buffer
-	retired := retireRemovedConfiguredNamedSessionBead(store, nil, sp, b, now, &stderr)
+	retired := retireRemovedConfiguredNamedSessionBead(store, nil, sp, nil, b, now, &stderr)
 
 	if retired {
 		t.Fatal("retireRemovedConfiguredNamedSessionBead returned true after runtime stop failed")
@@ -7623,6 +7623,48 @@ func TestReapRuntimesBoundToClosedBeadsStopsLiveRuntime(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "reaped runtime \"mayor\" bound to closed session bead gm-closed") {
 		t.Fatalf("stderr = %q, want reap message", stderr.String())
+	}
+}
+
+func TestReapRuntimesBoundToClosedBeadsParksStrictSameNameReplacement(t *testing.T) {
+	sp := newDeadRuntimeArtifactProvider()
+	sp.visible["shared-runtime"] = true
+	if err := sp.SetMeta("shared-runtime", "GC_SESSION_ID", "strict-closed"); err != nil {
+		t.Fatalf("SetMeta: %v", err)
+	}
+	store := beads.NewMemStoreFrom(0, []beads.Bead{{
+		ID:     "strict-closed",
+		Type:   session.BeadType,
+		Status: "closed",
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"session_name": "shared-runtime",
+			"template":     "ordinary-worker",
+		},
+	}}, nil)
+	// The public name now resolves to a distinct open owner. A name-only Stop
+	// cannot prove which incarnation it would hit.
+	snapshot := newSessionBeadSnapshot([]beads.Bead{{
+		ID:     "strict-replacement",
+		Type:   session.BeadType,
+		Status: "open",
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"session_name": "shared-runtime",
+			"template":     "strict-worker",
+		},
+	}})
+	cfg := &config.City{Agents: []config.Agent{
+		{Name: "ordinary-worker", ProjectHooks: config.ProjectHooksInherit},
+		{Name: "strict-worker", ProjectHooks: config.ProjectHooksForbid},
+	}}
+
+	var stderr bytes.Buffer
+	if got := reapRuntimesBoundToClosedBeads(store, snapshot, nil, sp, &stderr, cfg); got != 0 {
+		t.Fatalf("reaped strict replacement = %d, want 0; stderr=%q", got, stderr.String())
+	}
+	if sp.stopCalls["shared-runtime"] != 0 || !sp.visible["shared-runtime"] {
+		t.Fatalf("strict replacement provider mutation: stopCalls=%d visible=%t", sp.stopCalls["shared-runtime"], sp.visible["shared-runtime"])
 	}
 }
 

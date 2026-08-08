@@ -215,14 +215,7 @@ func filterReadyByRoute(ready []beads.Bead, metadataKey, route string) []beads.B
 		if b.Metadata[metadataKey] != route {
 			continue
 		}
-		held := false
-		for _, label := range beadmeta.DispatchHoldLabels {
-			if beadLabelsContain(b.Labels, label) {
-				held = true
-				break
-			}
-		}
-		if held {
+		if beadmeta.HasDispatchHoldLabel(b.Labels) {
 			continue
 		}
 		matched = append(matched, b)

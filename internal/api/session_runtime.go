@@ -7,10 +7,12 @@ import (
 	"os/exec"
 	"strings"
 
+	"github.com/gastownhall/gascity/internal/agentutil"
 	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/convergence"
 	"github.com/gastownhall/gascity/internal/materialize"
+	"github.com/gastownhall/gascity/internal/pathutil"
 	"github.com/gastownhall/gascity/internal/processenv"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
@@ -272,18 +274,33 @@ func (s *Server) resolveSessionWorkDir(agentCfg config.Agent, qualifiedName stri
 	if cfg == nil {
 		return "", errors.New("no city config loaded")
 	}
+	cityPath := strings.TrimSpace(s.state.CityPath())
+	var forbiddenDiscoveryRoots []string
+	if agentCfg.ForbidsProjectHooks() {
+		if cityPath == "" {
+			return "", fmt.Errorf("agent %q: project hook isolation requires an attested city path", agentCfg.QualifiedName())
+		}
+		// Supplying an attested local discovery root opts the workdir package
+		// into its canonical external/per-instance isolation fence. The fence
+		// also rejects every city, rig, agent-dir, repository, and symlink alias.
+		forbiddenDiscoveryRoots = []string{cityPath}
+	}
 	workDir, err := workdirutil.ResolveWorkDirPathStrict(
-		s.state.CityPath(),
-		workdirutil.CityName(s.state.CityPath(), cfg),
+		cityPath,
+		workdirutil.CityName(cityPath, cfg),
 		qualifiedName,
 		agentCfg,
 		cfg.Rigs,
+		forbiddenDiscoveryRoots...,
 	)
 	if err != nil {
 		return "", err
 	}
 	if workDir == "" {
-		workDir = s.state.CityPath()
+		if agentCfg.ForbidsProjectHooks() {
+			return "", fmt.Errorf("agent %q: project hook isolation resolved an empty work_dir", agentCfg.QualifiedName())
+		}
+		workDir = cityPath
 	}
 	return workDir, nil
 }
@@ -324,7 +341,11 @@ func (s *Server) resolveSessionTemplateForCreate(template string) (*config.Resol
 	if err != nil {
 		return nil, "", "", "", err
 	}
-	return resolved, workDir, config.ResolveSessionCreateTransport(agentCfg.Session, resolved), agentCfg.QualifiedName(), nil
+	transport := config.ResolveSessionCreateTransport(agentCfg.Session, resolved)
+	if err := validateProjectHookIsolationProvider(agentCfg, transport, s.state.SessionProvider()); err != nil {
+		return nil, "", "", "", err
+	}
+	return resolved, workDir, transport, agentCfg.QualifiedName(), nil
 }
 
 //nolint:unparam // kept as a focused test helper even though current call sites use one template shape.
@@ -351,7 +372,10 @@ func (s *Server) resolveSessionTemplate(template string) (*config.ResolvedProvid
 func (s *Server) buildSessionResume(info session.Info) (string, runtime.Config, error) {
 	cmd := session.BuildResumeCommand(info)
 	metadata := s.sessionMetadata(info.ID)
-	resolved, workDir, transport, ambiguous := s.resolveSessionRuntimeWithMetadata(info, metadata)
+	resolved, workDir, transport, projectHooksForbidden, ambiguous, resolveErr := s.resolveSessionRuntimeWithMetadata(info, metadata)
+	if resolveErr != nil {
+		return "", runtime.Config{}, resolveErr
+	}
 	if resolved == nil {
 		return cmd, runtime.Config{WorkDir: info.WorkDir}, nil
 	}
@@ -380,7 +404,11 @@ func (s *Server) buildSessionResume(info session.Info) (string, runtime.Config, 
 	resolvedInfo.ResumeStyle = resolved.ResumeStyle
 	resolvedInfo.ResumeCommand = resumeCommand
 	sessionEnv := cityAnchoredSessionEnv(s.state.CityPath(), configuredWorkspaceSessionEnv(s.state.Config()), resolved.Env)
-	return session.BuildResumeCommand(resolvedInfo), sessionResumeHints(resolved, workDir, sessionEnv, mcpServers, sessionResumeInteractive(metadata)), nil
+	hints := sessionResumeHints(resolved, workDir, sessionEnv, mcpServers, sessionResumeInteractive(metadata))
+	hints.ProviderName = firstNonEmptyString(resolved.BuiltinAncestor, resolved.Name)
+	hints.ProviderOverlayName = strings.TrimSpace(resolved.Name)
+	hints.ProjectHooksForbidden = projectHooksForbidden
+	return session.BuildResumeCommand(resolvedInfo), hints, nil
 }
 
 func (s *Server) resolvedSessionRuntimeCommand(resolved *config.ResolvedProvider, transport, storedCommand string, metadata map[string]string) (string, error) {
@@ -472,11 +500,20 @@ func (s *Server) resolveWorkerSessionRuntime(info session.Info) (*worker.Resolve
 	return s.resolveWorkerSessionRuntimeWithMetadata(info, "", nil)
 }
 
-func (s *Server) resolveWorkerSessionRuntimeWithMetadata(info session.Info, _ string, metadata map[string]string) (*worker.ResolvedRuntime, error) {
+func (s *Server) resolveWorkerSessionRuntimeWithMetadata(info session.Info, sessionKind string, metadata map[string]string) (*worker.ResolvedRuntime, error) {
 	if metadata == nil {
 		metadata = s.sessionMetadata(info.ID)
 	}
-	resolved, workDir, transport, ambiguous := s.resolveSessionRuntimeWithMetadata(info, metadata)
+	cfg := s.state.Config()
+	var err error
+	info, err = resolvePersistedSessionRuntimeInfo(cfg, info, sessionKind, metadata)
+	if err != nil {
+		return nil, err
+	}
+	resolved, workDir, transport, projectHooksForbidden, ambiguous, resolveErr := s.resolveSessionRuntimeWithMetadata(info, metadata)
+	if resolveErr != nil {
+		return nil, resolveErr
+	}
 	if resolved == nil {
 		return nil, nil
 	}
@@ -498,12 +535,24 @@ func (s *Server) resolveWorkerSessionRuntimeWithMetadata(info session.Info, _ st
 		}
 	}
 	sessionEnv := cityAnchoredSessionEnv(s.state.CityPath(), configuredWorkspaceSessionEnv(s.state.Config()), resolved.Env)
+	effectiveWorkDir := firstNonEmptyString(info.WorkDir, workDir)
+	if projectHooksForbidden {
+		// The freshly resolved path is the current attestation. When a persisted
+		// path exists, the resolver already proved it canonically identical; do
+		// not give persisted text precedence and accidentally reintroduce an
+		// unsafe alias or stale cwd.
+		effectiveWorkDir = workDir
+	}
+	hints := sessionResumeHints(resolved, workDir, sessionEnv, mcpServers, sessionResumeInteractive(metadata))
+	hints.ProviderName = firstNonEmptyString(resolved.BuiltinAncestor, resolved.Name)
+	hints.ProviderOverlayName = strings.TrimSpace(resolved.Name)
+	hints.ProjectHooksForbidden = projectHooksForbidden
 	runtimeCfg, err := worker.NormalizeResolvedRuntime(worker.ResolvedRuntime{
 		Command:    command,
-		WorkDir:    firstNonEmptyString(info.WorkDir, workDir),
+		WorkDir:    effectiveWorkDir,
 		Provider:   firstNonEmptyString(info.Provider, resolved.Name),
 		SessionEnv: sessionEnv,
-		Hints:      sessionResumeHints(resolved, firstNonEmptyString(workDir, info.WorkDir), sessionEnv, mcpServers, sessionResumeInteractive(metadata)),
+		Hints:      hints,
 		Resume: session.ProviderResume{
 			ResumeFlag:    firstNonEmptyString(resolved.ResumeFlag, info.ResumeFlag),
 			ResumeStyle:   firstNonEmptyString(resolved.ResumeStyle, info.ResumeStyle),
@@ -515,6 +564,53 @@ func (s *Server) resolveWorkerSessionRuntimeWithMetadata(info session.Info, _ st
 		return nil, err
 	}
 	return &runtimeCfg, nil
+}
+
+func resolvePersistedSessionRuntimeInfo(cfg *config.City, info session.Info, sessionKind string, metadata map[string]string) (session.Info, error) {
+	identity, _, err := resolvePersistedSessionAgentForRuntime(cfg, info, sessionKind, metadata)
+	if err != nil {
+		return session.Info{}, fmt.Errorf("resolving persisted session identity: %w", err)
+	}
+	if identity.Resolved {
+		// Provider, workdir, MCP, and isolation decisions must all consume the
+		// same conflict-checked configured base. Concrete identity remains on
+		// AgentName/canonical metadata for per-session materialization.
+		info.Template = identity.Agent.QualifiedName()
+	}
+	return info, nil
+}
+
+func resolvePersistedSessionAgentForRuntime(
+	cfg *config.City,
+	info session.Info,
+	sessionKind string,
+	metadata map[string]string,
+) (agentutil.PersistedSessionAgentResolution, bool, error) {
+	if cfg == nil {
+		resolution, err := agentutil.ResolvePersistedSessionAgent(cfg, info)
+		return resolution, true, err
+	}
+	if strings.TrimSpace(sessionKind) == "" {
+		sessionKind = legacySessionKind(metadata)
+	}
+	templateAgent, templateFound := resolveSessionTemplateAgent(cfg, info.Template)
+	templateIdentifiesAgent := session.UseAgentTemplateForProviderResolution(
+		sessionKind,
+		metadata,
+		info.Provider,
+		templateAgent.Provider,
+		templateFound,
+	)
+	identityInfo := info
+	if !templateIdentifiesAgent {
+		// Provider-created sessions persist the provider key in Template. Keep
+		// that value on info for provider/runtime resolution, but do not treat it
+		// as configured-agent identity evidence. Every other durable signal stays
+		// in the resolver input and therefore remains conflict-checked.
+		identityInfo.Template = ""
+	}
+	resolution, err := agentutil.ResolvePersistedSessionAgent(cfg, identityInfo)
+	return resolution, templateIdentifiesAgent, err
 }
 
 func storedSessionProvesACPTransport(resolved *config.ResolvedProvider, configuredTransport, storedCommand string, metadata map[string]string) bool {
@@ -634,12 +730,14 @@ func resolvedSessionTransport(info session.Info, resolved *config.ResolvedProvid
 	return ""
 }
 
-func (s *Server) resolveSessionRuntimeWithMetadata(info session.Info, metadata map[string]string) (*config.ResolvedProvider, string, string, bool) {
+func (s *Server) resolveSessionRuntimeWithMetadata(info session.Info, metadata map[string]string) (*config.ResolvedProvider, string, string, bool, bool, error) {
 	cfg := s.state.Config()
 	var (
-		resolved            *config.ResolvedProvider
-		workDir             string
-		configuredTransport string
+		resolved              *config.ResolvedProvider
+		workDir               string
+		configuredTransport   string
+		projectHooksAgent     config.Agent
+		projectHooksForbidden bool
 	)
 	if cfg != nil {
 		agentCfg, agentFound := resolveSessionTemplateAgent(cfg, info.Template)
@@ -647,12 +745,30 @@ func (s *Server) resolveSessionRuntimeWithMetadata(info session.Info, metadata m
 		if session.UseAgentTemplateForProviderResolution(sessionKind, metadata, info.Provider, agentCfg.Provider, agentFound) {
 			if agentFound {
 				candidate, err := config.ResolveProvider(&agentCfg, &cfg.Workspace, cfg.Providers, exec.LookPath)
+				if err != nil && agentCfg.ForbidsProjectHooks() {
+					return nil, "", "", false, false, fmt.Errorf("resolving provider for project-hook-isolated agent %q: %w", agentCfg.QualifiedName(), err)
+				}
 				if err == nil {
-					candidateWorkDir, workDirErr := s.resolveSessionWorkDir(agentCfg, agentCfg.QualifiedName())
+					qualifiedName := workdirutil.SessionQualifiedName(s.state.CityPath(), agentCfg, cfg.Rigs, info.Alias, info.SessionName)
+					if strings.TrimSpace(info.AgentName) != "" {
+						qualifiedName = info.AgentName
+					}
+					candidateWorkDir, workDirErr := s.resolveSessionWorkDir(agentCfg, qualifiedName)
+					if workDirErr != nil && agentCfg.ForbidsProjectHooks() {
+						return nil, "", "", false, false, fmt.Errorf("attesting resume work_dir for agent %q: %w", agentCfg.QualifiedName(), workDirErr)
+					}
 					if workDirErr == nil {
 						resolved = candidate
 						workDir = candidateWorkDir
-						if info.WorkDir != "" {
+						projectHooksForbidden = agentCfg.ForbidsProjectHooks()
+						projectHooksAgent = agentCfg
+						if projectHooksForbidden && strings.TrimSpace(info.WorkDir) != "" && !pathutil.SamePath(info.WorkDir, candidateWorkDir) {
+							return nil, "", "", false, false, fmt.Errorf(
+								"agent %q: persisted work_dir %q differs from current attested work_dir %q",
+								agentCfg.QualifiedName(), info.WorkDir, candidateWorkDir,
+							)
+						}
+						if !projectHooksForbidden && info.WorkDir != "" {
 							workDir = info.WorkDir
 						}
 						configuredTransport = config.ResolveSessionCreateTransport(agentCfg.Session, resolved)
@@ -668,7 +784,7 @@ func (s *Server) resolveSessionRuntimeWithMetadata(info session.Info, metadata m
 		}
 		candidate, err := s.resolveBareProvider(providerName)
 		if err != nil {
-			return nil, "", "", false
+			return nil, "", "", false, false, nil
 		}
 		resolved = candidate
 		workDir = info.WorkDir
@@ -681,7 +797,12 @@ func (s *Server) resolveSessionRuntimeWithMetadata(info session.Info, metadata m
 	if transport == "" && s.startedConfigHashProvesACPTransport(info, metadata, resolved, workDir, configuredTransport, legacySessionKind(metadata)) {
 		transport = "acp"
 	}
-	return resolved, workDir, transport, transport == "" && legacyACPTransportAmbiguous(resolved, configuredTransport, info.Command, metadata)
+	if projectHooksForbidden {
+		if err := validateProjectHookIsolationProvider(projectHooksAgent, transport, s.state.SessionProvider()); err != nil {
+			return nil, "", "", false, false, err
+		}
+	}
+	return resolved, workDir, transport, projectHooksForbidden, transport == "" && legacyACPTransportAmbiguous(resolved, configuredTransport, info.Command, metadata), nil
 }
 
 // resolveBareProvider resolves a provider by name without an agent template.

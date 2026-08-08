@@ -678,7 +678,9 @@ type t3BridgeTestServer struct {
 	server            *httptest.Server
 	mu                sync.Mutex
 	commands          []string
+	commandPayloads   []map[string]interface{}
 	snapshot          map[string]interface{}
+	snapshotAfterRead map[string]interface{}
 	authFailures      int
 	authFailureStatus int
 	authFailureBody   string
@@ -740,14 +742,20 @@ func newT3BridgeTestServer(t *testing.T, snapshot map[string]interface{}) *t3Bri
 		value := map[string]interface{}{}
 		switch req.Tag {
 		case "orchestration.getSnapshot":
+			ts.mu.Lock()
 			value = ts.snapshot
+			if ts.snapshotAfterRead != nil {
+				ts.snapshot = ts.snapshotAfterRead
+				ts.snapshotAfterRead = nil
+			}
+			ts.mu.Unlock()
 		case "orchestration.dispatchCommand":
 			var payload map[string]interface{}
 			if err := json.Unmarshal(req.Payload, &payload); err != nil {
 				t.Errorf("decode dispatch payload: %v", err)
 				return
 			}
-			ts.recordCommand(commandType(payload))
+			ts.recordCommand(payload)
 		}
 
 		resp := map[string]interface{}{
@@ -773,16 +781,23 @@ func (ts *t3BridgeTestServer) wsURL() string {
 	return "ws" + strings.TrimPrefix(ts.server.URL, "http")
 }
 
-func (ts *t3BridgeTestServer) recordCommand(typ string) {
+func (ts *t3BridgeTestServer) recordCommand(payload map[string]interface{}) {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
-	ts.commands = append(ts.commands, typ)
+	ts.commands = append(ts.commands, commandType(payload))
+	ts.commandPayloads = append(ts.commandPayloads, payload)
 }
 
 func (ts *t3BridgeTestServer) commandTypes() []string {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 	return append([]string(nil), ts.commands...)
+}
+
+func (ts *t3BridgeTestServer) dispatchedCommands() []map[string]interface{} {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	return append([]map[string]interface{}(nil), ts.commandPayloads...)
 }
 
 func (ts *t3BridgeTestServer) setAuthFailures(count, status int, body string) {

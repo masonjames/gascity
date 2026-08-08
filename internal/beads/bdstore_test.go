@@ -569,6 +569,57 @@ func TestBdStoreGetExactIDGuard(t *testing.T) {
 	}
 }
 
+func TestBdStoreGuardedAssignmentClaimFailsClosedWithoutRunner(t *testing.T) {
+	runnerCalls := 0
+	store := beads.NewBdStore("/city", func(_, _ string, _ ...string) ([]byte, error) {
+		runnerCalls++
+		return []byte(`[{"id":"wrong-id","status":"in_progress","assignee":"wrong-actor"}]`), nil
+	})
+	if claimer, ok := beads.GuardedAssignmentClaimerFor(store); ok || claimer != nil {
+		t.Fatalf("BdStore exposes GuardedAssignmentClaimer (%T); bd cannot bind explicit actor plus route/label/session guards atomically", claimer)
+	}
+	cache := beads.NewCachingStoreForTest(store, nil)
+	if claimer, ok := beads.GuardedAssignmentClaimerFor(cache); ok || claimer != nil {
+		t.Fatalf("CachingStore over BdStore exposes GuardedAssignmentClaimer (%T), want fail-closed capability veto", claimer)
+	}
+	claimed, ok, err := cache.ClaimAssignment(t.Context(), beads.AssignmentClaimRequest{
+		ID:               "wanted-exact-id",
+		Actor:            "explicit-worker",
+		ExpectedStatus:   "open",
+		ExpectedMetadata: map[string]string{"gc.routed_to": "rig/pool"},
+		ForbiddenLabels:  []string{"hold:external"},
+		AssignmentMetadata: map[string]string{
+			"gc.session_id":             "session-42",
+			"gc.session_name":           "rig-worker-1",
+			"gc.session_instance_token": "instance-9",
+		},
+	})
+	if ok || claimed.ID != "" || !errors.Is(err, beads.ErrGuardedAssignmentClaimUnsupported) {
+		t.Fatalf("ClaimAssignment over BdStore = (%+v, %v, %v), want zero,false,unsupported", claimed, ok, err)
+	}
+	if runnerCalls != 0 {
+		t.Fatalf("wrong-ID explicit-actor guarded claim invoked bd runner %d times, want zero mutation/read calls", runnerCalls)
+	}
+}
+
+func TestBdStoreCreateAssignmentClaimIsUnsupportedWithoutRunner(t *testing.T) {
+	runnerCalls := 0
+	store := beads.NewBdStore("/city", func(_, _ string, _ ...string) ([]byte, error) {
+		runnerCalls++
+		return nil, errors.New("runner must not be called while resolving capability")
+	})
+	if claimer, ok := beads.CreateAssignmentClaimerFor(store); ok || claimer != nil {
+		t.Fatalf("BdStore exposes CreateAssignmentClaimer (%T); bd cannot create a fresh witness and claim exact work in one rollback-capable operation", claimer)
+	}
+	cache := beads.NewCachingStoreForTest(store, nil)
+	if claimer, ok := beads.CreateAssignmentClaimerFor(cache); ok || claimer != nil {
+		t.Fatalf("CachingStore over BdStore exposes CreateAssignmentClaimer (%T), want fail-closed capability veto", claimer)
+	}
+	if runnerCalls != 0 {
+		t.Fatalf("CreateAssignmentClaimer resolution invoked bd runner %d times, want zero", runnerCalls)
+	}
+}
+
 // TestBdStoreMutationsPassThroughOnNotFound verifies that Update/Delete/Close
 // always reach bd directly (internal hot-path callers supply canonical full IDs;
 // the exact-ID collision guard lives at the CLI/API entry points — gcy-g4o).
@@ -2369,6 +2420,26 @@ func TestBdStoreReadyWithAssigneeAndLimit(t *testing.T) {
 	}
 	if got[0].ID != "bd-worker" {
 		t.Fatalf("Ready(assignee)[0].ID = %q, want bd-worker", got[0].ID)
+	}
+}
+
+func TestBdStoreReadyPassesEveryExcludedLabelToOneCommand(t *testing.T) {
+	var gotCmd string
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		gotCmd = name + " " + strings.Join(args, " ")
+		return []byte(`[{"id":"bd-unheld","title":"ready","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}]`), nil
+	}
+	store := beads.NewBdStore("/city", runner)
+	rows, err := store.Ready(beads.ReadyQuery{ExcludeLabels: []string{"hold:mayor", "hold:external"}})
+	if err != nil {
+		t.Fatalf("Ready: %v", err)
+	}
+	if len(rows) != 1 || rows[0].ID != "bd-unheld" {
+		t.Fatalf("Ready = %+v, want unheld row", rows)
+	}
+	want := "bd ready --json --exclude-label hold:mayor --exclude-label hold:external --limit 0"
+	if gotCmd != want {
+		t.Fatalf("bd command = %q, want %q", gotCmd, want)
 	}
 }
 

@@ -418,11 +418,22 @@ func (s *Store) Ready(query ...beads.ReadyQuery) ([]beads.Bead, error) {
 	result := all[:0]
 	now := time.Now().UTC()
 	for _, b := range all {
-		if beads.IsReadyCandidateForTier(b, now, q.TierMode) {
+		if beads.IsReadyCandidateForTier(b, now, q.TierMode) && !readyQueryExcludesAnyLabel(q, b.Labels) {
 			result = append(result, b)
 		}
 	}
 	return beads.ApplyListQuery(result, beads.ListQuery{Assignee: q.Assignee, Limit: q.Limit, TierMode: q.TierMode}), nil
+}
+
+func readyQueryExcludesAnyLabel(query beads.ReadyQuery, labels []string) bool {
+	for _, label := range labels {
+		for _, excluded := range query.ExcludeLabels {
+			if label == excluded {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Children returns non-closed beads whose ParentID matches by default:

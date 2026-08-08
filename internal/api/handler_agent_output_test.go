@@ -195,6 +195,41 @@ func TestAgentOutputConversationUsesConfiguredWorkDir(t *testing.T) {
 	}
 }
 
+func TestAgentOutputConversationReadsForbiddenExternalWorkDir(t *testing.T) {
+	state := newFakeState(t)
+	externalRoot := t.TempDir()
+	state.cfg.Agents[0].ProjectHooks = config.ProjectHooksForbid
+	state.cfg.Agents[0].WorkDir = filepath.Join(externalRoot, "{{.AgentBase}}")
+
+	searchBase := t.TempDir()
+	workDir := filepath.Join(externalRoot, "worker")
+	writeSessionJSONL(t, searchBase, workDir,
+		`{"uuid":"1","parentUuid":"","type":"user","message":"{\"role\":\"user\",\"content\":\"hello\"}","timestamp":"2025-01-01T00:00:00Z"}`,
+		`{"uuid":"2","parentUuid":"1","type":"assistant","message":"{\"role\":\"assistant\",\"content\":\"from forbidden external workdir\"}","timestamp":"2025-01-01T00:00:01Z"}`,
+	)
+
+	srv := newServerWithSearchPaths(state, searchBase)
+	h := newTestCityHandlerWith(t, state, srv)
+	req := httptest.NewRequest("GET", cityURL(state, "/agent/myrig/worker/output?tail=0"), nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var resp agentOutputResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Format != "conversation" {
+		t.Fatalf("Format = %q, want conversation", resp.Format)
+	}
+	if len(resp.Turns) != 2 || resp.Turns[1].Text != "from forbidden external workdir" {
+		t.Fatalf("Turns = %+v, want forbidden external work_dir session log", resp.Turns)
+	}
+}
+
 func TestAgentOutputNotFound(t *testing.T) {
 	state := newFakeState(t)
 	h := newTestCityHandler(t, state)
@@ -541,6 +576,44 @@ func TestAgentOutputStreamStoppedAgent(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "hello") {
 		t.Errorf("body should contain session data, got: %s", rec.Body.String())
+	}
+}
+
+func TestAgentOutputStreamStoppedForbiddenAgentReplaysTranscript(t *testing.T) {
+	state := newFakeState(t)
+	externalRoot := t.TempDir()
+	state.cfg.Agents[0].ProjectHooks = config.ProjectHooksForbid
+	state.cfg.Agents[0].WorkDir = filepath.Join(externalRoot, "{{.AgentBase}}")
+
+	searchBase := t.TempDir()
+	workDir := filepath.Join(externalRoot, "worker")
+	writeSessionJSONL(t, searchBase, workDir,
+		`{"uuid":"1","parentUuid":"","type":"user","message":"{\"role\":\"user\",\"content\":\"forbidden replay\"}","timestamp":"2025-01-01T00:00:00Z"}`,
+	)
+
+	srv := newServerWithSearchPaths(state, searchBase)
+	h := newTestCityHandlerWith(t, state, srv)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	req := httptest.NewRequest("GET", cityURL(state, "/agent/myrig/worker/output/stream"), nil).WithContext(ctx)
+	rec := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		h.ServeHTTP(rec, req)
+		close(done)
+	}()
+	<-done
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := rec.Result().Header.Get("GC-Agent-Status"); got != "stopped" {
+		t.Errorf("committed GC-Agent-Status = %q, want %q", got, "stopped")
+	}
+	if !strings.Contains(rec.Body.String(), "forbidden replay") {
+		t.Errorf("body should contain forbidden-agent session data, got: %s", rec.Body.String())
 	}
 }
 

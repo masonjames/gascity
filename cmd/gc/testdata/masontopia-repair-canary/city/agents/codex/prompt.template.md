@@ -1,0 +1,1 @@
+Frozen pool-worker fixture.

@@ -51,6 +51,8 @@ type StartupHints struct {
 	// CopyFiles lists files/directories to stage in the session's working
 	// directory before the agent command starts.
 	CopyFiles []runtime.CopyEntry
+	// ProjectHooksForbidden requires a hook-free, locally attestable cwd.
+	ProjectHooksForbidden bool
 }
 
 // ToRuntimeConfig projects the startup hints onto a runtime.Config. It is the
@@ -81,5 +83,6 @@ func (h StartupHints) ToRuntimeConfig() runtime.Config {
 		PackOverlayDirs:        h.PackOverlayDirs,
 		OverlayDir:             h.OverlayDir,
 		CopyFiles:              h.CopyFiles,
+		ProjectHooksForbidden:  h.ProjectHooksForbidden,
 	}
 }

@@ -83,18 +83,23 @@ func (m *Manager) SubmissionCapabilities(id string) (SubmissionCapabilities, err
 
 // Submit delivers a user message according to the requested semantic intent.
 func (m *Manager) Submit(ctx context.Context, id, message, resumeCommand string, hints runtime.Config, intent SubmitIntent) (SubmitOutcome, error) {
+	return m.SubmitWithWitness(ctx, id, message, resumeCommand, hints, intent, LiveBoundaryWitness{})
+}
+
+// SubmitWithWitness submits only while the authorized trigger remains current.
+func (m *Manager) SubmitWithWitness(ctx context.Context, id, message, resumeCommand string, hints runtime.Config, intent SubmitIntent, witness LiveBoundaryWitness) (SubmitOutcome, error) {
 	switch intent {
 	case "", SubmitIntentDefault, SubmitIntentFollowUp, SubmitIntentInterruptNow:
 	default:
 		return SubmitOutcome{}, fmt.Errorf("invalid submit intent %q", intent)
 	}
-	return m.submit(ctx, id, message, resumeCommand, hints, intent)
+	return m.submit(ctx, id, message, resumeCommand, hints, intent, witness)
 }
 
-func (m *Manager) submit(ctx context.Context, id, message, resumeCommand string, hints runtime.Config, intent SubmitIntent) (SubmitOutcome, error) {
+func (m *Manager) submit(ctx context.Context, id, message, resumeCommand string, hints runtime.Config, intent SubmitIntent, witness LiveBoundaryWitness) (SubmitOutcome, error) {
 	var outcome SubmitOutcome
 	err := withSessionMutationLock(id, func() error {
-		b, sessName, err := m.sessionBead(id)
+		b, sessName, err := m.sessionBeadWithWitness(id, witness)
 		if err != nil {
 			return err
 		}

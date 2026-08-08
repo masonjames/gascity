@@ -54,7 +54,8 @@ const FingerprintVersion = "v5"
 //
 // Included: Command, Lifecycle, Env, FingerprintExtra (pool config, etc.),
 // PreStart, SessionSetup, SessionSetupScript, OverlayDir, effective provider
-// overlay slots, CopyFiles, AcceptStartupDialogs, MouseOn, SessionLive.
+// overlay slots, CopyFiles, ProjectHooksForbidden, AcceptStartupDialogs,
+// MouseOn, SessionLive.
 //
 // Excluded (observation-only hints): WorkDir, ReadyPromptPrefix,
 // ReadyDelayMs, ProcessNames, EmitsPermissionWarning.
@@ -246,6 +247,9 @@ func hashCoreFields(h hash.Hash, cfg Config) {
 	hashOverlayProviders(h, OverlayProviderNames(cfg))
 	hashOptionalBool(h, "accept_startup_dialogs", cfg.AcceptStartupDialogs)
 	hashBool(h, "mouse_on", cfg.MouseOn)
+	if cfg.ProjectHooksForbidden {
+		hashBool(h, "project_hooks_forbidden", true)
+	}
 
 	// CopyFiles — probed entries use ContentHash (stable when content
 	// unchanged, even if files are recreated). Config-derived entries
@@ -458,6 +462,11 @@ func CoreFingerprintBreakdown(cfg Config) BreakdownV1 {
 		}),
 		"MouseOn": fieldHash(func(h hash.Hash) {
 			hashBool(h, "mouse_on", cfg.MouseOn)
+		}),
+		"ProjectHooksForbidden": fieldHash(func(h hash.Hash) {
+			if cfg.ProjectHooksForbidden {
+				hashBool(h, "project_hooks_forbidden", true)
+			}
 		}),
 		"CopyFiles": fieldHash(func(h hash.Hash) {
 			for _, cf := range cfg.CopyFiles {

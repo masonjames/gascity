@@ -37,6 +37,7 @@ var partitionHalfCases = []struct {
 	// ProviderOverlayName is the behavioral witness for the overlay-providers core
 	// hash, which also folds in ProviderName + InstallAgentHooks (see coreFieldHalf).
 	{"ProviderOverlayName", "provision", func(c *Config) { c.ProviderOverlayName = "different-overlay-provider" }},
+	{"ProjectHooksForbidden", "provision", func(c *Config) { c.ProjectHooksForbidden = !c.ProjectHooksForbidden }},
 	{"CopyFiles", "provision", func(c *Config) { c.CopyFiles = []CopyEntry{{Src: "/different", RelDst: "z"}} }},
 }
 
@@ -101,14 +102,15 @@ var coreFieldHalf = map[string]string{
 	"SessionSetup":         "launch",
 	"SessionSetupScript":   "launch",
 	// PROVISION (box) half.
-	"Env":                 "provision",
-	"FingerprintExtra":    "provision",
-	"PreStart":            "provision",
-	"OverlayDir":          "provision",
-	"CopyFiles":           "provision",
-	"ProviderName":        "provision",
-	"ProviderOverlayName": "provision",
-	"InstallAgentHooks":   "provision",
+	"Env":                   "provision",
+	"FingerprintExtra":      "provision",
+	"PreStart":              "provision",
+	"OverlayDir":            "provision",
+	"CopyFiles":             "provision",
+	"ProviderName":          "provision",
+	"ProviderOverlayName":   "provision",
+	"InstallAgentHooks":     "provision",
+	"ProjectHooksForbidden": "provision",
 }
 
 var excludedFromCore = map[string]string{

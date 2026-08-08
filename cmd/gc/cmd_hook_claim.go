@@ -12,11 +12,13 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/executionevent"
+	"github.com/gastownhall/gascity/internal/session"
 )
 
 const hookClaimCommandName = "hook"
@@ -42,6 +44,24 @@ type hookClaimOptions struct {
 	Env                []string
 	DrainAck           bool
 	JSON               bool
+}
+
+// hookClaimTriggerExpectation is the controller-authored, session-persisted
+// identity of the one work bead a triggered runtime may adopt. Both fields are
+// required together. A zero value is reserved for legacy sessions that have no
+// persisted trigger and therefore retain the generic claim path.
+type hookClaimTriggerExpectation struct {
+	BeadID   string
+	StoreRef string
+}
+
+// hookClaimExpectedTriggerOps contains the two boundaries needed by the exact
+// trigger path: canonical store resolution for the authoritative point read,
+// and the existing claim operations used only after that read passes every
+// fence. Keeping the resolver injectable lets tests prove no federated runner or
+// mutation is reached on a mismatch.
+type hookClaimExpectedTriggerOps struct {
+	ResolveStore func(string) (beads.Store, error)
 }
 
 type hookClaimOps struct {
@@ -124,6 +144,215 @@ func doHookClaim(workQuery, dir string, opts hookClaimOptions, ops hookClaimOps,
 		return res.code
 	}
 	return writeHookClaimNoWork(opts, ops, res.claimsErrored, stdout, stderr)
+}
+
+// claimHookExpectedTrigger executes the defense-in-depth claim path for a
+// session carrying a persisted trigger. It resolves exactly expectation.StoreRef
+// and point-reads exactly expectation.BeadID before invoking any generic
+// work-query, claim, metadata, continuation, event, run-map, or drain-ack
+// operation. The authoritative bead must still be dispatchable to this runtime:
+// another owner, a mismatched route, an unexpected status, or a mismatched
+// session witness all fail closed. Canonical holds are deliberately not
+// re-applied here: the controller's guarded assignment excludes them while the
+// bead is open/unassigned, while a hold added after assignment remains
+// transparent to the owning Tier-1/2 session.
+//
+// Once the fence passes, the already-tested claim protocol consumes only the
+// point-read bead. Its runner is replaced with a fixed serialization of that
+// bead, so even a caller-supplied federated runner cannot execute or substitute
+// another candidate between the fence and the mutation.
+func claimHookExpectedTrigger(expectation hookClaimTriggerExpectation, target hookStore, opts hookClaimOptions, ops hookClaimExpectedTriggerOps, stdout, stderr io.Writer) int {
+	if err := validateHookClaimTriggerExpectation(expectation); err != nil {
+		fmt.Fprintf(stderr, "gc hook --claim: refusing invalid trigger fence: %v\n", err) //nolint:errcheck
+		return 1
+	}
+	if len(target.env) > 0 {
+		opts.Env = target.env
+	}
+	if ops.ResolveStore == nil {
+		fmt.Fprintln(stderr, "gc hook --claim: refusing trigger fence: missing exact store resolver") //nolint:errcheck
+		return 1
+	}
+	store, err := ops.ResolveStore(expectation.StoreRef)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc hook --claim: refusing trigger %s in %s: resolving exact store: %v\n", expectation.BeadID, expectation.StoreRef, err) //nolint:errcheck
+		return 1
+	}
+	if store == nil {
+		fmt.Fprintf(stderr, "gc hook --claim: refusing trigger %s in %s: exact store resolver returned nil\n", expectation.BeadID, expectation.StoreRef) //nolint:errcheck
+		return 1
+	}
+	bead, err := beads.HandlesFor(store).Live.Get(expectation.BeadID)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc hook --claim: refusing trigger %s in %s: loading exact bead: %v\n", expectation.BeadID, expectation.StoreRef, err) //nolint:errcheck
+		return 1
+	}
+	if err := validateHookClaimExpectedBead(bead, expectation, opts); err != nil {
+		fmt.Fprintf(stderr, "gc hook --claim: refusing trigger %s in %s: %v\n", expectation.BeadID, expectation.StoreRef, err) //nolint:errcheck
+		return 1
+	}
+	revalidated, err := revalidateHookClaimExpectedBead(store, bead, expectation, opts)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc hook --claim: refusing trigger %s in %s: atomic assignment revalidation: %v\n", expectation.BeadID, expectation.StoreRef, err) //nolint:errcheck
+		return 1
+	}
+	if err := validateHookClaimExpectedBead(revalidated, expectation, opts); err != nil {
+		fmt.Fprintf(stderr, "gc hook --claim: refusing trigger %s in %s: authoritative assignment revalidation: %v\n", expectation.BeadID, expectation.StoreRef, err) //nolint:errcheck
+		return 1
+	}
+	bead = revalidated
+	return writeHookClaimExpectedTriggerResult(bead, opts, stdout, stderr)
+}
+
+func revalidateHookClaimExpectedBead(store beads.Store, bead beads.Bead, expectation hookClaimTriggerExpectation, opts hookClaimOptions) (beads.Bead, error) {
+	if !strings.HasPrefix(expectation.StoreRef, "city:") {
+		return beads.Bead{}, fmt.Errorf("session witness is not co-located with work store %q: %w", expectation.StoreRef, beads.ErrGuardedAssignmentClaimUnsupported)
+	}
+	claimer, ok := beads.GuardedAssignmentClaimerFor(store)
+	if !ok {
+		return beads.Bead{}, beads.ErrGuardedAssignmentClaimUnsupported
+	}
+	sessionID := hookClaimSessionID(opts.Env)
+	info, err := sessionFrontDoor(store).Get(sessionID)
+	if err != nil {
+		return beads.Bead{}, fmt.Errorf("loading co-located session witness %q: %w", sessionID, err)
+	}
+	if info.TriggerBeadID != expectation.BeadID || info.TriggerBeadStoreRef != expectation.StoreRef {
+		return beads.Bead{}, fmt.Errorf(
+			"co-located session trigger (%s, %s) does not match expected trigger (%s, %s)",
+			info.TriggerBeadID,
+			info.TriggerBeadStoreRef,
+			expectation.BeadID,
+			expectation.StoreRef,
+		)
+	}
+	if verdict, reason := hookClaimSessionEligibility(info, hookClaimEnvValue(opts.Env, "GC_INSTANCE_TOKEN")); verdict != hookClaimSessionEligible {
+		return beads.Bead{}, fmt.Errorf("co-located session witness is not eligible: %s", reason)
+	}
+	coLocatedWitness, err := session.GuardedAssignmentCoLocatedWitness(info)
+	if err != nil {
+		return beads.Bead{}, err
+	}
+	coLocatedWitness.ExpectedMetadata[beadmeta.TriggerBeadIDMetadataKey] = expectation.BeadID
+	coLocatedWitness.ExpectedMetadata[beadmeta.TriggerBeadStoreRefMetadataKey] = expectation.StoreRef
+	expectedMetadata := make(map[string]string, 2)
+	if route := strings.TrimSpace(bead.Metadata[beadmeta.RoutedToMetadataKey]); route != "" {
+		expectedMetadata[beadmeta.RoutedToMetadataKey] = route
+	} else if kind := strings.TrimSpace(bead.Metadata[beadmeta.KindMetadataKey]); kind == beadmeta.KindWorkflow {
+		runTarget := strings.TrimSpace(bead.Metadata[beadmeta.RunTargetMetadataKey])
+		if runTarget == "" {
+			return beads.Bead{}, errors.New("workflow trigger has no run target")
+		}
+		expectedMetadata[beadmeta.KindMetadataKey] = kind
+		expectedMetadata[beadmeta.RunTargetMetadataKey] = runTarget
+	} else {
+		return beads.Bead{}, errors.New("trigger has no exact route witness")
+	}
+	assignmentMetadata := map[string]string{
+		beadmeta.SessionIDMetadataKey:            hookClaimSessionID(opts.Env),
+		beadmeta.SessionNameMetadataKey:          hookClaimSessionName(opts.Env),
+		beadmeta.SessionInstanceTokenMetadataKey: hookClaimEnvValue(opts.Env, "GC_INSTANCE_TOKEN"),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), hookClaimMutationTimeout)
+	defer cancel()
+	verified, verifiedOK, err := claimer.ClaimAssignment(ctx, beads.AssignmentClaimRequest{
+		ID:                 strings.TrimSpace(bead.ID),
+		Actor:              strings.TrimSpace(bead.Assignee),
+		ExpectedStatus:     "open",
+		ExpectedAssignee:   "",
+		ExpectedMetadata:   expectedMetadata,
+		ForbiddenLabels:    beadmeta.DispatchHoldLabels,
+		AssignmentMetadata: assignmentMetadata,
+		CoLocatedWitness:   coLocatedWitness,
+		RequireIdempotent:  true,
+	})
+	if err != nil {
+		return beads.Bead{}, err
+	}
+	if !verifiedOK {
+		return beads.Bead{}, errors.New("existing assignment predicates no longer match")
+	}
+	return verified, nil
+}
+
+func writeHookClaimExpectedTriggerResult(bead beads.Bead, opts hookClaimOptions, stdout, stderr io.Writer) int {
+	result := hookClaimJSONResult{
+		SchemaVersion:     "1",
+		OK:                true,
+		Command:           hookClaimCommandName,
+		Action:            "work",
+		Reason:            "existing_assignment",
+		BeadID:            strings.TrimSpace(bead.ID),
+		Assignee:          strings.TrimSpace(bead.Assignee),
+		Route:             hookClaimRoute(bead),
+		RootBeadID:        strings.TrimSpace(bead.Metadata[beadmeta.RootBeadIDMetadataKey]),
+		ContinuationGroup: strings.TrimSpace(bead.Metadata[beadmeta.ContinuationGroupMetadataKey]),
+	}
+	if opts.JSON {
+		if err := writeCLIJSONLine(stdout, result); err != nil {
+			fmt.Fprintf(stderr, "gc hook --claim: writing exact trigger JSON: %v\n", err) //nolint:errcheck
+			return 1
+		}
+		return 0
+	}
+	fmt.Fprintln(stdout, result.BeadID) //nolint:errcheck
+	return 0
+}
+
+func validateHookClaimTriggerExpectation(expectation hookClaimTriggerExpectation) error {
+	if expectation.BeadID == "" || expectation.StoreRef == "" {
+		return errors.New("trigger bead id and store ref are both required")
+	}
+	if expectation.BeadID != strings.TrimSpace(expectation.BeadID) ||
+		strings.IndexFunc(expectation.BeadID, unicode.IsSpace) >= 0 ||
+		strings.IndexFunc(expectation.BeadID, unicode.IsControl) >= 0 {
+		return fmt.Errorf("malformed trigger bead id %q", expectation.BeadID)
+	}
+	if expectation.StoreRef != strings.TrimSpace(expectation.StoreRef) ||
+		strings.IndexFunc(expectation.StoreRef, unicode.IsControl) >= 0 {
+		return fmt.Errorf("malformed trigger store ref %q", expectation.StoreRef)
+	}
+	kind, name, ok := strings.Cut(expectation.StoreRef, ":")
+	if !ok || strings.TrimSpace(name) == "" || strings.Contains(name, ":") || (kind != "city" && kind != "rig") {
+		return fmt.Errorf("malformed trigger store ref %q", expectation.StoreRef)
+	}
+	return nil
+}
+
+func validateHookClaimExpectedBead(bead beads.Bead, expectation hookClaimTriggerExpectation, opts hookClaimOptions) error {
+	if strings.TrimSpace(bead.ID) != expectation.BeadID {
+		return fmt.Errorf("exact store returned bead %q", bead.ID)
+	}
+	if hookClaimCandidateIsMessage(bead) {
+		return errors.New("trigger bead is a message, not claimable work")
+	}
+	if !hookClaimMatchesRoute(bead, opts.RouteTargets) {
+		return fmt.Errorf("trigger route %q does not match this session", hookClaimRoute(bead))
+	}
+	sessionID := hookClaimSessionID(opts.Env)
+	sessionName := hookClaimSessionName(opts.Env)
+	instanceToken := hookClaimEnvValue(opts.Env, "GC_INSTANCE_TOKEN")
+	if sessionID == "" || sessionName == "" || instanceToken == "" {
+		return errors.New("triggered runtime identity is incomplete")
+	}
+	for key, expected := range map[string]string{
+		beadmeta.SessionIDMetadataKey:            sessionID,
+		beadmeta.SessionNameMetadataKey:          sessionName,
+		beadmeta.SessionInstanceTokenMetadataKey: instanceToken,
+	} {
+		if actual := strings.TrimSpace(bead.Metadata[key]); actual != expected {
+			return fmt.Errorf("trigger witness %s is %q, want %q", key, actual, expected)
+		}
+	}
+	status := strings.ToLower(strings.TrimSpace(bead.Status))
+	assignee := strings.TrimSpace(bead.Assignee)
+	if status == "in_progress" && hookClaimHasIdentity(assignee, opts.IdentityCandidates) {
+		return nil
+	}
+	if assignee != "" {
+		return fmt.Errorf("trigger bead is already owned by %q", assignee)
+	}
+	return fmt.Errorf("trigger bead status %q is not guarded-claimed for this session", bead.Status)
 }
 
 // tryHookClaim runs the work query for one store (dir, via ops.Runner) and

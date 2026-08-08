@@ -2,18 +2,21 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/agent"
+	"github.com/gastownhall/gascity/internal/agentutil"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/materialize"
 	"github.com/gastownhall/gascity/internal/processenv"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
+	workdirutil "github.com/gastownhall/gascity/internal/workdir"
 	"github.com/gastownhall/gascity/internal/worker"
 )
 
@@ -25,13 +28,28 @@ func workerSessionCatalogWithConfig(cityPath string, store beads.Store, sp runti
 	return factory.Catalog()
 }
 
-func workerFactoryWithConfig(cityPath string, store beads.Store, sp runtime.Provider, cfg *config.City) (*worker.Factory, error) {
-	return workerFactoryWithStaleKeyDetectionWaiter(cityPath, store, sp, cfg, nil)
+func workerFactoryWithConfig(cityPath string, store beads.Store, sp runtime.Provider, cfg *config.City, canonicalStores ...beads.Store) (*worker.Factory, error) {
+	canonicalStore := canonicalSessionWorkStore(store, cfg, canonicalStores...)
+	return workerFactoryWithStaleKeyDetectionWaiter(cityPath, store, canonicalStore, sp, cfg, nil)
+}
+
+func canonicalSessionWorkStore(store beads.Store, cfg *config.City, explicit ...beads.Store) beads.Store {
+	if len(explicit) > 0 {
+		return explicit[0]
+	}
+	if cfg != nil {
+		storage := cfg.EffectiveStorage()
+		if storage.Classes.BindingFor(config.StorageClassSessions) != storage.Classes.BindingFor(config.StorageClassWork) {
+			return nil
+		}
+	}
+	return store
 }
 
 func workerFactoryWithStaleKeyDetectionWaiter(
 	cityPath string,
 	store beads.Store,
+	canonicalStore beads.Store,
 	sp runtime.Provider,
 	cfg *config.City,
 	waiter session.StaleKeyDetectionWaiter,
@@ -78,23 +96,95 @@ func workerFactoryWithStaleKeyDetectionWaiter(
 	}
 	return worker.NewFactory(worker.FactoryConfig{
 		Store:                   store,
+		CanonicalCityStore:      canonicalStore,
+		CityConfig:              cfg,
 		Provider:                sp,
 		CityPath:                cityPath,
 		SearchPaths:             searchPaths,
 		UsageSink:               usageSinkForCity(cfg, cityPath),
 		ResolveTransport:        resolveTransport,
-		ResolveSessionRuntime:   workerSessionRuntimeResolverWithConfig(cityPath, cfg),
+		ResolveSessionRuntime:   workerSessionRuntimeResolverWithConfig(cityPath, cfg, sp),
+		AuthorizeLaunch:         workerLaunchAuthorizerWithConfig(cityPath, cfg, sp),
 		StaleKeyDetectionWaiter: waiter,
 		Pricing:                 cfg.PricingRegistry(),
 	})
 }
 
-func workerSessionRuntimeResolverWithConfig(cityPath string, cfg *config.City) worker.SessionRuntimeResolver {
+// workerLaunchAuthorizerWithConfig keeps direct CLI lifecycle operations on
+// the same configured-agent identity seam as runtime resolution. Ordinary
+// inherit agents and unconfigured provider sessions preserve their existing
+// behavior; project-hooks-isolated agents require an authoritative persisted
+// trigger pair in the canonical city session store before any live boundary.
+func workerLaunchAuthorizerWithConfig(cityPath string, cfg *config.City, providers ...runtime.Provider) worker.LaunchAuthorizer {
+	if cfg == nil {
+		return nil
+	}
+	cityStoreRef := "city:" + loadedCityName(cfg, cityPath)
+	return func(_ context.Context, req worker.LaunchAuthorizationRequest) (worker.LaunchAuthorization, error) {
+		// Expected-trigger delivery fences are useful for every configured
+		// session, including inherited project-hook policy. Bind a complete pair
+		// from the freshly reloaded persisted row so the worker boundary can
+		// reject a stale backstop request before provider mutation. A missing or
+		// half-written pair preserves ordinary inherited behavior; an operation
+		// that supplied an explicit expectation will fail its exact comparison.
+		authorization := worker.LaunchAuthorization{}
+		if req.Info != nil {
+			triggerID := strings.TrimSpace(req.Info.TriggerBeadID)
+			triggerStoreRef := strings.TrimSpace(req.Info.TriggerBeadStoreRef)
+			if triggerID != "" && triggerStoreRef != "" {
+				authorization.TriggerBeadID = triggerID
+				authorization.TriggerBeadStoreRef = triggerStoreRef
+			}
+		}
+		template := strings.TrimSpace(req.Session.Template)
+		if req.Info != nil && strings.TrimSpace(req.Info.Template) != "" {
+			template = strings.TrimSpace(req.Info.Template)
+		}
+		var (
+			agentCfg config.Agent
+			ok       bool
+		)
+		if req.Info != nil {
+			resolution, resolveErr := agentutil.ResolvePersistedSessionAgent(cfg, *req.Info)
+			if resolveErr != nil {
+				return worker.LaunchAuthorization{}, fmt.Errorf("%w: resolving persisted session identity: %w", worker.ErrLaunchUnauthorized, resolveErr)
+			}
+			if resolution.Resolved {
+				agentCfg = resolution.Agent
+				ok = true
+			}
+		}
+		if !ok {
+			agentCfg, ok = resolveWorkerConfigAgent(cfg, template)
+		}
+		if !ok || !agentCfg.ForbidsProjectHooks() {
+			return authorization, nil
+		}
+		authorization, err := worker.RequireExactSessionTriggerAuthority(req, cityStoreRef)
+		if err != nil {
+			return worker.LaunchAuthorization{}, err
+		}
+		resolved, err := resolvedWorkerRuntimeWithConfigAndMetadata(
+			cityPath,
+			cfg,
+			*req.Info,
+			strings.TrimSpace(req.Metadata["real_world_app_session_kind"]),
+			req.Metadata,
+			providers...,
+		)
+		if err != nil {
+			return worker.LaunchAuthorization{}, fmt.Errorf("resolving current isolated runtime: %w", err)
+		}
+		return worker.BindProjectHookIsolationRuntime(authorization, resolved)
+	}
+}
+
+func workerSessionRuntimeResolverWithConfig(cityPath string, cfg *config.City, providers ...runtime.Provider) worker.SessionRuntimeResolver {
 	if cfg == nil {
 		return nil
 	}
 	return func(info session.Info, sessionKind string, metadata map[string]string) (*worker.ResolvedRuntime, error) {
-		runtimeCfg, err := resolvedWorkerRuntimeWithConfigAndMetadata(cityPath, cfg, info, sessionKind, metadata)
+		runtimeCfg, err := resolvedWorkerRuntimeWithConfigAndMetadata(cityPath, cfg, info, sessionKind, metadata, providers...)
 		if err != nil {
 			return nil, err
 		}
@@ -136,6 +226,26 @@ func workerSessionCreateHints(resolved *config.ResolvedProvider) runtime.Config 
 	return hints.ToRuntimeConfig()
 }
 
+// resolveWorkerConfigAgent keeps worker lifecycle policy and runtime
+// resolution on the same configured-agent identity seam. In particular,
+// resolveAgentIdentity understands synthesized pool instance names such as
+// rig/worker-1 and worker-1; an exact-only lookup would treat those configured
+// sessions as synthetic and silently omit their launch policy.
+func resolveWorkerConfigAgent(cfg *config.City, template string) (config.Agent, bool) {
+	if cfg == nil {
+		return config.Agent{}, false
+	}
+	if agentCfg, ok := resolveAgentIdentity(cfg, strings.TrimSpace(template), ""); ok {
+		return agentCfg, true
+	}
+	// Preserve the legacy bound-to-unbound identity fallback used by stored
+	// sessions created before a binding migration.
+	if agentCfg := findAgentByTemplate(cfg, template); agentCfg != nil {
+		return agentCfg.Clone(), true
+	}
+	return config.Agent{}, false
+}
+
 // applyWorkerOverlayHints populates the provider-overlay staging fields
 // (ProviderName/ProviderOverlayName/InstallAgentHooks/PackOverlayDirs) on a
 // worker create/resume runtime.Config, mirroring the canonical create-time
@@ -157,16 +267,95 @@ func applyWorkerOverlayHints(hints *runtime.Config, cfg *config.City, cityPath, 
 	// name — identical to resolveTemplate's hint assignment.
 	hints.ProviderName = resolvedProviderLaunchFamily(resolved)
 	hints.ProviderOverlayName = strings.TrimSpace(resolved.Name)
-	agentCfg := findAgentByTemplate(cfg, template)
-	if agentCfg == nil {
+	agentCfg, ok := resolveWorkerConfigAgent(cfg, template)
+	if !ok {
 		// No agent config to resolve install-hooks/rig overlay scope against
 		// (e.g. a synthetic session). Still stage city pack overlays.
 		hints.PackOverlayDirs = effectiveOverlayDirs(cfg.PackOverlayDirs, cfg.RigOverlayDirs, "")
 		return
 	}
-	hints.InstallAgentHooks = config.ResolveInstallHooks(agentCfg, &cfg.Workspace)
-	rigName := sessionSetupContextForAgent(cityPath, cfg.EffectiveCityName(), firstNonEmptyGCString(agentCfg.QualifiedName(), template), agentCfg, cfg.Rigs).Rig
+	hints.ProjectHooksForbidden = agentCfg.ForbidsProjectHooks()
+	if !hints.ProjectHooksForbidden {
+		hints.InstallAgentHooks = config.ResolveInstallHooks(&agentCfg, &cfg.Workspace)
+	}
+	rigName := sessionSetupContextForAgent(cityPath, cfg.EffectiveCityName(), firstNonEmptyGCString(agentCfg.QualifiedName(), template), &agentCfg, cfg.Rigs).Rig
 	hints.PackOverlayDirs = effectiveOverlayDirs(cfg.PackOverlayDirs, cfg.RigOverlayDirs, rigName)
+}
+
+func validateWorkerProjectHookIsolationProvider(cfg *config.City, template, transport string, sp runtime.Provider) error {
+	if cfg == nil {
+		return nil
+	}
+	agentCfg, ok := resolveWorkerConfigAgent(cfg, template)
+	if !ok || !agentCfg.ForbidsProjectHooks() {
+		return nil
+	}
+	provider, ok := sp.(runtime.ProjectHookIsolationCapabilityProvider)
+	if ok && provider.SupportsProjectHookIsolation(strings.TrimSpace(transport)) {
+		return nil
+	}
+	transport = strings.TrimSpace(transport)
+	if transport == "" {
+		transport = "default"
+	}
+	return fmt.Errorf(
+		"agent %q: active session provider cannot attest project hook isolation for %q transport",
+		agentCfg.QualifiedName(), transport,
+	)
+}
+
+// resolveWorkerResumeWorkDir returns the stored legacy cwd for ordinary
+// sessions. A project-hook-isolated session is different: its current config
+// is authoritative, so resume re-resolves the concrete per-instance path,
+// verifies any persisted cwd names the same canonical directory, and returns
+// only the freshly attested spelling. This runs while worker handle creation is
+// still read-only, before provider or session lifecycle mutation.
+func resolveWorkerResumeWorkDir(cityPath string, cfg *config.City, info session.Info) (string, error) {
+	stored := strings.TrimSpace(info.WorkDir)
+	agentCfg, ok := resolveWorkerConfigAgent(cfg, info.Template)
+	if !ok || !agentCfg.ForbidsProjectHooks() {
+		if stored != "" {
+			return stored, nil
+		}
+		return cityPath, nil
+	}
+	// resolveWorkerConfigAgent returns a synthesized pool member when the
+	// persisted template is worker-N. Workdir identity recovery must still use
+	// the configured pool template: against the synthesized member, its exact
+	// agent_name looks like the template itself and the legacy aliasless fallback
+	// incorrectly substitutes the provider session name (s-<id>).
+	workDirAgent := agentCfg
+	if strings.TrimSpace(agentCfg.PoolName) != "" {
+		if base := findAgentByTemplate(cfg, agentCfg.PoolName); base != nil {
+			workDirAgent = base.Clone()
+		}
+	}
+	qualifiedName := sessionBeadQualifiedNameInfo(cityPath, &workDirAgent, cfg.Rigs, info)
+	// This preauthorization resolver must remain filesystem-pure. Runtime
+	// staging materializes the path only after SessionHandle.Start reloads the
+	// persisted trigger and the Manager revalidates that witness under its
+	// mutation lock.
+	attested, err := workdirutil.ResolveWorkDirPathStrict(
+		cityPath,
+		cfg.EffectiveCityName(),
+		qualifiedName,
+		workDirAgent,
+		cfg.Rigs,
+		cityPath,
+	)
+	if err != nil {
+		return "", fmt.Errorf("attesting resume work_dir for agent %q: %w", agentCfg.QualifiedName(), err)
+	}
+	if err := workdirutil.ValidateAncestorWorktreesNotStale(attested); err != nil {
+		return "", fmt.Errorf("attesting resume work_dir for agent %q: %w", agentCfg.QualifiedName(), err)
+	}
+	if stored != "" && !samePath(stored, attested) {
+		return "", fmt.Errorf(
+			"agent %q: persisted work_dir %q differs from current attested work_dir %q",
+			agentCfg.QualifiedName(), stored, attested,
+		)
+	}
+	return attested, nil
 }
 
 func resolvedRuntimeMCPServersWithConfig(
@@ -265,6 +454,9 @@ func newWorkerSessionHandleForResolvedRuntimeWithConfig(
 	resolved *config.ResolvedProvider,
 	metadata map[string]string,
 ) (worker.Handle, error) {
+	if err := validateWorkerProjectHookIsolationProvider(cfg, template, transport, sp); err != nil {
+		return nil, err
+	}
 	factory, err := workerFactoryWithConfig(cityPath, store, sp, cfg)
 	if err != nil {
 		return nil, err
@@ -399,7 +591,7 @@ func workerHandleForSessionWithStaleKeyDetectionWaiter(
 	id string,
 	waiter session.StaleKeyDetectionWaiter,
 ) (worker.Handle, error) {
-	factory, err := workerFactoryWithStaleKeyDetectionWaiter(cityPath, store, sp, cfg, waiter)
+	factory, err := workerFactoryWithStaleKeyDetectionWaiter(cityPath, store, canonicalSessionWorkStore(store, cfg), sp, cfg, waiter)
 	if err != nil {
 		return nil, err
 	}
@@ -495,6 +687,90 @@ func workerObserveSessionTargetWithRuntimeHintsWithConfig(cityPath string, store
 	return worker.ObserveHandle(context.Background(), handle)
 }
 
+func workerObserveReconcilerSessionWithWitness(
+	cityPath string,
+	store beads.Store,
+	sp runtime.Provider,
+	cfg *config.City,
+	info session.Info,
+	processNames []string,
+	boundaries ...reconcilerMutationBoundary,
+) (worker.LiveObservation, error) {
+	boundary := selectedReconcilerMutationBoundary(info, cfg, boundaries...)
+	if err := boundary.validateCurrent(info); err != nil {
+		return worker.LiveObservation{}, err
+	}
+	factory, err := workerFactoryWithConfig(cityPath, store, sp, cfg)
+	if err != nil {
+		return worker.LiveObservation{}, err
+	}
+	if boundary.strict || boundary.policyErr != nil {
+		decision, err := boundary.automaticRuntimeDecision()
+		if err != nil {
+			return worker.LiveObservation{}, err
+		}
+		return factory.ObserveSessionWithDecisionForReconciler(
+			context.Background(), info.ID, processNames, decision, false,
+		)
+	}
+	return factory.ObserveSessionForReconciler(context.Background(), info.ID, processNames, boundary.expected)
+}
+
+func workerObserveReconcilerTargetWithWitness(
+	cityPath string,
+	store beads.Store,
+	sp runtime.Provider,
+	cfg *config.City,
+	target string,
+	processNames []string,
+) (worker.LiveObservation, error) {
+	if store == nil {
+		return workerObserveSessionTargetWithRuntimeHintsWithConfig(cityPath, store, sp, cfg, target, processNames)
+	}
+	id, err := session.ResolveSessionID(store, target)
+	if err != nil {
+		if errors.Is(err, session.ErrSessionNotFound) {
+			return workerObserveSessionTargetWithRuntimeHintsWithConfig(cityPath, store, sp, cfg, target, processNames)
+		}
+		return worker.LiveObservation{}, err
+	}
+	info, persisted, err := sessionFrontDoor(store).GetPersistedResponse(id)
+	if err != nil {
+		return worker.LiveObservation{}, err
+	}
+	return workerObserveReconcilerSessionWithWitness(
+		cityPath, store, sp, cfg, info, processNames,
+		captureReconcilerMutationBoundary(info, cfg, persisted.Revision),
+	)
+}
+
+func workerPeekReconcilerSessionWithWitness(
+	cityPath string,
+	store beads.Store,
+	sp runtime.Provider,
+	cfg *config.City,
+	info session.Info,
+	lines int,
+	boundaries ...reconcilerMutationBoundary,
+) (string, error) {
+	boundary := selectedReconcilerMutationBoundary(info, cfg, boundaries...)
+	if err := boundary.validateCurrent(info); err != nil {
+		return "", err
+	}
+	factory, err := workerFactoryWithConfig(cityPath, store, sp, cfg)
+	if err != nil {
+		return "", err
+	}
+	if boundary.strict || boundary.policyErr != nil {
+		decision, err := boundary.automaticRuntimeDecision()
+		if err != nil {
+			return "", err
+		}
+		return factory.PeekSessionWithDecisionForReconciler(context.Background(), info.ID, lines, decision)
+	}
+	return factory.PeekSessionForReconciler(context.Background(), info.ID, lines, boundary.expected)
+}
+
 func workerSessionTargetRunningWithConfig(cityPath string, store beads.Store, sp runtime.Provider, cfg *config.City, target string) (bool, error) {
 	obs, err := workerObserveSessionTargetWithConfig(cityPath, store, sp, cfg, target)
 	if err != nil {
@@ -558,9 +834,19 @@ func resolvedWorkerRuntimeWithConfig(cityPath string, cfg *config.City, info ses
 	return resolvedWorkerRuntimeWithConfigAndMetadata(cityPath, cfg, info, sessionKind, nil)
 }
 
-func resolvedWorkerRuntimeWithConfigAndMetadata(cityPath string, cfg *config.City, info session.Info, sessionKind string, metadata map[string]string) (*worker.ResolvedRuntime, error) {
+func resolvedWorkerRuntimeWithConfigAndMetadata(cityPath string, cfg *config.City, info session.Info, sessionKind string, metadata map[string]string, providers ...runtime.Provider) (*worker.ResolvedRuntime, error) {
 	if cfg == nil {
 		return nil, nil
+	}
+	identity, err := agentutil.ResolvePersistedSessionAgent(cfg, info)
+	if err != nil {
+		return nil, fmt.Errorf("resolving persisted session identity: %w", err)
+	}
+	if identity.Resolved {
+		// Every downstream provider/workdir/hint decision consumes the same
+		// conflict-checked configured base. Concrete pool/adhoc identity remains
+		// available through AgentName/canonical metadata on info.
+		info.Template = identity.Agent.QualifiedName()
 	}
 	resolved, configuredTransport := resolveWorkerRuntimeProviderWithConfigAndMetadata(cfg, info, sessionKind, metadata)
 	if resolved == nil {
@@ -573,12 +859,17 @@ func resolvedWorkerRuntimeWithConfigAndMetadata(cityPath string, cfg *config.Cit
 	if transport == "" && legacyWorkerACPTransportAmbiguous(resolved, configuredTransport, info.Command, metadata) {
 		return nil, fmt.Errorf("legacy session transport is ambiguous: recreate the stopped session or resume it while ACP metadata can still be persisted")
 	}
+	if len(providers) > 0 {
+		if err := validateWorkerProjectHookIsolationProvider(cfg, info.Template, transport, providers[0]); err != nil {
+			return nil, err
+		}
+	}
 
 	command := resolvedWorkerRuntimeCommandForTransport(cityPath, resolved, transport, info.Command, info.Provider, metadata)
 
-	workDir := strings.TrimSpace(info.WorkDir)
-	if workDir == "" {
-		workDir = cityPath
+	workDir, err := resolveWorkerResumeWorkDir(cityPath, cfg, info)
+	if err != nil {
+		return nil, err
 	}
 	mcpServers, err := resumeRuntimeMCPServersWithConfig(cityPath, cfg, info, resolved, transport, metadata)
 	if err != nil {
@@ -613,8 +904,8 @@ func resolvedWorkerRuntimeWithConfigAndMetadata(cityPath string, cfg *config.Cit
 	// {{.Rig}}/{{.RigRoot}}/{{.AgentBase}} expand correctly. See ga-vtkhi.
 	qualifiedName := firstNonEmptyGCString(info.AgentName, info.Template)
 	var sessionLive []string
-	if agentCfg := findAgentByTemplate(cfg, info.Template); agentCfg != nil && len(agentCfg.SessionLive) > 0 {
-		setupCtx := sessionSetupContextForAgent(cityPath, cfg.EffectiveCityName(), qualifiedName, agentCfg, cfg.Rigs)
+	if agentCfg, ok := resolveWorkerConfigAgent(cfg, info.Template); ok && len(agentCfg.SessionLive) > 0 {
+		setupCtx := sessionSetupContextForAgent(cityPath, cfg.EffectiveCityName(), qualifiedName, &agentCfg, cfg.Rigs)
 		setupCtx.Session = info.SessionName
 		setupCtx.WorkDir = workDir
 		setupCtx.ConfigDir = cityPath
@@ -865,7 +1156,7 @@ func resolveWorkerRuntimeProviderWithConfigAndMetadata(cfg *config.City, info se
 	if cfg == nil {
 		return nil, ""
 	}
-	found, foundAgent := resolveAgentIdentity(cfg, info.Template, "")
+	found, foundAgent := resolveWorkerConfigAgent(cfg, info.Template)
 	if session.UseAgentTemplateForProviderResolution(sessionKind, metadata, info.Provider, found.Provider, foundAgent) {
 		if foundAgent {
 			if resolved, err := config.ResolveProvider(&found, &cfg.Workspace, cfg.Providers, exec.LookPath); err == nil {

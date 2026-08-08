@@ -2025,7 +2025,11 @@ func (p *Provider) ListRunning(prefix string) ([]string, error) {
 
 // Start creates or reuses a T3 thread for the named session and dispatches the
 // startup prompt and any nudge.
-func (p *Provider) Start(_ context.Context, name string, cfg runtime.Config) error {
+func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) error {
+	return p.start(ctx, name, cfg)
+}
+
+func (p *Provider) start(_ context.Context, name string, cfg runtime.Config) error {
 	fmt.Fprintf(os.Stderr, "t3bridge: Start(%s) called, wsURL=%s\n", name, resolveWsURL())
 
 	var envelope StartupEnvelope
@@ -2159,6 +2163,16 @@ func (p *Provider) Start(_ context.Context, name string, cfg runtime.Config) err
 			ThreadActive:  threadIsActive(snapshot, existingBinding.ThreadID),
 			ProjectActive: projectIsActive(snapshot, existingBinding.ProjectID),
 		})
+		if !threadRuntimeIncarnationReusable(existingThread, cfg.Env) {
+			if hasRuntimeIncarnationEvidence(cfg.Env) {
+				return fail(fmt.Errorf(
+					"%w: T3 session %q is already bound to a different runtime incarnation",
+					runtime.ErrIncarnationMismatch,
+					name,
+				))
+			}
+			reuse = ReuseResult{Decision: ReuseDecisionRecreate, Reason: "runtime-incarnation-mismatch"}
+		}
 
 		switch reuse.Decision {
 		case ReuseDecisionReuse, ReuseDecisionRebind:
@@ -2458,6 +2472,24 @@ func (p *Provider) SetMeta(name, key, value string) error {
 
 // GetMeta reads a previously stored session metadata value.
 func (p *Provider) GetMeta(name, key string) (string, error) {
+	snapshot, snapshotErr := p.rpcSnapshot()
+	if snapshotErr == nil {
+		thread := snapshotThreadBySessionName(snapshot, name)
+		if thread != nil {
+			if runtimeIdentityMetadataKey(key) {
+				env := ParseSessionEnv(threadCustomMetadata(thread)["gc.sessionEnv"])
+				return strings.TrimSpace(env[key]), nil
+			}
+			if value, ok := threadRuntimeMetadataValue(thread, key); ok {
+				return value, nil
+			}
+		}
+	} else if runtimeIdentityMetadataKey(key) {
+		return "", snapshotErr
+	}
+	if runtimeIdentityMetadataKey(key) {
+		return "", runtime.ErrSessionNotFound
+	}
 	return readMetaValue(name, key)
 }
 

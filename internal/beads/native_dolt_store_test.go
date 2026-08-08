@@ -8,6 +8,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -15,6 +16,1353 @@ import (
 
 	beadslib "github.com/steveyegge/beads"
 )
+
+func nativeGuardedClaimRequest(id string) AssignmentClaimRequest {
+	return AssignmentClaimRequest{
+		ID:               id,
+		Actor:            "explicit-worker",
+		ExpectedStatus:   "open",
+		ExpectedMetadata: map[string]string{"gc.routed_to": "rig/pool"},
+		ForbiddenLabels:  []string{"hold:mayor", "hold:external"},
+		AssignmentMetadata: map[string]string{
+			"gc.session_id":             "session-42",
+			"gc.session_name":           "rig-worker-1",
+			"gc.session_instance_token": "instance-9",
+		},
+	}
+}
+
+func nativeGuardedClaimRequestWithSessionWitness(workID, sessionID string) AssignmentClaimRequest {
+	req := nativeGuardedClaimRequest(workID)
+	req.CoLocatedWitness = &AssignmentClaimCoLocatedWitness{
+		ID:             sessionID,
+		ExpectedStatus: "open",
+		ExpectedType:   "session",
+		RequiredLabels: []string{"gc:session"},
+		ExpectedMetadata: map[string]string{
+			"instance_token": "instance-9",
+			"session_name":   "rig-worker-1",
+			"state":          "creating",
+			"alias":          "explicit-worker",
+		},
+		AbsentOrEmptyMetadata: []string{"configured_named_identity"},
+	}
+	return req
+}
+
+func nativeAssignmentReleaseRequest(id string, revision int64) AssignmentReleaseRequest {
+	return AssignmentReleaseRequest{
+		ID:               id,
+		ExpectedStatus:   "in_progress",
+		ExpectedAssignee: "worker-1",
+		ExpectedRevision: &revision,
+		ExpectedMetadata: map[string]string{
+			"gc.routed_to":  "rig/pool",
+			"gc.session_id": "session-old",
+		},
+		ForbiddenLabels: []string{"hold:mayor", "hold:external"},
+		ReleaseMetadata: map[string]string{"gc.session_id": ""},
+		AbsentCoLocatedMatch: &CoLocatedMatchPredicate{
+			ExpectedStatus: "open",
+			ClassAnyOf: []CoLocatedClassPredicate{
+				{ExpectedType: "session"},
+				{RequiredLabels: []string{"gc:session"}},
+			},
+			MatchValue:            "worker-1",
+			MatchID:               true,
+			MetadataKeys:          []string{"session_name", "configured_named_identity", "alias"},
+			DelimitedMetadataKeys: map[string]string{"alias_history": ","},
+		},
+	}
+}
+
+func TestNativeDoltStoreAssignmentReleaseFailsClosedForServerTransactionThatMissesNoHistory(t *testing.T) {
+	storage := &nativeServerSingleTierStorage{nativeDoltMemStorage: newNativeDoltMemStorage()}
+	store := newNativeDoltStoreForTest(storage)
+	work, err := store.Create(Bead{
+		Title:     "server-tier assigned work",
+		Assignee:  "worker-1",
+		NoHistory: false,
+		Metadata:  map[string]string{"gc.routed_to": "rig/pool", "gc.session_id": "session-old"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := "in_progress"
+	if err := store.Update(work.ID, UpdateOpts{Status: &status}); err != nil {
+		t.Fatal(err)
+	}
+	work, err = store.Get(work.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, err := store.Create(Bead{
+		Title:     "default no-history owner",
+		Type:      "session",
+		NoHistory: true,
+		Labels:    []string{"gc:session"},
+		Metadata:  map[string]string{"session_name": "worker-1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeTransactions := storage.transactions
+
+	if releaser, ok := AssignmentReleaserFor(store); ok || releaser != nil {
+		t.Fatalf("AssignmentReleaserFor(server single-tier native) = (%T, %v), want nil,false", releaser, ok)
+	}
+	beforeWork, err := store.Get(work.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeOwner, err := storage.store.Get(owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	released, won, err := store.ReleaseAssignment(t.Context(), nativeAssignmentReleaseRequest(work.ID, work.Revision))
+	if !errors.Is(err, ErrAssignmentReleaseUnsupported) || won || released.ID != "" {
+		t.Fatalf("ReleaseAssignment = (%+v, %v, %v), want zero,false,unsupported", released, won, err)
+	}
+	if storage.transactions != beforeTransactions {
+		t.Fatalf("unsupported server release entered %d transactions, want zero", storage.transactions-beforeTransactions)
+	}
+	afterWork, err := store.Get(work.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterOwner, err := storage.store.Get(owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(beforeWork, afterWork) || !reflect.DeepEqual(beforeOwner, afterOwner) {
+		t.Fatalf("unsupported server release mutated rows:\nwork before=%+v\nwork after=%+v\nowner before=%+v\nowner after=%+v", beforeWork, afterWork, beforeOwner, afterOwner)
+	}
+}
+
+func TestNativeDoltStoreAssignmentReleaseUsesOneTransactionAndReadback(t *testing.T) {
+	issue := &beadslib.Issue{
+		ID:         "gc-release-exact",
+		Title:      "guarded native release",
+		Status:     beadslib.StatusInProgress,
+		IssueType:  beadslib.TypeTask,
+		Assignee:   "worker-1",
+		Priority:   2,
+		RowVersion: -7, // Dolt row_lock is an opaque random int64; either sign is valid.
+		Metadata:   json.RawMessage(`{"gc.routed_to":"rig/pool","gc.session_id":"session-old"}`),
+	}
+	var calls []string
+	var storage *nativeDoltStorageSpy
+	storage = &nativeDoltStorageSpy{
+		getIssue: func(_ context.Context, id string) (*beadslib.Issue, error) {
+			calls = append(calls, "get:"+id)
+			return cloneNativeIssueForTest(issue), nil
+		},
+		getLabels: func(_ context.Context, id string) ([]string, error) {
+			calls = append(calls, "labels:"+id)
+			return nil, nil
+		},
+		searchIssues: func(_ context.Context, _ string, filter beadslib.IssueFilter) ([]*beadslib.Issue, error) {
+			calls = append(calls, "search")
+			if filter.Status == nil || string(*filter.Status) != "open" || filter.IssueType != nil {
+				return nil, fmt.Errorf("release absence filter = %+v, want every open class candidate", filter)
+			}
+			return nil, nil
+		},
+		updateIssue: func(_ context.Context, id string, updates map[string]interface{}, actor string) error {
+			calls = append(calls, "update:"+id)
+			if actor != "native-test" {
+				return fmt.Errorf("release actor = %q, want store actor", actor)
+			}
+			issue.Status = beadslib.Status(updates["status"].(string))
+			issue.Assignee = updates["assignee"].(string)
+			issue.Metadata = slices.Clone(updates["metadata"].(json.RawMessage))
+			issue.RowVersion++
+			return nil
+		},
+		runInTransaction: func(_ context.Context, _ string, fn func(beadslib.Transaction) error) error {
+			calls = append(calls, "begin")
+			if err := fn(nativeDoltTransactionForTest{storage: storage}); err != nil {
+				return err
+			}
+			calls = append(calls, "commit")
+			return nil
+		},
+	}
+	store := newNativeDoltStoreForTest(storage)
+	released, won, err := store.ReleaseAssignment(t.Context(), nativeAssignmentReleaseRequest(issue.ID, issue.RowVersion))
+	if err != nil || !won {
+		t.Fatalf("ReleaseAssignment = (%+v, %v, %v), want success", released, won, err)
+	}
+	if released.Status != "open" || released.Assignee != "" || released.Revision != -6 || released.Metadata["gc.session_id"] != "" {
+		t.Fatalf("released = %+v, want exact authoritative post-state", released)
+	}
+	wantCalls := []string{
+		"begin",
+		"get:" + issue.ID,
+		"labels:" + issue.ID,
+		"search",
+		"update:" + issue.ID,
+		"get:" + issue.ID,
+		"labels:" + issue.ID,
+		"commit",
+	}
+	if !slices.Equal(calls, wantCalls) {
+		t.Fatalf("transaction calls = %v, want %v", calls, wantCalls)
+	}
+}
+
+func TestNativeDoltStoreAssignmentReleaseRetriesSerializationConflictAndRechecksAbsence(t *testing.T) {
+	work := &beadslib.Issue{
+		ID:         "gc-release-conflict",
+		Title:      "guarded native release retry",
+		Status:     beadslib.StatusInProgress,
+		IssueType:  beadslib.TypeTask,
+		Assignee:   "worker-1",
+		Priority:   2,
+		RowVersion: 11,
+		Metadata:   json.RawMessage(`{"gc.routed_to":"rig/pool","gc.session_id":"session-old"}`),
+	}
+	owner := &beadslib.Issue{
+		ID:        "session-late",
+		Title:     "late co-located owner",
+		Status:    beadslib.StatusOpen,
+		IssueType: beadslib.IssueType("session"),
+		Priority:  2,
+		Metadata:  json.RawMessage(`{"session_name":"worker-1"}`),
+	}
+	var attempts, updates int
+	ownerVisible := false
+	var storage *nativeDoltStorageSpy
+	storage = &nativeDoltStorageSpy{
+		getIssue: func(_ context.Context, _ string) (*beadslib.Issue, error) {
+			return cloneNativeIssueForTest(work), nil
+		},
+		getLabels: func(_ context.Context, id string) ([]string, error) {
+			if id == owner.ID {
+				return []string{"gc:session"}, nil
+			}
+			return nil, nil
+		},
+		searchIssues: func(_ context.Context, _ string, _ beadslib.IssueFilter) ([]*beadslib.Issue, error) {
+			if !ownerVisible {
+				return nil, nil
+			}
+			return []*beadslib.Issue{cloneNativeIssueForTest(owner)}, nil
+		},
+		updateIssue: func(_ context.Context, _ string, _ map[string]interface{}, _ string) error {
+			updates++
+			return nil
+		},
+		runInTransaction: func(_ context.Context, _ string, fn func(beadslib.Transaction) error) error {
+			attempts++
+			if attempts == 1 {
+				return errors.New("Error 1213 (40001): serialization failure: this transaction conflicts with a committed transaction")
+			}
+			ownerVisible = true
+			return fn(nativeDoltTransactionForTest{storage: storage})
+		},
+	}
+	store := newNativeDoltStoreForTest(storage)
+	released, won, err := store.ReleaseAssignment(t.Context(), nativeAssignmentReleaseRequest(work.ID, work.RowVersion))
+	if err != nil || won || released.ID != "" {
+		t.Fatalf("ReleaseAssignment = (%+v, %v, %v), want zero,false,nil after retry sees late owner", released, won, err)
+	}
+	if attempts != 2 || updates != 0 {
+		t.Fatalf("transaction attempts=%d updates=%d, want two full checks and zero mutations", attempts, updates)
+	}
+}
+
+func TestNativeDoltStoreAssignmentReleaseRecoversAuthorizedPostCommitError(t *testing.T) {
+	stageErr := errors.New("injected post-SQL StageAndCommit failure")
+	issue := &beadslib.Issue{
+		ID:         "gc-release-post-commit",
+		Title:      "guarded native release post-commit",
+		Status:     beadslib.StatusInProgress,
+		IssueType:  beadslib.TypeTask,
+		Assignee:   "worker-1",
+		Priority:   2,
+		RowVersion: 19,
+		Metadata:   json.RawMessage(`{"gc.routed_to":"rig/pool","gc.session_id":"session-old"}`),
+	}
+	var storage *nativeDoltStorageSpy
+	storage = &nativeDoltStorageSpy{
+		getIssue: func(_ context.Context, _ string) (*beadslib.Issue, error) {
+			return cloneNativeIssueForTest(issue), nil
+		},
+		getLabels: func(_ context.Context, _ string) ([]string, error) { return nil, nil },
+		searchIssues: func(_ context.Context, _ string, _ beadslib.IssueFilter) ([]*beadslib.Issue, error) {
+			return nil, nil
+		},
+		updateIssue: func(_ context.Context, _ string, updates map[string]interface{}, _ string) error {
+			issue.Status = beadslib.Status(updates["status"].(string))
+			issue.Assignee = updates["assignee"].(string)
+			issue.Metadata = slices.Clone(updates["metadata"].(json.RawMessage))
+			issue.RowVersion++
+			return nil
+		},
+		runInTransaction: func(_ context.Context, _ string, fn func(beadslib.Transaction) error) error {
+			if err := fn(nativeDoltTransactionForTest{storage: storage}); err != nil {
+				return err
+			}
+			return stageErr
+		},
+	}
+	store := newNativeDoltStoreForTest(storage)
+	released, won, err := store.ReleaseAssignment(t.Context(), nativeAssignmentReleaseRequest(issue.ID, issue.RowVersion))
+	if err != nil || !won {
+		t.Fatalf("ReleaseAssignment = (%+v, %v, %v), want committed release recovered as success", released, won, err)
+	}
+	if released.Status != "open" || released.Assignee != "" || released.Metadata["gc.session_id"] != "" {
+		t.Fatalf("recovered release = %+v, want exact authoritative post-state", released)
+	}
+}
+
+func TestNativeDoltStoreReadyLabelBlindLiveListHydratesCanonicalHoldLabels(t *testing.T) {
+	for _, holdLabel := range []string{"hold:mayor", "hold:external"} {
+		t.Run(holdLabel, func(t *testing.T) {
+			storage := &labelBlindReadyNativeStorage{nativeDoltMemStorage: newNativeDoltMemStorage()}
+			store := newNativeDoltStoreForTest(storage)
+			created, err := store.Create(Bead{
+				Title:  "canonically held routed work",
+				Labels: []string{holdLabel},
+				Metadata: map[string]string{
+					"gc.routed_to": "rig/pool",
+				},
+			})
+			if err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+
+			ready, err := store.Ready()
+			if err != nil {
+				t.Fatalf("Ready: %v", err)
+			}
+			if len(ready) != 1 || ready[0].ID != created.ID {
+				t.Fatalf("Ready = %+v, want the one routed held bead %q", ready, created.ID)
+			}
+			if ready[0].Status != "open" || ready[0].Metadata["gc.routed_to"] != "rig/pool" {
+				t.Fatalf("Ready row = %+v, want open with gc.routed_to=rig/pool", ready[0])
+			}
+			if len(ready[0].Labels) != 0 {
+				t.Fatalf("Ready labels = %v, want label-blind native row", ready[0].Labels)
+			}
+
+			live, err := HandlesFor(store).Live.List(ListQuery{Label: holdLabel})
+			if err != nil {
+				t.Fatalf("Live.List(%q): %v", holdLabel, err)
+			}
+			if len(live) != 1 || live[0].ID != created.ID {
+				t.Fatalf("Live.List(%q) = %+v, want same bead %q", holdLabel, live, created.ID)
+			}
+			if !slices.Contains(live[0].Labels, holdLabel) {
+				t.Fatalf("Live.List(%q) labels = %v, want hydrated hold label", holdLabel, live[0].Labels)
+			}
+		})
+	}
+}
+
+// labelBlindReadyNativeStorage mirrors the native ready fast path observed by
+// the controller: row identity and metadata are present, while labels are not
+// hydrated. Ordinary SearchIssues remains fully hydrated, so an explicit live
+// label query can authoritatively recover canonical holds.
+type labelBlindReadyNativeStorage struct {
+	*nativeDoltMemStorage
+	readyFilters []beadslib.WorkFilter
+}
+
+func (s *labelBlindReadyNativeStorage) GetReadyWork(ctx context.Context, filter beadslib.WorkFilter) ([]*beadslib.Issue, error) {
+	filter.ExcludeLabels = slices.Clone(filter.ExcludeLabels)
+	s.readyFilters = append(s.readyFilters, filter)
+	issues, err := s.nativeDoltMemStorage.GetReadyWork(ctx, filter)
+	if err != nil {
+		return nil, err
+	}
+	for _, issue := range issues {
+		issue.Labels = nil
+	}
+	return issues, nil
+}
+
+func TestNativeDoltStoreReadyPushesOneExcludedLabelSnapshotPerStatus(t *testing.T) {
+	storage := &labelBlindReadyNativeStorage{nativeDoltMemStorage: newNativeDoltMemStorage()}
+	store := newNativeDoltStoreForTest(storage)
+	wantID := ""
+	for _, fixture := range []Bead{
+		{ID: "native-held", Title: "held", Type: "task", Status: "open", Labels: []string{"hold:external"}},
+		{ID: "native-unheld", Title: "unheld", Type: "task", Status: "open"},
+	} {
+		created, err := store.Create(fixture)
+		if err != nil {
+			t.Fatalf("Create(%q): %v", fixture.ID, err)
+		}
+		if fixture.ID == "native-unheld" {
+			wantID = created.ID
+		}
+	}
+
+	rows, err := store.Ready(ReadyQuery{ExcludeLabels: []string{"hold:mayor", "hold:external"}})
+	if err != nil {
+		t.Fatalf("Ready: %v", err)
+	}
+	if len(rows) != 1 || rows[0].ID != wantID {
+		t.Fatalf("filtered Ready = %+v, want only %s", rows, wantID)
+	}
+	if got, want := len(storage.readyFilters), len(nativeDoltOpenReadyStatuses); got != want {
+		t.Fatalf("GetReadyWork filters = %d, want %d (one snapshot for each authoritative status query)", got, want)
+	}
+	for i, filter := range storage.readyFilters {
+		if got, want := filter.ExcludeLabels, []string{"hold:mayor", "hold:external"}; !slices.Equal(got, want) {
+			t.Fatalf("filter[%d].ExcludeLabels = %v, want %v", i, got, want)
+		}
+	}
+}
+
+func TestNativeDoltStoreGuardedAssignmentUsesOneTransactionAndReadback(t *testing.T) {
+	issue := &beadslib.Issue{
+		ID:        "gc-exact",
+		Title:     "guarded native claim",
+		Status:    beadslib.StatusOpen,
+		IssueType: beadslib.TypeTask,
+		Priority:  2,
+		Metadata:  json.RawMessage(`{"gc.routed_to":"rig/pool"}`),
+	}
+	var calls []string
+	var updateActor string
+	var storage *nativeDoltStorageSpy
+	storage = &nativeDoltStorageSpy{
+		getIssue: func(_ context.Context, id string) (*beadslib.Issue, error) {
+			calls = append(calls, "get:"+id)
+			return cloneNativeIssueForTest(issue), nil
+		},
+		getLabels: func(_ context.Context, id string) ([]string, error) {
+			calls = append(calls, "labels:"+id)
+			return nil, nil
+		},
+		updateIssue: func(_ context.Context, id string, updates map[string]interface{}, actor string) error {
+			calls = append(calls, "update:"+id)
+			updateActor = actor
+			status, statusOK := updates["status"].(string)
+			assignee, assigneeOK := updates["assignee"].(string)
+			metadata, metadataOK := updates["metadata"].(json.RawMessage)
+			if !statusOK || !assigneeOK || !metadataOK {
+				return fmt.Errorf("guarded update fields = %#v, want typed status, assignee, metadata", updates)
+			}
+			issue.Status = beadslib.Status(status)
+			issue.Assignee = assignee
+			issue.Metadata = slices.Clone(metadata)
+			return nil
+		},
+		runInTransaction: func(_ context.Context, _ string, fn func(beadslib.Transaction) error) error {
+			calls = append(calls, "begin")
+			if err := fn(nativeDoltTransactionForTest{storage: storage}); err != nil {
+				return err
+			}
+			calls = append(calls, "commit")
+			return nil
+		},
+	}
+	store := newNativeDoltStoreForTest(storage)
+
+	claimed, ok, err := store.ClaimAssignment(t.Context(), nativeGuardedClaimRequest(issue.ID))
+	if err != nil || !ok {
+		t.Fatalf("ClaimAssignment = (%+v, %v, %v), want success", claimed, ok, err)
+	}
+	wantCalls := []string{"begin", "get:gc-exact", "labels:gc-exact", "update:gc-exact", "get:gc-exact", "labels:gc-exact", "commit"}
+	if !slices.Equal(calls, wantCalls) {
+		t.Fatalf("transaction calls = %v, want %v", calls, wantCalls)
+	}
+	if updateActor != "explicit-worker" {
+		t.Fatalf("upstream claim actor = %q, want requested explicit-worker", updateActor)
+	}
+	if claimed.Assignee != "explicit-worker" || claimed.Status != "in_progress" {
+		t.Fatalf("claimed bead = %+v, want explicit-worker/in_progress", claimed)
+	}
+	if claimed.Metadata["gc.session_instance_token"] != "instance-9" {
+		t.Fatalf("claimed witness metadata = %#v, want transaction readback", claimed.Metadata)
+	}
+}
+
+func TestNativeDoltStoreGuardedAssignmentReadbackFailureRollsBack(t *testing.T) {
+	wantErr := errors.New("injected transaction readback failure")
+	issue := &beadslib.Issue{
+		ID:        "gc-rollback",
+		Title:     "guarded native rollback",
+		Status:    beadslib.StatusOpen,
+		IssueType: beadslib.TypeTask,
+		Priority:  2,
+		Metadata:  json.RawMessage(`{"gc.routed_to":"rig/pool"}`),
+	}
+	var getCalls, updateCalls int
+	var storage *nativeDoltStorageSpy
+	storage = &nativeDoltStorageSpy{
+		getIssue: func(_ context.Context, _ string) (*beadslib.Issue, error) {
+			getCalls++
+			if getCalls == 2 {
+				return nil, wantErr
+			}
+			return cloneNativeIssueForTest(issue), nil
+		},
+		updateIssue: func(_ context.Context, _ string, updates map[string]interface{}, _ string) error {
+			updateCalls++
+			issue.Status = beadslib.Status(updates["status"].(string))
+			issue.Assignee = updates["assignee"].(string)
+			issue.Metadata = slices.Clone(updates["metadata"].(json.RawMessage))
+			return nil
+		},
+		runInTransaction: func(_ context.Context, _ string, fn func(beadslib.Transaction) error) error {
+			before := cloneNativeIssueForTest(issue)
+			if err := fn(nativeDoltTransactionForTest{storage: storage}); err != nil {
+				issue = before
+				return err
+			}
+			return nil
+		},
+	}
+	store := newNativeDoltStoreForTest(storage)
+
+	claimed, ok, err := store.ClaimAssignment(t.Context(), nativeGuardedClaimRequest(issue.ID))
+	if ok || claimed.ID != "" || !errors.Is(err, wantErr) {
+		t.Fatalf("ClaimAssignment = (%+v, %v, %v), want zero,false,readback error", claimed, ok, err)
+	}
+	if updateCalls != 1 || getCalls != 3 {
+		t.Fatalf("GetIssue calls=%d UpdateIssue calls=%d, want two transactional reads plus one post-error readback and one update", getCalls, updateCalls)
+	}
+	if issue.Status != beadslib.StatusOpen || issue.Assignee != "" {
+		t.Fatalf("failed transaction retained assignment: status=%q assignee=%q", issue.Status, issue.Assignee)
+	}
+	metadata, metadataErr := metadataMapFromNative(issue.Metadata)
+	if metadataErr != nil {
+		t.Fatal(metadataErr)
+	}
+	if !maps.Equal(metadata, map[string]string{"gc.routed_to": "rig/pool"}) {
+		t.Fatalf("failed transaction retained witness metadata: %#v", metadata)
+	}
+}
+
+func TestNativeDoltStoreGuardedAssignmentNilReadbackRollsBack(t *testing.T) {
+	issue := &beadslib.Issue{
+		ID:        "gc-nil-readback",
+		Title:     "guarded native nil readback",
+		Status:    beadslib.StatusOpen,
+		IssueType: beadslib.TypeTask,
+		Priority:  2,
+		Metadata:  json.RawMessage(`{"gc.routed_to":"rig/pool"}`),
+	}
+	var getCalls int
+	var storage *nativeDoltStorageSpy
+	storage = &nativeDoltStorageSpy{
+		getIssue: func(_ context.Context, _ string) (*beadslib.Issue, error) {
+			getCalls++
+			if getCalls == 2 {
+				return nil, nil
+			}
+			return cloneNativeIssueForTest(issue), nil
+		},
+		updateIssue: func(_ context.Context, _ string, updates map[string]interface{}, _ string) error {
+			issue.Status = beadslib.Status(updates["status"].(string))
+			issue.Assignee = updates["assignee"].(string)
+			issue.Metadata = slices.Clone(updates["metadata"].(json.RawMessage))
+			return nil
+		},
+		runInTransaction: func(_ context.Context, _ string, fn func(beadslib.Transaction) error) error {
+			before := cloneNativeIssueForTest(issue)
+			if err := fn(nativeDoltTransactionForTest{storage: storage}); err != nil {
+				issue = before
+				return err
+			}
+			return nil
+		},
+	}
+	store := newNativeDoltStoreForTest(storage)
+
+	claimed, ok, err := store.ClaimAssignment(t.Context(), nativeGuardedClaimRequest(issue.ID))
+	if ok || claimed.ID != "" || err == nil {
+		t.Fatalf("ClaimAssignment = (%+v, %v, %v), want zero,false,readback error", claimed, ok, err)
+	}
+	if issue.Status != beadslib.StatusOpen || issue.Assignee != "" {
+		t.Fatalf("nil readback retained assignment: status=%q assignee=%q", issue.Status, issue.Assignee)
+	}
+}
+
+func TestNativeDoltStoreGuardedAssignmentHydratesForbiddenLabelsInsideTransaction(t *testing.T) {
+	issue := &beadslib.Issue{
+		ID:        "gc-held",
+		Title:     "held native claim",
+		Status:    beadslib.StatusOpen,
+		IssueType: beadslib.TypeTask,
+		Priority:  2,
+		Metadata:  json.RawMessage(`{"gc.routed_to":"rig/pool"}`),
+		// Deliberately empty: real transaction GetIssue reads only the issue row.
+		Labels: nil,
+	}
+	var labelReads, updateCalls int
+	storage := &nativeDoltStorageSpy{
+		getIssue: func(_ context.Context, _ string) (*beadslib.Issue, error) {
+			return cloneNativeIssueForTest(issue), nil
+		},
+		getLabels: func(_ context.Context, id string) ([]string, error) {
+			labelReads++
+			if id != issue.ID {
+				t.Fatalf("GetLabels id = %q, want %q", id, issue.ID)
+			}
+			return []string{"hold:mayor"}, nil
+		},
+		updateIssue: func(_ context.Context, _ string, _ map[string]interface{}, _ string) error {
+			updateCalls++
+			return nil
+		},
+	}
+	store := newNativeDoltStoreForTest(storage)
+
+	claimed, ok, err := store.ClaimAssignment(t.Context(), nativeGuardedClaimRequest(issue.ID))
+	if err != nil || ok || claimed.ID != "" {
+		t.Fatalf("ClaimAssignment = (%+v, %v, %v), want zero,false,nil for transactionally held bead", claimed, ok, err)
+	}
+	if labelReads != 1 {
+		t.Fatalf("transaction label reads = %d, want 1", labelReads)
+	}
+	if updateCalls != 0 {
+		t.Fatalf("transaction updates = %d, want zero before forbidden-label refusal", updateCalls)
+	}
+}
+
+func TestNativeDoltStoreGuardedAssignmentHydratesSessionWitnessInsideTransaction(t *testing.T) {
+	work := &beadslib.Issue{
+		ID:        "gc-witnessed-work",
+		Title:     "guarded witnessed native claim",
+		Status:    beadslib.StatusOpen,
+		IssueType: beadslib.TypeTask,
+		Priority:  2,
+		Metadata:  json.RawMessage(`{"gc.routed_to":"rig/pool"}`),
+	}
+	canonicalSession := &beadslib.Issue{
+		ID:        "gc-session-witness",
+		Title:     "co-located session witness",
+		Status:    beadslib.StatusOpen,
+		IssueType: beadslib.IssueType("session"),
+		Priority:  2,
+		Metadata: json.RawMessage(`{
+			"instance_token":"instance-9",
+			"session_name":"rig-worker-1",
+			"state":"creating",
+			"alias":"explicit-worker"
+		}`),
+		// Deliberately misleading: native transaction issue rows do not own
+		// labels, so the separate label-table read must be authoritative.
+		Labels: []string{"gc:session"},
+	}
+
+	for _, tc := range []struct {
+		name          string
+		mutateSession func(*beadslib.Issue)
+		sessionLabels []string
+		wantClaim     bool
+	}{
+		{name: "matching raw row and label table", sessionLabels: []string{"gc:session"}, wantClaim: true},
+		{name: "extended raw status drift", mutateSession: func(issue *beadslib.Issue) {
+			issue.Status = beadslib.Status("blocked")
+		}, sessionLabels: []string{"gc:session"}},
+		{name: "label table drift", sessionLabels: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			workIssue := cloneNativeIssueForTest(work)
+			sessionIssue := cloneNativeIssueForTest(canonicalSession)
+			if tc.mutateSession != nil {
+				tc.mutateSession(sessionIssue)
+			}
+			var calls []string
+			var updateCalls int
+			var storage *nativeDoltStorageSpy
+			storage = &nativeDoltStorageSpy{
+				getIssue: func(_ context.Context, id string) (*beadslib.Issue, error) {
+					calls = append(calls, "get:"+id)
+					switch id {
+					case workIssue.ID:
+						return cloneNativeIssueForTest(workIssue), nil
+					case sessionIssue.ID:
+						return cloneNativeIssueForTest(sessionIssue), nil
+					default:
+						return nil, errors.New("not found")
+					}
+				},
+				getLabels: func(_ context.Context, id string) ([]string, error) {
+					calls = append(calls, "labels:"+id)
+					if id == sessionIssue.ID {
+						return slices.Clone(tc.sessionLabels), nil
+					}
+					return nil, nil
+				},
+				updateIssue: func(_ context.Context, id string, updates map[string]interface{}, _ string) error {
+					calls = append(calls, "update:"+id)
+					updateCalls++
+					workIssue.Status = beadslib.Status(updates["status"].(string))
+					workIssue.Assignee = updates["assignee"].(string)
+					workIssue.Metadata = slices.Clone(updates["metadata"].(json.RawMessage))
+					return nil
+				},
+				runInTransaction: func(_ context.Context, _ string, fn func(beadslib.Transaction) error) error {
+					calls = append(calls, "begin")
+					if err := fn(nativeDoltTransactionForTest{storage: storage}); err != nil {
+						return err
+					}
+					calls = append(calls, "commit")
+					return nil
+				},
+			}
+			store := newNativeDoltStoreForTest(storage)
+			claimed, ok, err := store.ClaimAssignment(t.Context(), nativeGuardedClaimRequestWithSessionWitness(workIssue.ID, sessionIssue.ID))
+			if err != nil || ok != tc.wantClaim {
+				t.Fatalf("ClaimAssignment = (%+v, %v, %v), want ok=%v", claimed, ok, err, tc.wantClaim)
+			}
+			if !tc.wantClaim {
+				if claimed.ID != "" || updateCalls != 0 {
+					t.Fatalf("drifted session witness returned %+v with %d updates, want zero bead and zero updates", claimed, updateCalls)
+				}
+				return
+			}
+			witnessGet := slices.Index(calls, "get:"+sessionIssue.ID)
+			witnessLabels := slices.Index(calls, "labels:"+sessionIssue.ID)
+			workUpdate := slices.Index(calls, "update:"+workIssue.ID)
+			if witnessGet < 0 || witnessLabels <= witnessGet || workUpdate <= witnessLabels {
+				t.Fatalf("transaction calls = %v, want session row+labels before work update", calls)
+			}
+		})
+	}
+}
+
+func TestNativeDoltStoreGuardedAssignmentRetriesSerializationConflictAndRechecksPredicates(t *testing.T) {
+	issue := &beadslib.Issue{
+		ID:        "gc-conflicted-claim",
+		Title:     "guarded native conflict",
+		Status:    beadslib.StatusOpen,
+		IssueType: beadslib.TypeTask,
+		Priority:  2,
+		Metadata:  json.RawMessage(`{"gc.routed_to":"rig/pool"}`),
+	}
+	var attempts, updates int
+	var storage *nativeDoltStorageSpy
+	storage = &nativeDoltStorageSpy{
+		getIssue: func(_ context.Context, _ string) (*beadslib.Issue, error) {
+			return cloneNativeIssueForTest(issue), nil
+		},
+		updateIssue: func(_ context.Context, _ string, update map[string]interface{}, _ string) error {
+			updates++
+			issue.Status = beadslib.Status(update["status"].(string))
+			issue.Assignee = update["assignee"].(string)
+			issue.Metadata = slices.Clone(update["metadata"].(json.RawMessage))
+			return nil
+		},
+		runInTransaction: func(_ context.Context, _ string, fn func(beadslib.Transaction) error) error {
+			attempts++
+			if attempts == 1 {
+				// A known-not-committed conflict leaves the row eligible. The store
+				// must re-run the whole guarded transaction, not report a hard error.
+				return errors.New("Error 1213 (40001): serialization failure: this transaction conflicts with a committed transaction")
+			}
+			if attempts == 2 {
+				// A competitor wins before the retry re-reads. The retry must observe
+				// its actor-specific witness and converge as the zero-bead loser.
+				issue.Status = beadslib.StatusInProgress
+				issue.Assignee = "competing-worker"
+				issue.Metadata = json.RawMessage(`{"gc.routed_to":"rig/pool","gc.session_id":"session-competing-worker","gc.session_name":"rig-competing-worker","gc.session_instance_token":"instance-competing-worker"}`)
+			}
+			return fn(nativeDoltTransactionForTest{storage: storage})
+		},
+	}
+	store := newNativeDoltStoreForTest(storage)
+
+	claimed, ok, err := store.ClaimAssignment(t.Context(), nativeGuardedClaimRequest(issue.ID))
+	if err != nil || ok || claimed.ID != "" {
+		t.Fatalf("ClaimAssignment = (%+v, %v, %v), want zero,false,nil after retry observes competing winner", claimed, ok, err)
+	}
+	if attempts != 2 || updates != 0 {
+		t.Fatalf("transaction attempts=%d updates=%d, want 2 attempts and no update after retry observes winner", attempts, updates)
+	}
+	if issue.Assignee != "competing-worker" || issue.Status != beadslib.StatusInProgress {
+		t.Fatalf("stored winner = status %q assignee %q, want competing-worker", issue.Status, issue.Assignee)
+	}
+}
+
+func TestNativeDoltStoreGuardedAssignmentPostCommitErrorReturnsCommittedWitness(t *testing.T) {
+	stageErr := errors.New("injected post-SQL StageAndCommit failure")
+	issue := &beadslib.Issue{
+		ID:        "gc-post-commit",
+		Title:     "guarded native post-commit",
+		Status:    beadslib.StatusOpen,
+		IssueType: beadslib.TypeTask,
+		Priority:  2,
+		Metadata:  json.RawMessage(`{"gc.routed_to":"rig/pool"}`),
+	}
+	var storage *nativeDoltStorageSpy
+	storage = &nativeDoltStorageSpy{
+		getIssue: func(_ context.Context, _ string) (*beadslib.Issue, error) {
+			return cloneNativeIssueForTest(issue), nil
+		},
+		updateIssue: func(_ context.Context, _ string, update map[string]interface{}, _ string) error {
+			issue.Status = beadslib.Status(update["status"].(string))
+			issue.Assignee = update["assignee"].(string)
+			issue.Metadata = slices.Clone(update["metadata"].(json.RawMessage))
+			return nil
+		},
+		runInTransaction: func(_ context.Context, _ string, fn func(beadslib.Transaction) error) error {
+			if err := fn(nativeDoltTransactionForTest{storage: storage}); err != nil {
+				return err
+			}
+			// Mirrors pinned embedded RunInTransaction: SQL commit can make the
+			// row visible before the subsequent version StageAndCommit fails.
+			return stageErr
+		},
+	}
+	store := newNativeDoltStoreForTest(storage)
+	req := nativeGuardedClaimRequest(issue.ID)
+
+	claimed, ok, err := store.ClaimAssignment(t.Context(), req)
+	if err != nil || !ok {
+		t.Fatalf("ClaimAssignment = (%+v, %v, %v), want committed assignment recovered as success", claimed, ok, err)
+	}
+	if claimed.Assignee != req.Actor || claimed.Metadata["gc.session_instance_token"] != req.AssignmentMetadata["gc.session_instance_token"] {
+		t.Fatalf("recovered claim = %+v, want exact actor/session witness", claimed)
+	}
+}
+
+func TestNativeDoltStoreGuardedAssignmentPostCommitErrorReturnsCommittedWitnessAfterSessionDrift(t *testing.T) {
+	stageErr := errors.New("injected post-SQL StageAndCommit failure")
+	workIssue := &beadslib.Issue{
+		ID:        "gc-post-commit-witnessed",
+		Title:     "guarded native witnessed post-commit",
+		Status:    beadslib.StatusOpen,
+		IssueType: beadslib.TypeTask,
+		Priority:  2,
+		Metadata:  json.RawMessage(`{"gc.routed_to":"rig/pool"}`),
+	}
+	sessionIssue := &beadslib.Issue{
+		ID:        "gc-session-post-commit",
+		Title:     "co-located session witness",
+		Status:    beadslib.StatusOpen,
+		IssueType: beadslib.IssueType("session"),
+		Priority:  2,
+		Metadata: json.RawMessage(`{
+			"instance_token":"instance-9",
+			"session_name":"rig-worker-1",
+			"state":"creating",
+			"alias":"explicit-worker"
+		}`),
+	}
+	var transactions, updates int
+	var storage *nativeDoltStorageSpy
+	storage = &nativeDoltStorageSpy{
+		getIssue: func(_ context.Context, id string) (*beadslib.Issue, error) {
+			switch id {
+			case workIssue.ID:
+				return cloneNativeIssueForTest(workIssue), nil
+			case sessionIssue.ID:
+				return cloneNativeIssueForTest(sessionIssue), nil
+			default:
+				return nil, errors.New("not found")
+			}
+		},
+		getLabels: func(_ context.Context, id string) ([]string, error) {
+			if id == sessionIssue.ID {
+				return []string{"gc:session"}, nil
+			}
+			return nil, nil
+		},
+		updateIssue: func(_ context.Context, id string, update map[string]interface{}, _ string) error {
+			if id != workIssue.ID {
+				return fmt.Errorf("UpdateIssue id = %q, want %q", id, workIssue.ID)
+			}
+			updates++
+			workIssue.Status = beadslib.Status(update["status"].(string))
+			workIssue.Assignee = update["assignee"].(string)
+			workIssue.Metadata = slices.Clone(update["metadata"].(json.RawMessage))
+			return nil
+		},
+		runInTransaction: func(_ context.Context, _ string, fn func(beadslib.Transaction) error) error {
+			transactions++
+			if err := fn(nativeDoltTransactionForTest{storage: storage}); err != nil {
+				return err
+			}
+			if transactions == 1 {
+				// SQL committed the exact work assignment. Before ambiguous-error
+				// reconciliation begins, the independently mutable session witness
+				// closes. Its later state cannot erase the fact that this call wrote
+				// the exact actor and assignment witness onto work.
+				sessionIssue.Status = beadslib.StatusClosed
+				return stageErr
+			}
+			return nil
+		},
+	}
+	store := newNativeDoltStoreForTest(storage)
+	req := nativeGuardedClaimRequestWithSessionWitness(workIssue.ID, sessionIssue.ID)
+
+	claimed, ok, err := store.ClaimAssignment(t.Context(), req)
+	if err != nil || !ok {
+		t.Fatalf("ClaimAssignment = (%+v, %v, %v), want committed assignment recovered as success", claimed, ok, err)
+	}
+	if claimed.ID != workIssue.ID || claimed.Assignee != req.Actor ||
+		claimed.Metadata["gc.session_instance_token"] != req.AssignmentMetadata["gc.session_instance_token"] {
+		t.Fatalf("recovered claim = %+v, want exact committed actor/session witness", claimed)
+	}
+	if transactions != 2 || updates != 1 {
+		t.Fatalf("transactions=%d updates=%d, want one claim, one recovery readback, and one work mutation", transactions, updates)
+	}
+}
+
+func TestNativeDoltStoreGuardedAssignmentPostErrorIdempotentWorkRequiresAttemptWitnessAuthorization(t *testing.T) {
+	stageErr := errors.New("injected transaction close failure after refused callback")
+	workIssue := &beadslib.Issue{
+		ID:        "gc-idempotent-stale-witness",
+		Title:     "already assigned native work",
+		Status:    beadslib.StatusInProgress,
+		IssueType: beadslib.TypeTask,
+		Priority:  2,
+		Assignee:  "explicit-worker",
+		Metadata: json.RawMessage(`{
+			"gc.routed_to":"rig/pool",
+			"gc.session_id":"session-42",
+			"gc.session_name":"rig-worker-1",
+			"gc.session_instance_token":"instance-9"
+		}`),
+	}
+	sessionIssue := &beadslib.Issue{
+		ID:        "gc-session-stale-before-callback",
+		Title:     "stale co-located session witness",
+		Status:    beadslib.StatusClosed,
+		IssueType: beadslib.IssueType("session"),
+		Priority:  2,
+		Metadata: json.RawMessage(`{
+			"instance_token":"instance-9",
+			"session_name":"rig-worker-1",
+			"state":"creating",
+			"alias":"explicit-worker"
+		}`),
+	}
+	var transactions, updates int
+	var storage *nativeDoltStorageSpy
+	storage = &nativeDoltStorageSpy{
+		getIssue: func(_ context.Context, id string) (*beadslib.Issue, error) {
+			switch id {
+			case workIssue.ID:
+				return cloneNativeIssueForTest(workIssue), nil
+			case sessionIssue.ID:
+				return cloneNativeIssueForTest(sessionIssue), nil
+			default:
+				return nil, errors.New("not found")
+			}
+		},
+		getLabels: func(_ context.Context, id string) ([]string, error) {
+			if id == sessionIssue.ID {
+				return []string{"gc:session"}, nil
+			}
+			return nil, nil
+		},
+		updateIssue: func(_ context.Context, _ string, _ map[string]interface{}, _ string) error {
+			updates++
+			return nil
+		},
+		runInTransaction: func(_ context.Context, _ string, fn func(beadslib.Transaction) error) error {
+			transactions++
+			if err := fn(nativeDoltTransactionForTest{storage: storage}); err != nil {
+				return err
+			}
+			if transactions == 1 {
+				// The callback ran but refused the stale session witness before it
+				// reached the already-idempotent work decision. A later transaction
+				// error must not turn that pre-existing work row into proof of success.
+				return stageErr
+			}
+			return nil
+		},
+	}
+	store := newNativeDoltStoreForTest(storage)
+
+	claimed, ok, err := store.ClaimAssignment(
+		t.Context(),
+		nativeGuardedClaimRequestWithSessionWitness(workIssue.ID, sessionIssue.ID),
+	)
+	if err != nil || ok || claimed.ID != "" {
+		t.Fatalf("ClaimAssignment = (%+v, %v, %v), want zero,false,nil for unauthorized idempotent work", claimed, ok, err)
+	}
+	if transactions != 2 || updates != 0 {
+		t.Fatalf("transactions=%d updates=%d, want refused callback plus recovery read and no mutation", transactions, updates)
+	}
+}
+
+func TestNativeDoltStoreGuardedAssignmentPostErrorAuthorizedIdempotentSurvivesSessionDrift(t *testing.T) {
+	stageErr := errors.New("injected transaction close failure after authorized callback")
+	workIssue := &beadslib.Issue{
+		ID:        "gc-idempotent-authorized-before-drift",
+		Title:     "already assigned authorized native work",
+		Status:    beadslib.StatusInProgress,
+		IssueType: beadslib.TypeTask,
+		Priority:  2,
+		Assignee:  "explicit-worker",
+		Metadata: json.RawMessage(`{
+			"gc.routed_to":"rig/pool",
+			"gc.session_id":"session-42",
+			"gc.session_name":"rig-worker-1",
+			"gc.session_instance_token":"instance-9"
+		}`),
+	}
+	sessionIssue := &beadslib.Issue{
+		ID:        "gc-session-drift-after-idempotent",
+		Title:     "co-located session witness",
+		Status:    beadslib.StatusOpen,
+		IssueType: beadslib.IssueType("session"),
+		Priority:  2,
+		Metadata: json.RawMessage(`{
+			"instance_token":"instance-9",
+			"session_name":"rig-worker-1",
+			"state":"creating",
+			"alias":"explicit-worker"
+		}`),
+	}
+	var transactions, updates int
+	var storage *nativeDoltStorageSpy
+	storage = &nativeDoltStorageSpy{
+		getIssue: func(_ context.Context, id string) (*beadslib.Issue, error) {
+			switch id {
+			case workIssue.ID:
+				return cloneNativeIssueForTest(workIssue), nil
+			case sessionIssue.ID:
+				return cloneNativeIssueForTest(sessionIssue), nil
+			default:
+				return nil, errors.New("not found")
+			}
+		},
+		getLabels: func(_ context.Context, id string) ([]string, error) {
+			if id == sessionIssue.ID {
+				return []string{"gc:session"}, nil
+			}
+			return nil, nil
+		},
+		updateIssue: func(_ context.Context, _ string, _ map[string]interface{}, _ string) error {
+			updates++
+			return nil
+		},
+		runInTransaction: func(_ context.Context, _ string, fn func(beadslib.Transaction) error) error {
+			transactions++
+			if err := fn(nativeDoltTransactionForTest{storage: storage}); err != nil {
+				return err
+			}
+			if transactions == 1 {
+				// The callback passed the live witness and reached the exact
+				// idempotent work row. Later witness drift cannot invalidate that
+				// already-authorized post-state during ambiguous-error recovery.
+				sessionIssue.Status = beadslib.StatusClosed
+				return stageErr
+			}
+			return nil
+		},
+	}
+	store := newNativeDoltStoreForTest(storage)
+	req := nativeGuardedClaimRequestWithSessionWitness(workIssue.ID, sessionIssue.ID)
+
+	claimed, ok, err := store.ClaimAssignment(t.Context(), req)
+	if err != nil || !ok {
+		t.Fatalf("ClaimAssignment = (%+v, %v, %v), want authorized idempotent post-state recovered as success", claimed, ok, err)
+	}
+	if claimed.ID != workIssue.ID || claimed.Assignee != req.Actor {
+		t.Fatalf("recovered claim = %+v, want exact authorized idempotent work", claimed)
+	}
+	if transactions != 2 || updates != 0 {
+		t.Fatalf("transactions=%d updates=%d, want authorized callback plus recovery read and no mutation", transactions, updates)
+	}
+}
+
+func TestNativeDoltStoreGuardedAssignmentInternalCallbackRetryClearsAbandonedSuccess(t *testing.T) {
+	workIssue := &beadslib.Issue{
+		ID:        "gc-internal-callback-retry",
+		Title:     "guarded native internal callback retry",
+		Status:    beadslib.StatusOpen,
+		IssueType: beadslib.TypeTask,
+		Priority:  2,
+		Metadata:  json.RawMessage(`{"gc.routed_to":"rig/pool"}`),
+	}
+	sessionIssue := &beadslib.Issue{
+		ID:        "gc-session-internal-callback-retry",
+		Title:     "co-located session witness",
+		Status:    beadslib.StatusOpen,
+		IssueType: beadslib.IssueType("session"),
+		Priority:  2,
+		Metadata: json.RawMessage(`{
+			"instance_token":"instance-9",
+			"session_name":"rig-worker-1",
+			"state":"creating",
+			"alias":"explicit-worker"
+		}`),
+	}
+	var transactions, callbacks, updates int
+	var storage *nativeDoltStorageSpy
+	storage = &nativeDoltStorageSpy{
+		getIssue: func(_ context.Context, id string) (*beadslib.Issue, error) {
+			switch id {
+			case workIssue.ID:
+				return cloneNativeIssueForTest(workIssue), nil
+			case sessionIssue.ID:
+				return cloneNativeIssueForTest(sessionIssue), nil
+			default:
+				return nil, errors.New("not found")
+			}
+		},
+		getLabels: func(_ context.Context, id string) ([]string, error) {
+			if id == sessionIssue.ID {
+				return []string{"gc:session"}, nil
+			}
+			return nil, nil
+		},
+		updateIssue: func(_ context.Context, id string, update map[string]interface{}, _ string) error {
+			if id != workIssue.ID {
+				return fmt.Errorf("UpdateIssue id = %q, want %q", id, workIssue.ID)
+			}
+			updates++
+			workIssue.Status = beadslib.Status(update["status"].(string))
+			workIssue.Assignee = update["assignee"].(string)
+			workIssue.Metadata = slices.Clone(update["metadata"].(json.RawMessage))
+			return nil
+		},
+		runInTransaction: func(_ context.Context, _ string, fn func(beadslib.Transaction) error) error {
+			transactions++
+			before := cloneNativeIssueForTest(workIssue)
+			callbacks++
+			if err := fn(nativeDoltTransactionForTest{storage: storage}); err != nil {
+				return err
+			}
+			// The provider discards the first callback's apparent write after a
+			// retryable noncommit, then invokes the same callback again. The second
+			// snapshot has a stale session witness and must be the only result that
+			// survives RunInTransaction.
+			workIssue = before
+			sessionIssue.Status = beadslib.StatusClosed
+			callbacks++
+			return fn(nativeDoltTransactionForTest{storage: storage})
+		},
+	}
+	store := newNativeDoltStoreForTest(storage)
+
+	claimed, ok, err := store.ClaimAssignment(
+		t.Context(),
+		nativeGuardedClaimRequestWithSessionWitness(workIssue.ID, sessionIssue.ID),
+	)
+	if err != nil || ok || claimed.ID != "" {
+		t.Fatalf("ClaimAssignment = (%+v, %v, %v), want zero,false,nil from final refused callback", claimed, ok, err)
+	}
+	if transactions != 1 || callbacks != 2 || updates != 1 {
+		t.Fatalf("transactions=%d callbacks=%d updates=%d, want one transaction, two callbacks, and one abandoned update", transactions, callbacks, updates)
+	}
+	if workIssue.Status != beadslib.StatusOpen || workIssue.Assignee != "" {
+		t.Fatalf("abandoned callback leaked work mutation: status=%q assignee=%q", workIssue.Status, workIssue.Assignee)
+	}
+}
+
+func TestNativeDoltStoreGuardedAssignmentWitnessedReadbackInternalRetryClearsAbandonedSnapshot(t *testing.T) {
+	readErr := errors.New("injected second callback read failure")
+	req := nativeGuardedClaimRequestWithSessionWitness(
+		"gc-readback-internal-retry",
+		"gc-session-readback-internal-retry",
+	)
+	workIssue := &beadslib.Issue{
+		ID:        req.ID,
+		Title:     "assigned native work readback",
+		Status:    beadslib.StatusInProgress,
+		IssueType: beadslib.TypeTask,
+		Priority:  2,
+		Assignee:  req.Actor,
+		Metadata: json.RawMessage(`{
+			"gc.routed_to":"rig/pool",
+			"gc.session_id":"session-42",
+			"gc.session_name":"rig-worker-1",
+			"gc.session_instance_token":"instance-9"
+		}`),
+	}
+	sessionIssue := &beadslib.Issue{
+		ID:        req.CoLocatedWitness.ID,
+		Title:     "co-located session witness",
+		Status:    beadslib.StatusOpen,
+		IssueType: beadslib.IssueType("session"),
+		Priority:  2,
+		Metadata: json.RawMessage(`{
+			"instance_token":"instance-9",
+			"session_name":"rig-worker-1",
+			"state":"creating",
+			"alias":"explicit-worker"
+		}`),
+	}
+	var callbacks int
+	retrying := false
+	var storage *nativeDoltStorageSpy
+	storage = &nativeDoltStorageSpy{
+		getIssue: func(_ context.Context, id string) (*beadslib.Issue, error) {
+			if retrying && id == workIssue.ID {
+				return nil, readErr
+			}
+			switch id {
+			case workIssue.ID:
+				return cloneNativeIssueForTest(workIssue), nil
+			case sessionIssue.ID:
+				return cloneNativeIssueForTest(sessionIssue), nil
+			default:
+				return nil, errors.New("not found")
+			}
+		},
+		getLabels: func(_ context.Context, id string) ([]string, error) {
+			if id == sessionIssue.ID {
+				return []string{"gc:session"}, nil
+			}
+			return nil, nil
+		},
+		runInTransaction: func(_ context.Context, _ string, fn func(beadslib.Transaction) error) error {
+			callbacks++
+			if err := fn(nativeDoltTransactionForTest{storage: storage}); err != nil {
+				return err
+			}
+			// Discard the first complete snapshot and retry the callback against a
+			// failing read. readComplete/observed/witnessMatches from the abandoned
+			// callback must not make the second failure look authoritative.
+			retrying = true
+			callbacks++
+			return fn(nativeDoltTransactionForTest{storage: storage})
+		},
+	}
+
+	observed, witnessMatches, err := nativeAssignmentClaimWitnessedReadback(
+		t.Context(),
+		storage,
+		req,
+	)
+	if !errors.Is(err, readErr) || witnessMatches || observed.ID != "" {
+		t.Fatalf("readback = (%+v, %v, %v), want zero,false,second callback error", observed, witnessMatches, err)
+	}
+	if callbacks != 2 {
+		t.Fatalf("callbacks = %d, want 2", callbacks)
+	}
+}
+
+func TestNativeDoltStoreGuardedAssignmentPostErrorEligibleStateRequiresCurrentSessionWitness(t *testing.T) {
+	workIssue := &beadslib.Issue{
+		ID:        "gc-eligible-witness-drift",
+		Title:     "guarded native eligible witness drift",
+		Status:    beadslib.StatusOpen,
+		IssueType: beadslib.TypeTask,
+		Priority:  2,
+		Metadata:  json.RawMessage(`{"gc.routed_to":"rig/pool"}`),
+	}
+	sessionIssue := &beadslib.Issue{
+		ID:        "gc-session-eligible-drift",
+		Title:     "co-located session witness",
+		Status:    beadslib.StatusOpen,
+		IssueType: beadslib.IssueType("session"),
+		Priority:  2,
+		Metadata: json.RawMessage(`{
+			"instance_token":"instance-9",
+			"session_name":"rig-worker-1",
+			"state":"creating",
+			"alias":"explicit-worker"
+		}`),
+	}
+	var transactions int
+	var storage *nativeDoltStorageSpy
+	storage = &nativeDoltStorageSpy{
+		getIssue: func(_ context.Context, id string) (*beadslib.Issue, error) {
+			switch id {
+			case workIssue.ID:
+				return cloneNativeIssueForTest(workIssue), nil
+			case sessionIssue.ID:
+				return cloneNativeIssueForTest(sessionIssue), nil
+			default:
+				return nil, errors.New("not found")
+			}
+		},
+		getLabels: func(_ context.Context, id string) ([]string, error) {
+			if id == sessionIssue.ID {
+				return []string{"gc:session"}, nil
+			}
+			return nil, nil
+		},
+		runInTransaction: func(_ context.Context, _ string, fn func(beadslib.Transaction) error) error {
+			transactions++
+			if transactions == 1 {
+				// A known-not-committed conflict leaves work eligible, but the
+				// session closes before recovery reads both rows. The stale witness
+				// must prevent a retry against that still-open work bead.
+				sessionIssue.Status = beadslib.StatusClosed
+				return errors.New("Error 1213 (40001): serialization failure: this transaction conflicts with a committed transaction")
+			}
+			return fn(nativeDoltTransactionForTest{storage: storage})
+		},
+	}
+	store := newNativeDoltStoreForTest(storage)
+
+	claimed, ok, err := store.ClaimAssignment(
+		t.Context(),
+		nativeGuardedClaimRequestWithSessionWitness(workIssue.ID, sessionIssue.ID),
+	)
+	if err != nil || ok || claimed.ID != "" {
+		t.Fatalf("ClaimAssignment = (%+v, %v, %v), want zero,false,nil after recovery observes stale session", claimed, ok, err)
+	}
+	if transactions != 2 {
+		t.Fatalf("transactions = %d, want one failed claim plus one recovery read and no retry", transactions)
+	}
+	if workIssue.Status != beadslib.StatusOpen || workIssue.Assignee != "" {
+		t.Fatalf("eligible work mutated: status=%q assignee=%q", workIssue.Status, workIssue.Assignee)
+	}
+}
+
+func TestNativeDoltStoreGuardedAssignmentPostErrorEligibleStatePreservesError(t *testing.T) {
+	wantErr := errors.New("injected transaction failure before mutation")
+	issue := &beadslib.Issue{
+		ID:        "gc-still-eligible",
+		Title:     "guarded native unchanged error",
+		Status:    beadslib.StatusOpen,
+		IssueType: beadslib.TypeTask,
+		Priority:  2,
+		Metadata:  json.RawMessage(`{"gc.routed_to":"rig/pool"}`),
+	}
+	storage := &nativeDoltStorageSpy{
+		getIssue: func(_ context.Context, _ string) (*beadslib.Issue, error) {
+			return cloneNativeIssueForTest(issue), nil
+		},
+		runInTransaction: func(_ context.Context, _ string, _ func(beadslib.Transaction) error) error {
+			return wantErr
+		},
+	}
+	store := newNativeDoltStoreForTest(storage)
+
+	claimed, ok, err := store.ClaimAssignment(t.Context(), nativeGuardedClaimRequest(issue.ID))
+	if ok || claimed.ID != "" || !errors.Is(err, wantErr) {
+		t.Fatalf("ClaimAssignment = (%+v, %v, %v), want zero,false,original error", claimed, ok, err)
+	}
+}
+
+func TestNativeDoltStoreGuardedAssignmentPostErrorOtherWinnerConvergesAsLoser(t *testing.T) {
+	stageErr := errors.New("injected post-SQL StageAndCommit failure after competing winner")
+	issue := &beadslib.Issue{
+		ID:        "gc-other-winner",
+		Title:     "guarded native other winner",
+		Status:    beadslib.StatusOpen,
+		IssueType: beadslib.TypeTask,
+		Priority:  2,
+		Metadata:  json.RawMessage(`{"gc.routed_to":"rig/pool"}`),
+	}
+	storage := &nativeDoltStorageSpy{
+		getIssue: func(_ context.Context, _ string) (*beadslib.Issue, error) {
+			return cloneNativeIssueForTest(issue), nil
+		},
+		runInTransaction: func(_ context.Context, _ string, _ func(beadslib.Transaction) error) error {
+			issue.Status = beadslib.StatusInProgress
+			issue.Assignee = "competing-worker"
+			issue.Metadata = json.RawMessage(`{"gc.routed_to":"rig/pool","gc.session_id":"session-competing-worker","gc.session_name":"rig-competing-worker","gc.session_instance_token":"instance-competing-worker"}`)
+			return stageErr
+		},
+	}
+	store := newNativeDoltStoreForTest(storage)
+
+	claimed, ok, err := store.ClaimAssignment(t.Context(), nativeGuardedClaimRequest(issue.ID))
+	if err != nil || ok || claimed.ID != "" {
+		t.Fatalf("ClaimAssignment = (%+v, %v, %v), want zero,false,nil for authoritative other winner", claimed, ok, err)
+	}
+}
 
 func TestNativeDoltStoreCreateDelegatesToUpstreamStorage(t *testing.T) {
 	createdAt := time.Date(2026, 5, 17, 10, 30, 0, 0, time.UTC)
@@ -2041,9 +3389,11 @@ type nativeDoltTransactionTestStorage interface {
 	CloseIssue(context.Context, string, string, string, string) error
 	AddLabel(context.Context, string, string, string) error
 	RemoveLabel(context.Context, string, string, string) error
+	GetLabels(context.Context, string) ([]string, error)
 	AddDependency(context.Context, *beadslib.Dependency, string) error
 	RemoveDependency(context.Context, string, string, string) error
 	GetDependencyRecords(context.Context, string) ([]*beadslib.Dependency, error)
+	SearchIssues(context.Context, string, beadslib.IssueFilter) ([]*beadslib.Issue, error)
 }
 
 type nativeDoltTransactionForTest struct {
@@ -2079,6 +3429,10 @@ func (tx nativeDoltTransactionForTest) RemoveLabel(ctx context.Context, issueID,
 	return tx.storage.RemoveLabel(ctx, issueID, label, actor)
 }
 
+func (tx nativeDoltTransactionForTest) GetLabels(ctx context.Context, issueID string) ([]string, error) {
+	return tx.storage.GetLabels(ctx, issueID)
+}
+
 func (tx nativeDoltTransactionForTest) AddDependency(ctx context.Context, dep *beadslib.Dependency, actor string) error {
 	return tx.storage.AddDependency(ctx, dep, actor)
 }
@@ -2089,6 +3443,10 @@ func (tx nativeDoltTransactionForTest) RemoveDependency(ctx context.Context, iss
 
 func (tx nativeDoltTransactionForTest) GetDependencyRecords(ctx context.Context, issueID string) ([]*beadslib.Dependency, error) {
 	return tx.storage.GetDependencyRecords(ctx, issueID)
+}
+
+func (tx nativeDoltTransactionForTest) SearchIssues(ctx context.Context, query string, filter beadslib.IssueFilter) ([]*beadslib.Issue, error) {
+	return tx.storage.SearchIssues(ctx, query, filter)
 }
 
 type nativeDoltStorageSpy struct {
@@ -2106,6 +3464,7 @@ type nativeDoltStorageSpy struct {
 	getReadyWork                func(context.Context, beadslib.WorkFilter) ([]*beadslib.Issue, error)
 	addLabel                    func(context.Context, string, string, string) error
 	removeLabel                 func(context.Context, string, string, string) error
+	getLabels                   func(context.Context, string) ([]string, error)
 	addDependency               func(context.Context, *beadslib.Dependency, string) error
 	removeDependency            func(context.Context, string, string, string) error
 	getDependencyRecords        func(context.Context, string) ([]*beadslib.Dependency, error)
@@ -2114,6 +3473,8 @@ type nativeDoltStorageSpy struct {
 	getConfig                   func(context.Context, string) (string, error)
 	close                       func() error
 }
+
+func (*nativeDoltStorageSpy) NativeAssignmentReleaseAllTierTransactions() bool { return true }
 
 func (s *nativeDoltStorageSpy) CreateIssue(ctx context.Context, issue *beadslib.Issue, actor string) error {
 	if s.createIssue == nil {
@@ -2211,6 +3572,13 @@ func (s *nativeDoltStorageSpy) RemoveLabel(ctx context.Context, issueID, label, 
 	return s.removeLabel(ctx, issueID, label, actor)
 }
 
+func (s *nativeDoltStorageSpy) GetLabels(ctx context.Context, issueID string) ([]string, error) {
+	if s.getLabels == nil {
+		return nil, nil
+	}
+	return s.getLabels(ctx, issueID)
+}
+
 func (s *nativeDoltStorageSpy) AddDependency(ctx context.Context, dep *beadslib.Dependency, actor string) error {
 	if s.addDependency == nil {
 		return nil
@@ -2271,6 +3639,42 @@ func (s *nativeDoltStorageSpy) Close() error {
 type nativeDoltMemStorage struct {
 	beadslib.Storage
 	store *MemStore
+}
+
+// nativeServerSingleTierStorage mirrors the pinned server doltTransaction:
+// SearchIssues reads the durable issues table and omits no-history rows stored
+// in wisps. The assignment-release capability must reject this storage before
+// entering a transaction because absence cannot be proven across both tiers.
+type nativeServerSingleTierStorage struct {
+	*nativeDoltMemStorage
+	transactions int
+}
+
+func (*nativeDoltMemStorage) NativeAssignmentReleaseAllTierTransactions() bool { return true }
+
+func (*nativeServerSingleTierStorage) NativeAssignmentReleaseAllTierTransactions() bool {
+	return false
+}
+
+func (s *nativeServerSingleTierStorage) RunInTransaction(_ context.Context, _ string, fn func(beadslib.Transaction) error) error {
+	s.transactions++
+	return runNativeDoltMemStorageTransactionForTest(s.nativeDoltMemStorage, func() error {
+		return fn(nativeDoltTransactionForTest{storage: s})
+	})
+}
+
+func (s *nativeServerSingleTierStorage) SearchIssues(ctx context.Context, query string, filter beadslib.IssueFilter) ([]*beadslib.Issue, error) {
+	issues, err := s.nativeDoltMemStorage.SearchIssues(ctx, query, filter)
+	if err != nil {
+		return nil, err
+	}
+	visible := make([]*beadslib.Issue, 0, len(issues))
+	for _, issue := range issues {
+		if issue != nil && !issue.NoHistory {
+			visible = append(visible, issue)
+		}
+	}
+	return visible, nil
 }
 
 func newNativeDoltMemStorage() *nativeDoltMemStorage {
@@ -2393,6 +3797,16 @@ func (s *nativeDoltMemStorage) GetReadyWork(_ context.Context, filter beadslib.W
 		if filter.Assignee != nil && bead.Assignee != *filter.Assignee {
 			continue
 		}
+		excluded := false
+		for _, label := range bead.Labels {
+			if slices.Contains(filter.ExcludeLabels, label) {
+				excluded = true
+				break
+			}
+		}
+		if excluded {
+			continue
+		}
 		deps, err := s.store.DepList(bead.ID, "down")
 		if err != nil {
 			return nil, err
@@ -2418,6 +3832,14 @@ func (s *nativeDoltMemStorage) GetReadyWork(_ context.Context, filter beadslib.W
 		}
 	}
 	return nativeIssuesFromBeads(ready)
+}
+
+func (s *nativeDoltMemStorage) GetLabels(ctx context.Context, issueID string) ([]string, error) {
+	issue, err := s.GetIssue(ctx, issueID)
+	if err != nil {
+		return nil, err
+	}
+	return slices.Clone(issue.Labels), nil
 }
 
 func (s *nativeDoltMemStorage) AddLabel(_ context.Context, issueID, label, _ string) error {

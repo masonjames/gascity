@@ -116,11 +116,31 @@ func filterAssignedWorkBeadsForPoolDemand(
 	assignedWorkBeads []beads.Bead,
 	assignedWorkStoreRefs []string,
 ) []beads.Bead {
+	filtered, _ := filterAssignedWorkBeadsForPoolDemandWithStoreRefs(
+		cfg,
+		cityPath,
+		sessionInfos,
+		assignedWorkBeads,
+		assignedWorkStoreRefs,
+	)
+	return filtered
+}
+
+// filterAssignedWorkBeadsForPoolDemandWithStoreRefs is the index-preserving
+// form used by pool realization. The legacy projection above intentionally
+// keeps its established one-slice signature for count-only callers.
+func filterAssignedWorkBeadsForPoolDemandWithStoreRefs(
+	cfg *config.City,
+	cityPath string,
+	sessionInfos []sessionpkg.Info,
+	assignedWorkBeads []beads.Bead,
+	assignedWorkStoreRefs []string,
+) ([]beads.Bead, []string) {
 	if len(assignedWorkBeads) == 0 || len(assignedWorkStoreRefs) == 0 {
-		return assignedWorkBeads
+		return assignedWorkBeads, assignedWorkStoreRefs
 	}
 	if cfg == nil {
-		return assignedWorkBeads
+		return assignedWorkBeads, assignedWorkStoreRefs
 	}
 	assigneeToSessionBeadID := make(map[string]string)
 	sessionBeadTemplate := make(map[string]string)
@@ -140,7 +160,11 @@ func filterAssignedWorkBeadsForPoolDemand(
 		}
 	}
 	filtered := make([]beads.Bead, 0, len(assignedWorkBeads))
+	filteredRefs := make([]string, 0, len(assignedWorkBeads))
 	for i, wb := range assignedWorkBeads {
+		if i >= len(assignedWorkStoreRefs) {
+			continue
+		}
 		template := routedToOrLegacyWorkflowTarget(wb)
 		if template == "" {
 			if sessionBeadID := assigneeToSessionBeadID[strings.TrimSpace(wb.Assignee)]; sessionBeadID != "" {
@@ -160,9 +184,10 @@ func filterAssignedWorkBeadsForPoolDemand(
 		}
 		if assignedWorkIndexReachableFromAgent(cityPath, cfg, agentCfg, assignedWorkStoreRefs, i) {
 			filtered = append(filtered, wb)
+			filteredRefs = append(filteredRefs, assignedWorkStoreRefs[i])
 		}
 	}
-	return filtered
+	return filtered, filteredRefs
 }
 
 // filterAssignedWorkBeadsForSessionWake resolves work through assignment

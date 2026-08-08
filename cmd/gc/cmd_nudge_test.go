@@ -1260,6 +1260,65 @@ func TestWorkerObserveNudgeTargetPrefersSessionNameWhenAvailable(t *testing.T) {
 	}
 }
 
+func TestWorkerHandleForNudgeTargetKnownSessionIDNeverFallsBackToRuntimeHandle(t *testing.T) {
+	store := beads.NewMemStoreFrom(0, []beads.Bead{{
+		ID:     "session-missing",
+		Type:   "task",
+		Status: "open",
+	}}, nil)
+	sp := runtime.NewFake()
+	if err := sp.Start(context.Background(), "session-live", runtime.Config{}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := sp.SetMeta("session-live", "GC_SESSION_ID", "session-missing"); err != nil {
+		t.Fatalf("SetMeta: %v", err)
+	}
+
+	handle, err := workerHandleForNudgeTarget(nudgeTarget{
+		sessionID:   "session-missing",
+		sessionName: "session-live",
+	}, store, sp)
+	if err == nil || handle != nil {
+		t.Fatalf("workerHandleForNudgeTarget = (%T, %v), want fail-closed bead lookup", handle, err)
+	}
+	if got := sp.CountCalls("Nudge", "session-live"); got != 0 {
+		t.Fatalf("Nudge calls = %d, want 0", got)
+	}
+}
+
+func TestWorkerHandleForNudgeTargetForbiddenAgentWithoutSessionRowNeverFallsBackToRuntimeHandle(t *testing.T) {
+	sp := runtime.NewFake()
+	if err := sp.Start(context.Background(), "strict-live", runtime.Config{}); err != nil {
+		t.Fatalf("seed runtime: %v", err)
+	}
+	baseline := len(sp.SnapshotCalls())
+
+	handle, err := workerHandleForNudgeTarget(nudgeTarget{
+		agent: config.Agent{
+			Name:         "strict",
+			ProjectHooks: config.ProjectHooksForbid,
+		},
+		sessionName: "strict-live",
+	}, nil, sp)
+	if err == nil || handle != nil {
+		t.Fatalf("workerHandleForNudgeTarget = (%T, %v), want strict missing-row refusal", handle, err)
+	}
+	if calls := sp.SnapshotCalls()[baseline:]; len(calls) != 0 {
+		t.Fatalf("provider calls after strict target resolution = %+v, want none", calls)
+	}
+
+	legacy, err := workerHandleForNudgeTarget(nudgeTarget{
+		agent:       config.Agent{Name: "legacy"},
+		sessionName: "strict-live",
+	}, nil, sp)
+	if err != nil {
+		t.Fatalf("inherit runtime-only target: %v", err)
+	}
+	if _, ok := legacy.(*worker.RuntimeHandle); !ok {
+		t.Fatalf("inherit target handle = %T, want *worker.RuntimeHandle", legacy)
+	}
+}
+
 func TestShouldKeepNudgePollerAliveDuringStartupGrace(t *testing.T) {
 	t.Setenv("GC_BEADS", "file")
 	dir := t.TempDir()

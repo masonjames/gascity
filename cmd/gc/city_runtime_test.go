@@ -3390,6 +3390,7 @@ func TestCityRuntimeBeadReconcileTick_IdleClaimNudgeSeesReadyUnassignedRoutedTri
 			beadmeta.TriggerBeadIDMetadataKey:       work.ID,
 			beadmeta.TriggerBeadStoreRefMetadataKey: "rig:fixture",
 			idleClaimNudgeTriggerKey:                work.ID,
+			idleClaimNudgeTriggerStoreRefKey:        "rig:fixture",
 			idleClaimNudgeCountKey:                  "0",
 			idleClaimNudgeAtKey:                     staleObservation,
 		},
@@ -4429,6 +4430,150 @@ func TestCityRuntimeReloadProviderSwapPreservesDrainTracker(t *testing.T) {
 	}
 	if cr.sessionDrains == nil {
 		t.Fatal("sessionDrains = nil after provider swap, want non-nil")
+	}
+}
+
+func TestCityRuntimeReloadWaitsForAutomaticActionsBeforeConfigProviderSwap(t *testing.T) {
+	cityPath := t.TempDir()
+	tomlPath := filepath.Join(cityPath, "city.toml")
+	writeCityRuntimeConfig(t, tomlPath, "fake")
+
+	cfg, configRev := loadCityRuntimeControllerConfig(t, cityPath)
+	sp := runtime.NewFake()
+	cr := newTestCityRuntime(t, CityRuntimeParams{
+		CityPath:  cityPath,
+		CityName:  "test-city",
+		TomlPath:  tomlPath,
+		ConfigRev: configRev,
+		Cfg:       cfg,
+		SP:        sp,
+		BuildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
+			return DesiredStateResult{State: map[string]TemplateParams{}}
+		},
+		Dops:   newDrainOps(sp),
+		Rec:    events.Discard,
+		Stdout: io.Discard,
+		Stderr: io.Discard,
+	})
+	cs := newControllerState(context.Background(), cfg, sp, events.NewFake(), "test-city", cityPath)
+	cs.cityBeadStore = beads.NewMemStore()
+	cr.setControllerState(cs)
+	cr.sessionDrains = newDrainTracker()
+
+	actionDone, ok := cr.asyncStarts.start()
+	if !ok {
+		t.Fatal("reserve in-flight automatic action")
+	}
+	writeCityRuntimeConfig(t, tomlPath, "fail")
+	lastProviderName := "fake"
+	reloadDone := make(chan reloadControlReply, 1)
+	go func() {
+		reloadDone <- cr.reloadConfigTraced(context.Background(), &lastProviderName, cityPath, nil, reloadSourceManual)
+	}()
+
+	select {
+	case reply := <-reloadDone:
+		actionDone()
+		t.Fatalf("reload completed before automatic action: %+v", reply)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if lastProviderName != "fake" || cr.cfg != cfg || cr.sp != sp {
+		actionDone()
+		t.Fatalf("reload swapped live config/provider before action commit: provider=%q cfgChanged=%t spChanged=%t", lastProviderName, cr.cfg != cfg, cr.sp != sp)
+	}
+
+	actionDone()
+	select {
+	case reply := <-reloadDone:
+		if reply.Outcome != reloadOutcomeApplied {
+			t.Fatalf("reload outcome after action commit = %q, want %q: %+v", reply.Outcome, reloadOutcomeApplied, reply)
+		}
+		if lastProviderName != "fail" || cr.cfg == cfg || cr.sp == sp {
+			t.Fatalf("reload did not apply after action commit: provider=%q cfgChanged=%t spChanged=%t", lastProviderName, cr.cfg != cfg, cr.sp != sp)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("reload remained blocked after automatic action committed")
+	}
+}
+
+func TestCityRuntimeReloadWaitsForAutomaticActionsBeforeStoreMetadataSwap(t *testing.T) {
+	cityPath := t.TempDir()
+	tomlPath := filepath.Join(cityPath, "city.toml")
+	writeCityRuntimeConfig(t, tomlPath, "fake")
+
+	cfg, configRev := loadCityRuntimeControllerConfig(t, cityPath)
+	sp := runtime.NewFake()
+	cr := newTestCityRuntime(t, CityRuntimeParams{
+		CityPath:  cityPath,
+		CityName:  "test-city",
+		TomlPath:  tomlPath,
+		ConfigRev: configRev,
+		Cfg:       cfg,
+		SP:        sp,
+		BuildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
+			return DesiredStateResult{State: map[string]TemplateParams{}}
+		},
+		Dops:   newDrainOps(sp),
+		Rec:    events.Discard,
+		Stdout: io.Discard,
+		Stderr: io.Discard,
+	})
+	cs := newControllerState(context.Background(), cfg, sp, events.NewFake(), "test-city", cityPath)
+	cs.cityBeadStore = beads.NewMemStore()
+	cr.setControllerState(cs)
+	cr.sessionDrains = newDrainTracker()
+	previousOpenCityStore := newControllerStateOpenCityStore
+	storeSwapEntered := make(chan struct{}, 1)
+	newControllerStateOpenCityStore = func(string, gate.Mode) (beads.StoreOpenResult, error) {
+		storeSwapEntered <- struct{}{}
+		return beads.StoreOpenResult{Store: beads.NewMemStore()}, nil
+	}
+	t.Cleanup(func() { newControllerStateOpenCityStore = previousOpenCityStore })
+
+	actionDone, ok := cr.asyncStarts.start()
+	if !ok {
+		t.Fatal("reserve in-flight automatic action")
+	}
+	metadataPath := scopeMetadataJSONPath(cityPath)
+	if err := os.MkdirAll(filepath.Dir(metadataPath), 0o755); err != nil {
+		actionDone()
+		t.Fatalf("create metadata directory: %v", err)
+	}
+	if err := os.WriteFile(metadataPath, []byte("{\"reload_barrier_test\":true}\n"), 0o600); err != nil {
+		actionDone()
+		t.Fatalf("write changed store metadata: %v", err)
+	}
+	if !cs.storeMetadataChanged(cfg) {
+		actionDone()
+		t.Fatal("fixture did not change the controller store metadata signature")
+	}
+
+	lastProviderName := "fake"
+	reloadDone := make(chan reloadControlReply, 1)
+	go func() {
+		reloadDone <- cr.reloadConfigTraced(context.Background(), &lastProviderName, cityPath, nil, reloadSourceManual)
+	}()
+
+	select {
+	case <-storeSwapEntered:
+		actionDone()
+		t.Fatal("store metadata reload began swapping stores before automatic action committed")
+	case <-time.After(time.Second):
+	}
+
+	actionDone()
+	select {
+	case <-storeSwapEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("store metadata reload did not begin store swap after automatic action committed")
+	}
+	select {
+	case reply := <-reloadDone:
+		if reply.Outcome != reloadOutcomeApplied {
+			t.Fatalf("store metadata reload outcome after action commit = %q, want %q: %+v", reply.Outcome, reloadOutcomeApplied, reply)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("store metadata reload remained blocked after automatic action committed")
 	}
 }
 

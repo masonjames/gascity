@@ -781,7 +781,7 @@ func TestRuntimeStartCallSitesCleanOrphansFirst(t *testing.T) {
 			lines := strings.Split(string(data), "\n")
 			starts := 0
 			for i, line := range lines {
-				if !strings.Contains(line, "m.sp.Start(ctx, sessName, cfg)") {
+				if !strings.Contains(line, "m.startProvider(ctx, sessName, cfg)") {
 					continue
 				}
 				starts++
@@ -794,9 +794,24 @@ func TestRuntimeStartCallSitesCleanOrphansFirst(t *testing.T) {
 				}
 			}
 			if starts == 0 {
-				t.Fatalf("%s contains no m.sp.Start(ctx, sessName, cfg) call sites", tt.file)
+				t.Fatalf("%s contains no m.startProvider(ctx, sessName, cfg) call sites", tt.file)
 			}
 		})
+	}
+
+	managerSource, err := os.ReadFile("manager.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	chatSource, err := os.ReadFile("chat.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(managerSource), "m.sp.Start(") + strings.Count(string(chatSource), "m.sp.Start("); got != 1 {
+		t.Fatalf("direct runtime Provider.Start call sites = %d, want only the centralized Manager boundary", got)
+	}
+	if !strings.Contains(string(managerSource), "runtime.FinalizeProjectHookIsolatedConfig(cfg)") {
+		t.Fatal("centralized Manager runtime start does not finalize project-hook isolation")
 	}
 }
 

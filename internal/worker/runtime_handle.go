@@ -81,6 +81,10 @@ func (h *RuntimeHandle) StartResolved(ctx context.Context, startCommand string, 
 	event := h.beginOperationEvent(ctx, workerOperationStartResolved)
 	defer func() { event.finish(err) }()
 
+	if cfg.ProjectHooksForbidden {
+		err = fmt.Errorf("%w: project-hook-isolated start requires a bead-backed session", ErrOperationUnsupported)
+		return err
+	}
 	if h.provider.IsRunning(h.sessionName) {
 		return nil
 	}
@@ -88,8 +92,18 @@ func (h *RuntimeHandle) StartResolved(ctx context.Context, startCommand string, 
 	if strings.TrimSpace(startCfg.Command) == "" {
 		startCfg.Command = strings.TrimSpace(startCommand)
 	}
+	if strings.TrimSpace(startCfg.ProviderName) == "" {
+		startCfg.ProviderName = h.providerName
+	}
 	if strings.TrimSpace(startCfg.Command) == "" {
 		err = fmt.Errorf("%w: start requires a runtime command", ErrOperationUnsupported)
+		return err
+	}
+	startCfg, err = runtime.FinalizeProjectHookIsolatedConfig(startCfg)
+	if err != nil {
+		return err
+	}
+	if err = runtime.MaterializeProjectHookIsolatedConfigRoots(startCfg); err != nil {
 		return err
 	}
 	err = h.provider.Start(ctx, h.sessionName, startCfg)

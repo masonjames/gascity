@@ -474,8 +474,13 @@ func (s *Server) handleSessionWake(w http.ResponseWriter, r *http.Request) {
 		writeResolveError(w, err)
 		return
 	}
+	handle, err := s.workerHandleForSession(store.Store, id)
+	if err != nil {
+		writeSessionManagerError(w, err)
+		return
+	}
 
-	res, err := session.NewStore(store).WakeSession(id, time.Now().UTC(), session.WakeOpts{})
+	res, err := session.NewStore(store).WakeSession(id, time.Now().UTC(), session.WakeOpts{RejectClosed: true})
 	if err != nil {
 		if errors.Is(err, session.ErrNotSessionBead) {
 			writeError(w, http.StatusBadRequest, "invalid", id+" is not a session")
@@ -502,6 +507,11 @@ func (s *Server) handleSessionWake(w http.ResponseWriter, r *http.Request) {
 	if sessionName != "" {
 		s.state.ClearCrashHistory(sessionName)
 	}
+	go func() {
+		if err := handle.Start(context.Background()); err != nil {
+			log.Printf("gc api: waking session %s: %v", id, err)
+		}
+	}()
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "id": id})
 }

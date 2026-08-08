@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"maps"
 	"path"
 	"strings"
 	"time"
@@ -102,13 +103,58 @@ func releaseOrphanedPoolAssignmentsWhenSnapshotsComplete(
 	result DesiredStateResult,
 	rigStores map[string]beads.Store,
 ) []releasedPoolAssignment {
+	return releaseOrphanedPoolAssignmentsWhenSnapshotsCompleteWithTopology(
+		store,
+		cfg,
+		cityPath,
+		openSessionInfos,
+		result,
+		rigStores,
+		true,
+	)
+}
+
+// releaseOrphanedPoolAssignmentsWhenSnapshotsCompleteWithStores is the typed
+// production boundary for orphan release. A strict agent's work assignment is
+// ownership state coupled to its session row, so it remains untouched unless
+// the session and canonical city work handles name the same physical store.
+// Inherit agents keep the historical release behavior across a class split.
+func releaseOrphanedPoolAssignmentsWhenSnapshotsCompleteWithStores(
+	sessStore beads.SessionStore,
+	canonicalWorkStore beads.WorkStore,
+	cfg *config.City,
+	cityPath string,
+	openSessionInfos []session.Info,
+	result DesiredStateResult,
+	rigStores map[string]beads.Store,
+) []releasedPoolAssignment {
+	return releaseOrphanedPoolAssignmentsWhenSnapshotsCompleteWithTopology(
+		canonicalWorkStore.Store,
+		cfg,
+		cityPath,
+		openSessionInfos,
+		result,
+		rigStores,
+		validateStrictSessionWorkStore(sessStore.Store, canonicalWorkStore) == nil,
+	)
+}
+
+func releaseOrphanedPoolAssignmentsWhenSnapshotsCompleteWithTopology(
+	store beads.Store,
+	cfg *config.City,
+	cityPath string,
+	openSessionInfos []session.Info,
+	result DesiredStateResult,
+	rigStores map[string]beads.Store,
+	strictTopologyOK bool,
+) []releasedPoolAssignment {
 	// Partial input snapshots can make active work look orphaned for this
 	// tick only: missing work affects drain decisions, and missing sessions
 	// affects assigned-work orphan release.
 	if result.snapshotQueryPartial() {
 		return nil
 	}
-	return releaseOrphanedPoolAssignments(store, cfg, cityPath, openSessionInfos, result.AssignedWorkBeads, result.AssignedWorkStores, result.AssignedWorkStoreRefs, rigStores)
+	return releaseOrphanedPoolAssignmentsWithTopology(store, cfg, cityPath, openSessionInfos, result.AssignedWorkBeads, result.AssignedWorkStores, result.AssignedWorkStoreRefs, rigStores, strictTopologyOK)
 }
 
 // releaseOrphanedPoolAssignments reopens active pool-routed work whose
@@ -124,6 +170,30 @@ func releaseOrphanedPoolAssignments(
 	assignedWorkStores []beads.Store,
 	assignedWorkStoreRefs []string,
 	rigStores map[string]beads.Store,
+) []releasedPoolAssignment {
+	return releaseOrphanedPoolAssignmentsWithTopology(
+		store,
+		cfg,
+		cityPath,
+		openSessionInfos,
+		assignedWorkBeads,
+		assignedWorkStores,
+		assignedWorkStoreRefs,
+		rigStores,
+		true,
+	)
+}
+
+func releaseOrphanedPoolAssignmentsWithTopology(
+	store beads.Store,
+	cfg *config.City,
+	cityPath string,
+	openSessionInfos []session.Info,
+	assignedWorkBeads []beads.Bead,
+	assignedWorkStores []beads.Store,
+	assignedWorkStoreRefs []string,
+	rigStores map[string]beads.Store,
+	strictTopologyOK bool,
 ) []releasedPoolAssignment {
 	if store == nil || cfg == nil || len(assignedWorkBeads) == 0 {
 		return nil
@@ -165,6 +235,10 @@ func releaseOrphanedPoolAssignments(
 		if agentCfg == nil || !agentCfg.SupportsGenericEphemeralSessions() {
 			continue
 		}
+		strictRelease := agentCfg.ForbidsProjectHooks()
+		if strictRelease && !strictTopologyOK {
+			continue
+		}
 		if assignee == "" {
 			if wb.Status != "in_progress" {
 				continue
@@ -198,6 +272,13 @@ func releaseOrphanedPoolAssignments(
 				continue
 			}
 		}
+		// Strict ownership is meaningful only on the physical store that also
+		// owns the session projection. strictTopologyOK proves session==canonical
+		// work; this per-candidate check rejects rig/other stores even when they
+		// happen to contain the same bead IDs.
+		if strictRelease && !beads.SameStoreIdentity(ownerStore, store) {
+			continue
+		}
 		if !liveWorkAssignmentStillReleasable(ownerStore, wb.ID, wb.Status, assignee) {
 			continue
 		}
@@ -205,12 +286,63 @@ func releaseOrphanedPoolAssignments(
 		if !allowsRelease {
 			continue
 		}
-		if !releaseOrphanedPoolAssignment(ownerStore, wb, clearDetached) {
+		if strictRelease {
+			if !releaseStrictOrphanedPoolAssignment(ownerStore, wb, clearDetached) {
+				continue
+			}
+		} else if !releaseOrphanedPoolAssignment(ownerStore, wb, clearDetached) {
 			continue
 		}
 		released = append(released, releasedPoolAssignment{ID: wb.ID, Index: i})
 	}
 	return released
+}
+
+// releaseStrictOrphanedPoolAssignment makes orphan proof and release one
+// physical-store operation. The advisory snapshot and live checks above can
+// cheaply reject known-live owners, but only this capability closes the race
+// where a canonical hold or a new matching session row lands immediately
+// before the release. Unsupported backends fail closed. Inherit-mode agents
+// intentionally retain the historical compatibility path below because their
+// ownership may span stores and legacy backends.
+func releaseStrictOrphanedPoolAssignment(store beads.Store, wb beads.Bead, clearDetached bool) bool {
+	if store == nil || wb.Status != "in_progress" || strings.TrimSpace(wb.ID) == "" || strings.TrimSpace(wb.Assignee) == "" {
+		return false
+	}
+	releaser, ok := beads.AssignmentReleaserFor(store)
+	if !ok {
+		log.Printf("releaseOrphanedPoolAssignments: strict release unsupported for %s on %T; leaving assignment unchanged", wb.ID, store)
+		return false
+	}
+	absence, err := session.AssignmentReleaseCoLocatedMatch(wb.Assignee)
+	if err != nil {
+		log.Printf("releaseOrphanedPoolAssignments: strict release predicate for %s: %v", wb.ID, err)
+		return false
+	}
+	releaseMetadata := clearedSessionAffinityMetadata()
+	if clearDetached {
+		releaseMetadata[detachedProbeMetadataKey] = ""
+	}
+	revision := wb.Revision
+	released, won, err := releaser.ReleaseAssignment(context.Background(), beads.AssignmentReleaseRequest{
+		ID:                   wb.ID,
+		ExpectedStatus:       "in_progress",
+		ExpectedAssignee:     strings.TrimSpace(wb.Assignee),
+		ExpectedRevision:     &revision,
+		ExpectedMetadata:     maps.Clone(wb.Metadata),
+		ForbiddenLabels:      beadmeta.DispatchHoldLabels,
+		ReleaseMetadata:      releaseMetadata,
+		AbsentCoLocatedMatch: absence,
+	})
+	if err != nil {
+		log.Printf("releaseOrphanedPoolAssignments: strict atomic release failed for %s: %v", wb.ID, err)
+		return false
+	}
+	if !won {
+		log.Printf("releaseOrphanedPoolAssignments: skipping strict release for %s: work, hold, or co-located ownership changed", wb.ID)
+		return false
+	}
+	return released.ID == wb.ID && released.Status == "open" && strings.TrimSpace(released.Assignee) == ""
 }
 
 func detachedProbeAllowsOrphanRelease(wb beads.Bead) (bool, bool) {

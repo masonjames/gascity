@@ -1447,6 +1447,32 @@ func TestUpdateAgent(t *testing.T) {
 	}
 }
 
+func TestEditorRejectsWorkspaceHookInheritanceForProjectHooksForbidBeforeWrite(t *testing.T) {
+	dir := t.TempDir()
+	original := withTestProviderCatalog(`[workspace]
+name = "test-city"
+install_agent_hooks = ["claude"]
+
+[[agent]]
+name = "worker"
+provider = "claude"
+project_hooks = "forbid"
+`)
+	path := writeTOML(t, dir, original)
+	ed := configedit.NewEditor(fsys.OSFS{}, path)
+
+	err := ed.Edit(func(cfg *config.City) error {
+		cfg.Workspace.Name = "must-not-be-written"
+		return nil
+	})
+	if !errors.Is(err, configedit.ErrValidation) {
+		t.Fatalf("Edit error = %v, want ErrValidation", err)
+	}
+	if got := string(mustReadFile(t, path)); got != original {
+		t.Fatalf("city.toml changed despite validation failure:\n%s", got)
+	}
+}
+
 func TestUpdateAgent_PreservesSuspended(t *testing.T) {
 	dir := t.TempDir()
 	city := `[workspace]

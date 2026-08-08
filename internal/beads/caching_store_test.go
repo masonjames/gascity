@@ -10,7 +10,20 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/beads/beadstest"
 )
+
+func TestCachingStoreAssignmentClaimConformance(t *testing.T) {
+	beadstest.RunGuardedAssignmentClaimConformance(t, "CachingStore", func(_ *testing.T) beads.Store {
+		return beads.NewCachingStoreForTest(beads.NewMemStore(), nil)
+	})
+}
+
+func TestCachingStoreAssignmentReleaseConformance(t *testing.T) {
+	beadstest.RunAssignmentReleaseConformance(t, "CachingStore", func(_ *testing.T) beads.Store {
+		return beads.NewCachingStoreForTest(beads.NewMemStore(), nil)
+	})
+}
 
 func TestCachingStoreReadThrough(t *testing.T) {
 	t.Parallel()

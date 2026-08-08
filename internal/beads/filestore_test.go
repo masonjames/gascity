@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -61,6 +62,19 @@ type oneShotStatErrorFS struct {
 	fired bool
 }
 
+type claimRenameFailFS struct {
+	fsys.FS
+	fail bool
+	err  error
+}
+
+func (f *claimRenameFailFS) Rename(oldpath, newpath string) error {
+	if f.fail {
+		return f.err
+	}
+	return f.FS.Rename(oldpath, newpath)
+}
+
 func (f *oneShotStatErrorFS) Stat(name string) (os.FileInfo, error) {
 	if name == f.path && !f.fired {
 		f.fired = true
@@ -113,6 +127,217 @@ func TestFileStoreConditionalWriterConformance(t *testing.T) {
 			},
 		},
 	)
+}
+
+func TestFileStoreAssignmentClaimConformance(t *testing.T) {
+	beadstest.RunGuardedAssignmentClaimConformance(t, "FileStore", func(st *testing.T) beads.Store {
+		path := filepath.Join(st.TempDir(), "beads.json")
+		store, err := beads.OpenFileStore(fsys.OSFS{}, path)
+		if err != nil {
+			st.Fatal(err)
+		}
+		return store
+	})
+}
+
+func TestFileStoreAssignmentReleaseConformance(t *testing.T) {
+	beadstest.RunAssignmentReleaseConformance(t, "FileStore", func(st *testing.T) beads.Store {
+		path := filepath.Join(st.TempDir(), "beads.json")
+		store, err := beads.OpenFileStore(fsys.OSFS{}, path)
+		if err != nil {
+			st.Fatal(err)
+		}
+		return store
+	})
+}
+
+func TestFileStoreAssignmentClaimPersistsAtomicWitness(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "beads.json")
+	store, err := beads.OpenFileStore(fsys.OSFS{}, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := store.Create(beads.Bead{
+		Title:    "persistent claim",
+		Metadata: map[string]string{"gc.routed_to": "rig/pool"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimer, ok := beads.GuardedAssignmentClaimerFor(store)
+	if !ok {
+		t.Fatal("FileStore does not expose GuardedAssignmentClaimer")
+	}
+	claimed, ok, err := claimer.ClaimAssignment(t.Context(), beads.AssignmentClaimRequest{
+		ID:               created.ID,
+		Actor:            "worker-1",
+		ExpectedStatus:   "open",
+		ExpectedMetadata: map[string]string{"gc.routed_to": "rig/pool"},
+		ForbiddenLabels:  []string{"hold:external"},
+		AssignmentMetadata: map[string]string{
+			"gc.session_id":             "session-1",
+			"gc.session_instance_token": "instance-1",
+		},
+	})
+	if err != nil || !ok {
+		t.Fatalf("ClaimAssignment = (%+v, %v, %v), want success", claimed, ok, err)
+	}
+
+	reopened, err := beads.OpenFileStore(fsys.OSFS{}, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := reopened.Get(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed.CreatedAt = claimed.CreatedAt.Round(0)
+	claimed.UpdatedAt = claimed.UpdatedAt.Round(0)
+	persisted.CreatedAt = persisted.CreatedAt.Round(0)
+	persisted.UpdatedAt = persisted.UpdatedAt.Round(0)
+	if !reflect.DeepEqual(persisted, claimed) {
+		t.Fatalf("persisted claim differs from authoritative result:\nclaimed=%+v\npersisted=%+v", claimed, persisted)
+	}
+}
+
+func TestFileStoreAssignmentClaimRollsBackOnPersistFailure(t *testing.T) {
+	base := fsys.NewFake()
+	filesystem := &claimRenameFailFS{FS: base, err: errors.New("rename failed")}
+	path := "/city/beads.json"
+	store, err := beads.OpenFileStore(filesystem, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := store.Create(beads.Bead{
+		Title:    "claim rollback",
+		Metadata: map[string]string{"gc.routed_to": "rig/pool"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.Get(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	filesystem.fail = true
+	claimer, ok := beads.GuardedAssignmentClaimerFor(store)
+	if !ok {
+		t.Fatal("FileStore does not expose GuardedAssignmentClaimer")
+	}
+	_, claimed, err := claimer.ClaimAssignment(t.Context(), beads.AssignmentClaimRequest{
+		ID:                 created.ID,
+		Actor:              "worker-1",
+		ExpectedStatus:     "open",
+		ExpectedMetadata:   map[string]string{"gc.routed_to": "rig/pool"},
+		ForbiddenLabels:    []string{"hold:external"},
+		AssignmentMetadata: map[string]string{"gc.session_id": "session-1"},
+	})
+	if err == nil || claimed {
+		t.Fatalf("ClaimAssignment on failed persist = (ok %v, err %v), want false,error", claimed, err)
+	}
+	if !errors.Is(err, filesystem.err) {
+		t.Fatalf("ClaimAssignment error = %v, want injected rename failure", err)
+	}
+	after, err := store.Get(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before.CreatedAt = before.CreatedAt.Round(0)
+	before.UpdatedAt = before.UpdatedAt.Round(0)
+	after.CreatedAt = after.CreatedAt.Round(0)
+	after.UpdatedAt = after.UpdatedAt.Round(0)
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("failed persist left in-memory mutation:\nbefore=%+v\nafter=%+v", before, after)
+	}
+
+	filesystem.fail = false
+	reopened, err := beads.OpenFileStore(base, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := reopened.Get(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted.CreatedAt = persisted.CreatedAt.Round(0)
+	persisted.UpdatedAt = persisted.UpdatedAt.Round(0)
+	if !reflect.DeepEqual(persisted, before) {
+		t.Fatalf("failed persist changed disk:\nbefore=%+v\npersisted=%+v", before, persisted)
+	}
+}
+
+func TestFileStoreAssignmentReleaseRollsBackOnPersistFailure(t *testing.T) {
+	base := fsys.NewFake()
+	filesystem := &claimRenameFailFS{FS: base, err: errors.New("rename failed")}
+	path := "/city/beads.json"
+	store, err := beads.OpenFileStore(filesystem, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := store.Create(beads.Bead{
+		Title:    "release rollback",
+		Assignee: "worker-1",
+		Metadata: map[string]string{"route": "pool", "owner": "session-old"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := "in_progress"
+	if err := store.Update(created.ID, beads.UpdateOpts{Status: &status}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.Get(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision := before.Revision
+	filesystem.fail = true
+	releaser, ok := beads.AssignmentReleaserFor(store)
+	if !ok {
+		t.Fatal("FileStore does not expose AssignmentReleaser")
+	}
+	_, released, err := releaser.ReleaseAssignment(t.Context(), beads.AssignmentReleaseRequest{
+		ID:                   before.ID,
+		ExpectedStatus:       "in_progress",
+		ExpectedAssignee:     "worker-1",
+		ExpectedRevision:     &revision,
+		ExpectedMetadata:     map[string]string{"route": "pool", "owner": "session-old"},
+		ForbiddenLabels:      []string{"hold:external"},
+		ReleaseMetadata:      map[string]string{"owner": ""},
+		AbsentCoLocatedMatch: &beads.CoLocatedMatchPredicate{ExpectedStatus: "open", ClassAnyOf: []beads.CoLocatedClassPredicate{{ExpectedType: "coordination-row"}}, MatchValue: "worker-1", MatchID: true},
+	})
+	if err == nil || released {
+		t.Fatalf("ReleaseAssignment on failed persist = (ok %v, err %v), want false,error", released, err)
+	}
+	if !errors.Is(err, filesystem.err) {
+		t.Fatalf("ReleaseAssignment error = %v, want injected rename failure", err)
+	}
+	after, err := store.Get(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before.CreatedAt = before.CreatedAt.Round(0)
+	before.UpdatedAt = before.UpdatedAt.Round(0)
+	after.CreatedAt = after.CreatedAt.Round(0)
+	after.UpdatedAt = after.UpdatedAt.Round(0)
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("failed persist left in-memory release:\nbefore=%+v\nafter=%+v", before, after)
+	}
+
+	filesystem.fail = false
+	reopened, err := beads.OpenFileStore(base, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := reopened.Get(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted.CreatedAt = persisted.CreatedAt.Round(0)
+	persisted.UpdatedAt = persisted.UpdatedAt.Round(0)
+	if !reflect.DeepEqual(persisted, before) {
+		t.Fatalf("failed persist changed disk:\nbefore=%+v\npersisted=%+v", before, persisted)
+	}
 }
 
 // TestFileStoreRevisionSurvivesReopen proves the ConditionalWriter revision

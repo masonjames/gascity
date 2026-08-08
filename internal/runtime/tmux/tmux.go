@@ -565,20 +565,79 @@ func withEnvUnsetPrefix(command string, unsetKeys []string) string {
 // SURVIVE into later processes, rather than only applying to the command tmux
 // execs first.
 //
-// That is the controller-scope credentials and nothing else. The other keys a
-// session env pins empty — CLAUDECODE, CLAUDE_CODE_ENTRYPOINT, the CODEX_ pair —
-// are nesting-detection flags, not secrets: the `env -u` prefix already gives
+// That is controller-scope credentials plus the project-hook isolation keys
+// that can influence a future parsing shell, dynamic loader, or Codex runtime.
+// Other keys a session env pins empty — CLAUDECODE, CLAUDE_CODE_ENTRYPOINT, the
+// CODEX_ pair — are nesting-detection flags: the `env -u` prefix already gives
 // them the behavior they need on the launched command, and marking them in the
 // session environment would buy nothing while putting an extra tmux round-trip
 // on every session creation in the repo.
 func durableWithholdKeys(env map[string]string) []string {
 	var keys []string
 	for _, k := range sessionEnvUnsetKeys(env) {
-		if processenv.IsControllerOnlyEnv(k) {
+		if processenv.IsControllerOnlyEnv(k) || runtime.IsProjectHookIsolationWithheldEnv(k) {
 			keys = append(keys, k)
 		}
 	}
 	return keys
+}
+
+func isFinalizedProjectHookIsolationEnv(env map[string]string) bool {
+	for _, key := range []string{"HOME", "CODEX_HOME", "PATH", "GC_BIN"} {
+		if strings.TrimSpace(env[key]) == "" {
+			return false
+		}
+	}
+	for _, key := range runtime.ProjectHookIsolationWithheldEnvKeys() {
+		value, ok := env[key]
+		if !ok || value != "" {
+			return false
+		}
+	}
+	return true
+}
+
+// reconcileSessionEnvironment makes a warm session's complete environment
+// overlay equal the finalized launch environment and reads every entry back
+// before respawn. Empty values use tmux's removal marker so the server-global
+// value cannot bleed through; non-empty values are installed exactly. Errors
+// name only the key so a configured secret value is never copied into logs.
+func (t *Tmux) reconcileSessionEnvironment(session string, env map[string]string) error {
+	if err := runtime.ValidateEnvironmentKeys(env); err != nil {
+		return fmt.Errorf("reconciling session %q environment: %w", session, err)
+	}
+	keys := make([]string, 0, len(env))
+	for key := range env {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	for _, key := range keys {
+		var err error
+		if env[key] == "" {
+			_, err = t.run("set-environment", "-t", session, "-r", key)
+		} else {
+			_, err = t.run("set-environment", "-t", session, key, env[key])
+		}
+		if err != nil {
+			return fmt.Errorf("reconciling session %q environment key %s: %w", session, key, err)
+		}
+	}
+
+	for _, key := range keys {
+		got, err := t.run("show-environment", "-t", session, key)
+		if err != nil {
+			return fmt.Errorf("attesting session %q environment key %s: %w", session, key, err)
+		}
+		want := key + "=" + env[key]
+		if env[key] == "" {
+			want = "-" + key
+		}
+		if got != want {
+			return fmt.Errorf("attesting session %q environment key %s: readback mismatch", session, key)
+		}
+	}
+	return nil
 }
 
 // markSessionEnvRemoved marks keys for REMOVAL in the session environment
@@ -624,14 +683,18 @@ func (t *Tmux) markSessionEnvRemoved(session string, keys []string) error {
 // but -e provides defense-in-depth for the initial shell environment.
 // Requires tmux >= 3.2.
 //
-// Empty-valued keys are WITHHELD by the `env -u` command prefix, which covers
-// the command new-session execs. Controller-scope credentials additionally get
-// the durable session-environment marker, which covers every process started in
-// the session afterwards — above all respawn-pane. Both are required for those
-// keys and each was falsified against a real tmux 3.4: new-session starts the
-// command before any follow-up can land, so the marker alone leaves the CREATED
-// pane exposed; the prefix alone leaves the RESPAWNED pane exposed.
+// Empty-valued keys are atomically set empty with `-e KEY=` before tmux starts
+// its parsing shell, then WITHHELD from the launched child by the `env -u`
+// command prefix. Controller-scope credentials and project-hook isolation keys
+// additionally get the durable session-environment marker, which covers every
+// later process — above all respawn-pane. All three layers are required: the
+// shell exists before either the command prefix or a post-create marker can
+// neutralize a server-global BASH_ENV/ENV injection value, while the prefix
+// alone does not survive respawn.
 func (t *Tmux) NewSessionWithCommandAndEnv(name, workDir, command string, env map[string]string) error {
+	if err := runtime.ValidateEnvironmentKeys(env); err != nil {
+		return fmt.Errorf("creating session %q environment: %w", name, err)
+	}
 	if err := validateSessionName(name); err != nil {
 		return err
 	}
@@ -651,9 +714,7 @@ func (t *Tmux) NewSessionWithCommandAndEnv(name, workDir, command string, env ma
 	sort.Strings(keys)
 	unsetKeys := sessionEnvUnsetKeys(env)
 	for _, k := range keys {
-		if env[k] != "" {
-			args = append(args, "-e", fmt.Sprintf("%s=%s", k, env[k]))
-		}
+		args = append(args, "-e", fmt.Sprintf("%s=%s", k, env[k]))
 	}
 	// For vars that need unsetting, prefix the command with env -u flags. The
 	// pane's shell would otherwise inherit them from the tmux server's global
@@ -666,11 +727,10 @@ func (t *Tmux) NewSessionWithCommandAndEnv(name, workDir, command string, env ma
 	if err != nil {
 		return err
 	}
-	// Carry the CREDENTIAL withholding into the session environment, so it
-	// survives into every later process — above all respawn-pane, which the
-	// warm-box relaunch path uses and which takes no env argument at all. Fail
-	// closed: a session that silently kept a withheld credential is the defect
-	// this prevents.
+	// Carry durable withholding into the session environment, so it survives
+	// into every later process — above all respawn-pane, which the warm-box
+	// relaunch path uses and which takes no env argument at all. Fail closed: a
+	// session that silently kept a withheld value is the defect this prevents.
 	if err := t.markSessionEnvRemoved(name, durableWithholdKeys(env)); err != nil {
 		return err
 	}

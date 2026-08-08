@@ -120,7 +120,7 @@ func doConfigShow(validate, showProvenance, asJSON bool, stdout, stderr io.Write
 
 	// Run validation.
 	var validationErrors []string
-	if err := config.ValidateAgents(cfg.Agents); err != nil {
+	if err := config.ValidateCityAgents(cfg); err != nil {
 		validationErrors = append(validationErrors, err.Error())
 	}
 	if err := config.ValidateRigs(cfg.Rigs, config.EffectiveHQPrefix(cfg)); err != nil {

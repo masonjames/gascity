@@ -24,6 +24,17 @@ type failUpdateStore struct {
 
 func (s failUpdateStore) Update(string, beads.UpdateOpts) error { return s.err }
 
+func (s failUpdateStore) GuardedAssignmentClaimerHandle() (beads.GuardedAssignmentClaimer, bool) {
+	return beads.GuardedAssignmentClaimerFor(s.Store)
+}
+
+// TestRealizePoolDesiredSessionsTriggerBindFailurePreventsLaunch is the
+// incident-A ordering boundary: the exact guarded assignment may commit, but
+// a failed session-trigger bind must publish no desired launch.
+func TestRealizePoolDesiredSessionsTriggerBindFailurePreventsLaunch(t *testing.T) {
+	runRealizePoolDesiredSessionsTriggerBindFailurePreventsLaunch(t)
+}
+
 // triggerClusterSessionBead builds a pool session bead carrying a full
 // trigger/provenance cluster, so a clear reconciles every cluster key at once.
 func triggerClusterSessionBead() beads.Bead {

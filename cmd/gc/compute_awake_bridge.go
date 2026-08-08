@@ -4,6 +4,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/agentutil"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
@@ -114,6 +115,9 @@ func buildAwakeInputFromReconciler(
 		if info.Closed {
 			continue
 		}
+		if !projectHookControllerSessionLaunchAuthorized(cfg, cityPath, info) {
+			continue
+		}
 		name := strings.TrimSpace(info.SessionNameMetadata)
 		if name == "" {
 			continue
@@ -203,6 +207,29 @@ func buildAwakeInputFromReconciler(
 	}
 
 	return input
+}
+
+// projectHookControllerSessionLaunchAuthorized fails closed at the reconciler's
+// last pure-input boundary for configured sessions that can otherwise wake from
+// lifecycle state alone. Any session whose backing agent forbids project hooks
+// may enter the awake set only when its durable trigger pair identifies exact
+// work in the same city store. Inherit-policy sessions preserve their existing
+// lifecycle behavior.
+func projectHookControllerSessionLaunchAuthorized(cfg *config.City, cityPath string, info session.Info) bool {
+	if cfg == nil {
+		return true
+	}
+	resolution, err := agentutil.ResolvePersistedSessionAgent(cfg, info)
+	if err != nil {
+		return false
+	}
+	if !resolution.Resolved || !resolution.Strict {
+		return true
+	}
+	return validateProjectHookSessionTrigger(
+		info,
+		canonicalCityDemandStoreRef(cfg, cityPath),
+	) == nil
 }
 
 func shouldProbeAttachmentForAwakeInput(info session.Info, alive bool, cfg *config.City, poolDesired map[string]int) bool {

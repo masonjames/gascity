@@ -75,3 +75,21 @@ func transportSupportsTmux(sp runtime.Provider) bool {
 	}
 	return true
 }
+
+func validateProjectHookIsolationProvider(agentCfg config.Agent, transport string, sp runtime.Provider) error {
+	if !agentCfg.ForbidsProjectHooks() {
+		return nil
+	}
+	provider, ok := sp.(runtime.ProjectHookIsolationCapabilityProvider)
+	if ok && provider.SupportsProjectHookIsolation(strings.TrimSpace(transport)) {
+		return nil
+	}
+	transport = strings.TrimSpace(transport)
+	if transport == "" {
+		transport = "default"
+	}
+	return fmt.Errorf(
+		"agent %q: active session provider cannot attest project hook isolation for %q transport",
+		agentCfg.QualifiedName(), transport,
+	)
+}

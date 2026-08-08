@@ -219,7 +219,7 @@ func (m *Manager) retryFreshStartAfterStaleKey(
 		}
 		return false, fmt.Errorf("pre-start orphan cleanup: %w", orphanErr)
 	}
-	if err := m.sp.Start(ctx, sessName, cfg); err != nil {
+	if err := m.startProvider(ctx, sessName, cfg); err != nil {
 		if unroute != nil {
 			unroute()
 		}
@@ -309,6 +309,12 @@ func sessionName(id string, b beads.Bead) string {
 }
 
 func (m *Manager) loadSessionBead(id string, allowClosed bool) (beads.Bead, string, error) {
+	return m.loadSessionBeadWithWitness(id, allowClosed, LiveBoundaryWitness{})
+}
+
+// loadSessionBeadWithWitness validates strict launch authority before the
+// read path can heal an empty type or mutate ACP routing.
+func (m *Manager) loadSessionBeadWithWitness(id string, allowClosed bool, witness LiveBoundaryWitness) (beads.Bead, string, error) {
 	b, err := m.store.Get(id)
 	if err != nil {
 		return beads.Bead{}, "", fmt.Errorf("getting session: %w", err)
@@ -316,10 +322,13 @@ func (m *Manager) loadSessionBead(id string, allowClosed bool) (beads.Bead, stri
 	if !IsSessionBeadOrRepairable(b) {
 		return beads.Bead{}, "", fmt.Errorf("%w: bead %s (type=%q)", ErrNotSession, id, b.Type)
 	}
-	RepairEmptyType(m.store, &b)
 	if !allowClosed && b.Status == "closed" {
 		return beads.Bead{}, "", fmt.Errorf("%w: %s", ErrSessionClosed, id)
 	}
+	if err := validateLiveBoundaryWitness(b, witness); err != nil {
+		return beads.Bead{}, "", err
+	}
+	RepairEmptyType(m.store, &b)
 	sessName := sessionName(id, b)
 	if b.Status != "closed" {
 		transport, _ := m.transportForBead(b, sessName)
@@ -330,6 +339,10 @@ func (m *Manager) loadSessionBead(id string, allowClosed bool) (beads.Bead, stri
 
 func (m *Manager) sessionBead(id string) (beads.Bead, string, error) {
 	return m.loadSessionBead(id, false)
+}
+
+func (m *Manager) sessionBeadWithWitness(id string, witness LiveBoundaryWitness) (beads.Bead, string, error) {
+	return m.loadSessionBeadWithWitness(id, false, witness)
 }
 
 func (m *Manager) ensureRunning(ctx context.Context, id string, b beads.Bead, sessName, resumeCommand string, hints runtime.Config) error {
@@ -394,7 +407,7 @@ func (m *Manager) ensureRunning(ctx context.Context, id string, b beads.Bead, se
 		}
 		return fmt.Errorf("pre-start orphan cleanup: %w", orphanErr)
 	}
-	if err := m.sp.Start(ctx, sessName, cfg); err != nil {
+	if err := m.startProvider(ctx, sessName, cfg); err != nil {
 		if errors.Is(err, runtime.ErrSessionDiedDuringStartup) && b.Metadata["session_key"] != "" {
 			retried, err := m.retryFreshStartAfterStaleKey(ctx, id, &b, sessName, resumeCommand, cfg, unroute)
 			if err != nil {
@@ -510,7 +523,7 @@ func (m *Manager) ensureRunningRuntimeOnly(ctx context.Context, id string, b bea
 		}
 		return fmt.Errorf("pre-start orphan cleanup: %w", orphanErr)
 	}
-	if err := m.sp.Start(ctx, sessName, cfg); err != nil {
+	if err := m.startProvider(ctx, sessName, cfg); err != nil {
 		switch {
 		case errors.Is(err, runtime.ErrSessionDiedDuringStartup) && b.Metadata["session_key"] != "":
 			retried, err := m.retryFreshStartAfterStaleKey(ctx, id, &b, sessName, resumeCommand, cfg, unroute)
@@ -747,9 +760,9 @@ func (m *Manager) sendLocked(ctx context.Context, id string, b beads.Bead, sessN
 	return nil
 }
 
-func (m *Manager) send(ctx context.Context, id, message, resumeCommand string, hints runtime.Config, immediate bool) error {
+func (m *Manager) send(ctx context.Context, id, message, resumeCommand string, hints runtime.Config, immediate bool, witness LiveBoundaryWitness) error {
 	return withSessionMutationLock(id, func() error {
-		b, sessName, err := m.sessionBead(id)
+		b, sessName, err := m.sessionBeadWithWitness(id, witness)
 		if err != nil {
 			return err
 		}
@@ -757,10 +770,10 @@ func (m *Manager) send(ctx context.Context, id, message, resumeCommand string, h
 	})
 }
 
-func (m *Manager) sendLiveOnly(ctx context.Context, id, message string, immediate bool) (bool, error) {
+func (m *Manager) sendLiveOnly(ctx context.Context, id, message string, immediate bool, witness LiveBoundaryWitness) (bool, error) {
 	var delivered bool
 	err := withSessionMutationLock(id, func() error {
-		_, sessName, err := m.sessionBead(id)
+		_, sessName, err := m.sessionBeadWithWitness(id, witness)
 		if err != nil {
 			return err
 		}
@@ -781,8 +794,13 @@ func (m *Manager) sendLiveOnly(ctx context.Context, id, message string, immediat
 // It is the canonical manager-level bring-up path for worker handles and
 // other callers that need bounded startup without attaching a terminal.
 func (m *Manager) Start(ctx context.Context, id, resumeCommand string, hints runtime.Config) error {
+	return m.StartWithWitness(ctx, id, resumeCommand, hints, LiveBoundaryWitness{})
+}
+
+// StartWithWitness starts only while the authorized trigger remains current.
+func (m *Manager) StartWithWitness(ctx context.Context, id, resumeCommand string, hints runtime.Config, witness LiveBoundaryWitness) error {
 	return withSessionMutationLock(id, func() error {
-		b, sessName, err := m.sessionBead(id)
+		b, sessName, err := m.sessionBeadWithWitness(id, witness)
 		if err != nil {
 			return err
 		}
@@ -795,8 +813,14 @@ func (m *Manager) Start(ctx context.Context, id, resumeCommand string, hints run
 // bridge while they still own commit/rollback bookkeeping above the worker
 // boundary.
 func (m *Manager) StartRuntimeOnly(ctx context.Context, id, resumeCommand string, hints runtime.Config) error {
+	return m.StartRuntimeOnlyWithWitness(ctx, id, resumeCommand, hints, LiveBoundaryWitness{})
+}
+
+// StartRuntimeOnlyWithWitness starts runtime-only only while the authorized
+// trigger remains current.
+func (m *Manager) StartRuntimeOnlyWithWitness(ctx context.Context, id, resumeCommand string, hints runtime.Config, witness LiveBoundaryWitness) error {
 	return withSessionMutationLock(id, func() error {
-		b, sessName, err := m.sessionBead(id)
+		b, sessName, err := m.sessionBeadWithWitness(id, witness)
 		if err != nil {
 			return err
 		}
@@ -807,7 +831,12 @@ func (m *Manager) StartRuntimeOnly(ctx context.Context, id, resumeCommand string
 // Send resumes a suspended session if needed, then nudges the runtime with a
 // new user message.
 func (m *Manager) Send(ctx context.Context, id, message, resumeCommand string, hints runtime.Config) error {
-	return m.send(ctx, id, message, resumeCommand, hints, false)
+	return m.SendWithWitness(ctx, id, message, resumeCommand, hints, LiveBoundaryWitness{})
+}
+
+// SendWithWitness sends only while the authorized trigger remains current.
+func (m *Manager) SendWithWitness(ctx context.Context, id, message, resumeCommand string, hints runtime.Config, witness LiveBoundaryWitness) error {
+	return m.send(ctx, id, message, resumeCommand, hints, false, witness)
 }
 
 // SendImmediate resumes a suspended session if needed, then injects the new
@@ -815,19 +844,35 @@ func (m *Manager) Send(ctx context.Context, id, message, resumeCommand string, h
 // immediate nudges. Falls back to Send semantics on runtimes without the
 // optional immediate nudge capability.
 func (m *Manager) SendImmediate(ctx context.Context, id, message, resumeCommand string, hints runtime.Config) error {
-	return m.send(ctx, id, message, resumeCommand, hints, true)
+	return m.SendImmediateWithWitness(ctx, id, message, resumeCommand, hints, LiveBoundaryWitness{})
+}
+
+// SendImmediateWithWitness sends immediately only while the authorized trigger remains current.
+func (m *Manager) SendImmediateWithWitness(ctx context.Context, id, message, resumeCommand string, hints runtime.Config, witness LiveBoundaryWitness) error {
+	return m.send(ctx, id, message, resumeCommand, hints, true, witness)
 }
 
 // SendLiveOnly nudges the runtime only when the current session is already
 // running. It never resumes or restarts the session.
 func (m *Manager) SendLiveOnly(ctx context.Context, id, message string) (bool, error) {
-	return m.sendLiveOnly(ctx, id, message, false)
+	return m.SendLiveOnlyWithWitness(ctx, id, message, LiveBoundaryWitness{})
+}
+
+// SendLiveOnlyWithWitness sends to a live runtime only while the authorized trigger remains current.
+func (m *Manager) SendLiveOnlyWithWitness(ctx context.Context, id, message string, witness LiveBoundaryWitness) (bool, error) {
+	return m.sendLiveOnly(ctx, id, message, false, witness)
 }
 
 // SendImmediateLiveOnly is like SendLiveOnly but uses the immediate nudge path
 // when the runtime supports it. It never resumes or restarts the session.
 func (m *Manager) SendImmediateLiveOnly(ctx context.Context, id, message string) (bool, error) {
-	return m.sendLiveOnly(ctx, id, message, true)
+	return m.SendImmediateLiveOnlyWithWitness(ctx, id, message, LiveBoundaryWitness{})
+}
+
+// SendImmediateLiveOnlyWithWitness sends immediately to a live runtime only
+// while the authorized trigger remains current.
+func (m *Manager) SendImmediateLiveOnlyWithWitness(ctx context.Context, id, message string, witness LiveBoundaryWitness) (bool, error) {
+	return m.sendLiveOnly(ctx, id, message, true, witness)
 }
 
 // TryWaitIdleNudge delivers a best-effort session nudge at a provider-defined
@@ -836,9 +881,14 @@ func (m *Manager) SendImmediateLiveOnly(ctx context.Context, id, message string)
 // so higher layers can fall back to queue semantics without treating that as
 // an operational error.
 func (m *Manager) TryWaitIdleNudge(ctx context.Context, id, source, message, resumeCommand string, hints runtime.Config) (bool, error) {
+	return m.TryWaitIdleNudgeWithWitness(ctx, id, source, message, resumeCommand, hints, LiveBoundaryWitness{})
+}
+
+// TryWaitIdleNudgeWithWitness nudges only while the authorized trigger remains current.
+func (m *Manager) TryWaitIdleNudgeWithWitness(ctx context.Context, id, source, message, resumeCommand string, hints runtime.Config, witness LiveBoundaryWitness) (bool, error) {
 	var delivered bool
 	err := withSessionMutationLock(id, func() error {
-		b, sessName, err := m.sessionBead(id)
+		b, sessName, err := m.sessionBeadWithWitness(id, witness)
 		if err != nil {
 			return err
 		}
@@ -852,9 +902,15 @@ func (m *Manager) TryWaitIdleNudge(ctx context.Context, id, source, message, res
 // only when the runtime is already live. It never resumes or restarts the
 // session.
 func (m *Manager) TryWaitIdleNudgeLiveOnly(ctx context.Context, id, source, message string) (bool, error) {
+	return m.TryWaitIdleNudgeLiveOnlyWithWitness(ctx, id, source, message, LiveBoundaryWitness{})
+}
+
+// TryWaitIdleNudgeLiveOnlyWithWitness nudges a live runtime only while the
+// authorized trigger remains current.
+func (m *Manager) TryWaitIdleNudgeLiveOnlyWithWitness(ctx context.Context, id, source, message string, witness LiveBoundaryWitness) (bool, error) {
 	var delivered bool
 	err := withSessionMutationLock(id, func() error {
-		b, sessName, err := m.sessionBead(id)
+		b, sessName, err := m.sessionBeadWithWitness(id, witness)
 		if err != nil {
 			return err
 		}
@@ -925,8 +981,14 @@ func (m *Manager) PendingByName(sessName string) (*runtime.PendingInteraction, b
 
 // Respond resolves the current pending interaction for a session.
 func (m *Manager) Respond(id string, response runtime.InteractionResponse) error {
+	return m.RespondWithWitness(id, response, LiveBoundaryWitness{})
+}
+
+// RespondWithWitness resolves the current pending interaction only while the
+// authorized trigger remains current.
+func (m *Manager) RespondWithWitness(id string, response runtime.InteractionResponse, witness LiveBoundaryWitness) error {
 	return withSessionMutationLock(id, func() error {
-		_, sessName, err := m.sessionBead(id)
+		_, sessName, err := m.sessionBeadWithWitness(id, witness)
 		if err != nil {
 			return err
 		}

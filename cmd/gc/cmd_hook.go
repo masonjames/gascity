@@ -294,11 +294,15 @@ func cmdHookWithOptions(args []string, opts hookCommandOptions, stdout, stderr i
 	// would keep retrying the plain failure instead of seeing the terminal
 	// stale-session drain result and exiting. The fence reads the runtime's own
 	// identity from the environment; it is a no-op for a non-session runtime (no
-	// GC_SESSION_ID / GC_INSTANCE_TOKEN) and fails open for an eligible session or a
-	// transient session-store fault, so a healthy worker still falls through to the
-	// suspension and config checks below.
+	// GC_SESSION_ID). A tokenless session without a persisted trigger keeps the
+	// legacy generic path; any session-store fault fails closed because neither the
+	// current incarnation nor its controller-persisted trigger can be proven.
+	var triggerExpectation hookClaimTriggerExpectation
 	if opts.Claim {
-		if code, handled := fenceHookClaimSession(cityPath, cfg, strings.TrimSpace(os.Getenv("GC_SESSION_ID")), opts, stdout, stderr); handled {
+		var handled bool
+		var code int
+		code, handled, triggerExpectation = fenceHookClaimSession(cityPath, cfg, strings.TrimSpace(os.Getenv("GC_SESSION_ID")), opts, stdout, stderr)
+		if handled {
 			return code
 		}
 	}
@@ -467,6 +471,23 @@ func cmdHookWithOptions(args []string, opts hookCommandOptions, stdout, stderr i
 			DrainAck:     opts.DrainAck,
 			JSON:         opts.JSON,
 		}
+		if triggerExpectation != (hookClaimTriggerExpectation{}) {
+			target, err := selectHookClaimTriggerStore(stores, cityPath, cityName, cfg, triggerExpectation)
+			if err != nil {
+				fmt.Fprintf(stderr, "gc hook --claim: refusing trigger %s in %s: %v\n", triggerExpectation.BeadID, triggerExpectation.StoreRef, err) //nolint:errcheck
+				return 1
+			}
+			return claimHookExpectedTrigger(
+				triggerExpectation,
+				target,
+				claimOpts,
+				hookClaimExpectedTriggerOps{
+					ResolveStore: makeStoreRefResolver(cityPath, cfg),
+				},
+				stdout,
+				stderr,
+			)
+		}
 		return claimHookWork(workQuery, workDir, queryEnv, stores, claimOpts, emitQueryFailure, stdout, stderr)
 	}
 	return doHook(workQuery, workDir, false, runner, stdout, stderr)
@@ -488,60 +509,216 @@ const (
 	hookClaimSessionStale
 	// hookClaimSessionStoreUnavailable: the session store could not be opened, or
 	// its read failed for a reason other than a confirmed-missing or non-session
-	// bead. That is a transient infrastructure fault, not a definitive
-	// ineligibility, so the caller fails open into the normal claim path (whose
-	// runner surfaces and escalates its own store errors) rather than mislabeling
-	// the fault as a stale session. A bead that is confirmed absent or resolves to
-	// a non-session bead is NOT this verdict — it is a definitive identity failure
-	// and classified stale.
+	// bead. That is a transient infrastructure fault, not a definitive stale
+	// verdict, but it still fails closed: the runtime cannot prove its current
+	// incarnation or persisted trigger while the store is unavailable. A bead
+	// that is confirmed absent or resolves to a non-session bead is NOT this
+	// verdict — it is a definitive identity failure and classified stale.
 	hookClaimSessionStoreUnavailable
 )
 
 // fenceHookClaimSession applies the runtime-identity fence that gates
-// gc hook --claim before it runs the work query. It returns (code, handled):
-// handled is true only for a definitively stale session, whose terminal drain
-// result the caller must return as-is. An un-fenceable context (no session id or
-// no instance token), an eligible session, or a transient session-store fault all
-// return handled=false so the normal claim path runs — the fence never turns an
-// infrastructure hiccup or an in-progress start into a false refusal.
-func fenceHookClaimSession(cityPath string, cfg *config.City, sessionID string, opts hookCommandOptions, stdout, stderr io.Writer) (int, bool) {
-	instanceToken := strings.TrimSpace(os.Getenv("GC_INSTANCE_TOKEN"))
-	if sessionID == "" || instanceToken == "" {
-		return 0, false
+// gc hook --claim before it runs the work query. It returns (code, handled,
+// expectation): handled is true for a terminal stale drain or a fail-closed
+// operational/trigger refusal; an eligible session returns its exact persisted
+// trigger expectation. Only a genuine legacy context (no session id, or a
+// tokenless session with no persisted trigger) proceeds without an expectation.
+func fenceHookClaimSession(cityPath string, cfg *config.City, sessionID string, opts hookCommandOptions, stdout, stderr io.Writer) (int, bool, hookClaimTriggerExpectation) {
+	envBeadID := os.Getenv("GC_TRIGGER_BEAD_ID")
+	envStoreRef := os.Getenv("GC_TRIGGER_BEAD_STORE_REF")
+	if sessionID == "" {
+		if envBeadID != "" || envStoreRef != "" {
+			fmt.Fprintln(stderr, "gc hook --claim: refusing trigger fence without a session id") //nolint:errcheck
+			return 1, true, hookClaimTriggerExpectation{}
+		}
+		return 0, false, hookClaimTriggerExpectation{}
 	}
-	switch verdict, reason := classifyHookClaimSession(cityPath, cfg, sessionID, instanceToken); verdict {
+	instanceToken := strings.TrimSpace(os.Getenv("GC_INSTANCE_TOKEN"))
+
+	info, verdict, reason := loadHookClaimSessionInfo(cityPath, cfg, sessionID)
+	if verdict == hookClaimSessionStoreUnavailable {
+		// Fail closed. Without an authoritative session read the runtime cannot
+		// prove either its incarnation or the trigger the controller persisted.
+		// Do not emit/ack a drain: this is an operational retry, not confirmed
+		// stale state, and even drain acknowledgement is a mutation.
+		fmt.Fprintf(stderr, "gc hook --claim: session fence unavailable for %s: %s; refusing claim\n", sessionID, reason) //nolint:errcheck
+		return 1, true, hookClaimTriggerExpectation{}
+	}
+	if verdict == hookClaimSessionStale {
+		if envBeadID != "" || envStoreRef != "" {
+			// A triggered runtime whose session identity cannot be loaded has no
+			// authority for either a work mutation or a drain acknowledgement.
+			fmt.Fprintf(stderr, "gc hook --claim: refusing trigger fence for unavailable session %s: %s\n", sessionID, reason) //nolint:errcheck
+			return 1, true, hookClaimTriggerExpectation{}
+		}
+		fmt.Fprintf(stderr, "gc hook --claim: refusing stale session %s: %s\n", sessionID, reason) //nolint:errcheck
+		return writeHookClaimStaleSessionDrain(opts, stdout, stderr), true, hookClaimTriggerExpectation{}
+	}
+
+	requiresExactTrigger, policyErr := hookClaimSessionRequiresExactTrigger(cfg, info)
+	if policyErr != nil {
+		fmt.Fprintf(stderr, "gc hook --claim: refusing session %s configured identity: %v\n", sessionID, policyErr) //nolint:errcheck
+		return 1, true, hookClaimTriggerExpectation{}
+	}
+	if instanceToken == "" && envBeadID == "" && envStoreRef == "" && !requiresExactTrigger {
+		// Compatibility: a tokenless session without runtime trigger context
+		// retains the generic path only after its persisted session resolves to an
+		// inherit-policy (or otherwise unmanaged) agent. A configured
+		// project_hooks=forbid session cannot use missing incarnation metadata to
+		// bypass exact controller authority.
+		return 0, false, hookClaimTriggerExpectation{}
+	}
+	expectation, err := hookClaimTriggerExpectationForSession(info, envBeadID, envStoreRef)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc hook --claim: refusing session %s trigger fence: %v\n", sessionID, err) //nolint:errcheck
+		return 1, true, hookClaimTriggerExpectation{}
+	}
+	if expectation == (hookClaimTriggerExpectation{}) && requiresExactTrigger {
+		// A tokened runtime backed by project_hooks=forbid is controller-managed,
+		// even when its row predates the trigger metadata. Do not let a named or
+		// dependency-only floor (or any other tokened incarnation) turn the lack
+		// of an exact controller assignment into authority for the legacy generic
+		// query/claim path. Return a bare refusal: no work query, claim, drain
+		// acknowledgement, or protocol output is safe without that authority.
+		fmt.Fprintf(stderr, "gc hook --claim: refusing project_hooks=forbid session %s without an exact trigger witness\n", sessionID) //nolint:errcheck
+		return 1, true, hookClaimTriggerExpectation{}
+	}
+	if instanceToken == "" {
+		fmt.Fprintf(stderr, "gc hook --claim: refusing triggered session %s without an instance token\n", sessionID) //nolint:errcheck
+		return 1, true, hookClaimTriggerExpectation{}
+	}
+	switch verdict, reason := hookClaimSessionEligibility(info, instanceToken); verdict {
 	case hookClaimSessionStale:
 		fmt.Fprintf(stderr, "gc hook --claim: refusing stale session %s: %s\n", sessionID, reason) //nolint:errcheck
-		return writeHookClaimStaleSessionDrain(opts, stdout, stderr), true
+		return writeHookClaimStaleSessionDrain(opts, stdout, stderr), true, hookClaimTriggerExpectation{}
 	case hookClaimSessionStoreUnavailable:
-		// Fail open: let the claim path run and surface/escalate its own store
-		// error rather than reporting a false stale session. Name the fault
-		// without the alarming "stale session" wording.
-		fmt.Fprintf(stderr, "gc hook --claim: session fence unavailable for %s: %s; proceeding to claim\n", sessionID, reason) //nolint:errcheck
-		return 0, false
+		fmt.Fprintf(stderr, "gc hook --claim: session fence unavailable for %s: %s; refusing claim\n", sessionID, reason) //nolint:errcheck
+		return 1, true, hookClaimTriggerExpectation{}
 	default:
-		return 0, false
+		return 0, false, expectation
 	}
 }
 
-// classifyHookClaimSession loads the session bead named by sessionID and reports
-// whether the runtime holding instanceToken may claim. A confirmed identity
-// failure — the session bead is absent, or resolves to a non-session bead — is a
-// stale verdict: the incarnation can no longer prove its identity and must drain
-// rather than claim. Only a genuine store-open or read fault yields
-// hookClaimSessionStoreUnavailable (transient, fails open), so an infrastructure
-// hiccup is not mislabeled as staleness AND a vanished session is not laundered
-// into an infrastructure hiccup that lets a stale runtime reach the claim path.
-func classifyHookClaimSession(cityPath string, cfg *config.City, sessionID, instanceToken string) (hookClaimSessionVerdict, string) {
+// hookClaimSessionRequiresExactTrigger resolves the persisted session template
+// through the current city config and reports whether its runtime forbids
+// project-scoped hooks. The caller already proved this is a tokened session
+// bead; tokenless/unmanaged legacy contexts keep their compatibility path, and
+// project_hooks=inherit sessions keep generic dependency-floor behavior.
+func hookClaimSessionRequiresExactTrigger(cfg *config.City, info session.Info) (bool, error) {
+	resolution, err := agentutil.ResolvePersistedSessionAgent(cfg, info)
+	if err != nil {
+		return false, err
+	}
+	return resolution.Resolved && resolution.Strict, nil
+}
+
+// hookClaimTriggerExpectationForSession reconciles controller-persisted trigger
+// identity with the runtime environment. Persisted trigger metadata is the
+// authority: it requires both environment fields and exact equality. A session
+// with neither persisted field is legacy and may use the generic claim path,
+// but an environment-only or partial trigger is refused.
+func hookClaimTriggerExpectationForSession(info session.Info, envBeadID, envStoreRef string) (hookClaimTriggerExpectation, error) {
+	persisted := hookClaimTriggerExpectation{
+		BeadID:   info.TriggerBeadID,
+		StoreRef: info.TriggerBeadStoreRef,
+	}
+	environment := hookClaimTriggerExpectation{BeadID: envBeadID, StoreRef: envStoreRef}
+	persistedAny := persisted.BeadID != "" || persisted.StoreRef != ""
+	environmentAny := environment.BeadID != "" || environment.StoreRef != ""
+	if !persistedAny {
+		if environmentAny {
+			return hookClaimTriggerExpectation{}, errors.New("runtime trigger has no persisted session authority")
+		}
+		return hookClaimTriggerExpectation{}, nil
+	}
+	if err := validateHookClaimTriggerExpectation(persisted); err != nil {
+		return hookClaimTriggerExpectation{}, fmt.Errorf("invalid persisted trigger: %w", err)
+	}
+	if !environmentAny {
+		return hookClaimTriggerExpectation{}, errors.New("persisted trigger is missing from the runtime environment")
+	}
+	if err := validateHookClaimTriggerExpectation(environment); err != nil {
+		return hookClaimTriggerExpectation{}, fmt.Errorf("invalid runtime trigger: %w", err)
+	}
+	if environment != persisted {
+		return hookClaimTriggerExpectation{}, fmt.Errorf(
+			"runtime trigger (%s, %s) does not match persisted trigger (%s, %s)",
+			environment.BeadID,
+			environment.StoreRef,
+			persisted.BeadID,
+			persisted.StoreRef,
+		)
+	}
+	return persisted, nil
+}
+
+// selectHookClaimTriggerStore maps the canonical expectation to exactly one of
+// the store contexts the resolved agent can reach. Repeated entries for the same
+// physical directory are harmless (some legacy federation shapes add the own
+// store twice); two distinct directories claiming the same canonical ref are
+// ambiguous and fail closed.
+func selectHookClaimTriggerStore(stores []hookStore, cityPath, cityName string, cfg *config.City, expectation hookClaimTriggerExpectation) (hookStore, error) {
+	if err := validateHookClaimTriggerExpectation(expectation); err != nil {
+		return hookStore{}, err
+	}
+	var selected hookStore
+	found := false
+	for _, candidate := range stores {
+		if hookClaimStoreRefForContext(candidate, cityPath, cityName, cfg) != expectation.StoreRef {
+			continue
+		}
+		if !found {
+			selected = candidate
+			found = true
+			continue
+		}
+		if !samePath(selected.dir, candidate.dir) {
+			return hookStore{}, fmt.Errorf("canonical store ref resolves to multiple store directories")
+		}
+	}
+	if !found {
+		return hookStore{}, fmt.Errorf("canonical store is not reachable by this agent")
+	}
+	return selected, nil
+}
+
+// hookClaimStoreRefForContext derives store ownership from the explicit runtime
+// environment first, not from process cwd. A project-hooks=forbid session runs
+// in an external per-instance bootstrap directory by design, while BEADS_DIR /
+// GC_RIG_ROOT still pin its canonical rig store. Falling back to directory
+// mapping preserves older test and local contexts that predate those anchors.
+func hookClaimStoreRefForContext(candidate hookStore, cityPath, cityName string, cfg *config.City) string {
+	if rig := hookClaimEnvValue(candidate.env, "GC_RIG"); rig != "" {
+		return "rig:" + rig
+	}
+	if rigRoot := hookClaimEnvValue(candidate.env, "GC_RIG_ROOT"); rigRoot != "" && cfg != nil {
+		for _, rig := range cfg.Rigs {
+			if samePath(rigRoot, rig.Path) {
+				return "rig:" + rig.Name
+			}
+		}
+	}
+	if hookClaimEnvValue(candidate.env, "GC_CITY_PATH") != "" {
+		cityName = strings.TrimSpace(cityName)
+		if cityName == "" {
+			cityName = "city"
+		}
+		return "city:" + cityName
+	}
+	return workflowStoreRefForDir(candidate.dir, cityPath, cityName, cfg)
+}
+
+func loadHookClaimSessionInfo(cityPath string, cfg *config.City, sessionID string) (session.Info, hookClaimSessionVerdict, string) {
 	store, err := openCityStoreAt(cityPath)
 	if err != nil {
-		return hookClaimSessionStoreUnavailable, fmt.Sprintf("opening session store: %v", err)
+		return session.Info{}, hookClaimSessionStoreUnavailable, fmt.Sprintf("opening session store: %v", err)
 	}
 	info, err := cliSessionFrontDoor(store, cfg, cityPath).Get(sessionID)
 	if err != nil {
-		return classifyHookClaimSessionLookupError(err)
+		verdict, reason := classifyHookClaimSessionLookupError(err)
+		return session.Info{}, verdict, reason
 	}
-	return hookClaimSessionEligibility(info, instanceToken)
+	return info, hookClaimSessionEligible, ""
 }
 
 // classifyHookClaimSessionLookupError maps a session Store.Get error to a fence
@@ -550,9 +727,8 @@ func classifyHookClaimSession(cityPath string, cfg *config.City, sessionID, inst
 // id resolves to a bead that is not a session) as session.ErrSessionNotFound.
 // Both are definitive identity failures — the runtime's session no longer exists
 // in the store — so the incarnation is stale and must drain. Any other error is a
-// genuine store open/read fault the fence fails open on, letting the normal claim
-// path surface and escalate its own store error rather than refusing a healthy
-// worker over an infrastructure hiccup.
+// genuine store open/read fault the command fence fails closed on without
+// mislabeling it as staleness or acknowledging a drain.
 func classifyHookClaimSessionLookupError(err error) (hookClaimSessionVerdict, string) {
 	switch {
 	case errors.Is(err, beads.ErrNotFound):

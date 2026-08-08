@@ -2701,6 +2701,9 @@ func (s *BdStore) Ready(query ...ReadyQuery) ([]Bead, error) {
 		if q.Assignee != "" && bead.Assignee != q.Assignee {
 			continue
 		}
+		if q.excludesAnyLabel(bead.Labels) {
+			continue
+		}
 		result = append(result, bead)
 		if q.Limit > 0 && len(result) >= q.Limit {
 			break
@@ -2722,6 +2725,9 @@ func bdReadyArgs(q ReadyQuery, includeEphemeral bool) []string {
 	}
 	if q.Assignee != "" {
 		args = append(args, "--assignee", q.Assignee)
+	}
+	for _, label := range q.ExcludeLabels {
+		args = append(args, "--exclude-label", label)
 	}
 	args = append(args, "--limit", "0")
 	return args

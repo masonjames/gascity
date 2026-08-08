@@ -329,6 +329,7 @@ func (s *Server) materializeNamedSessionWithContext(ctx context.Context, store b
 	}
 	sessionEnv := cityAnchoredSessionEnv(s.state.CityPath(), configuredWorkspaceSessionEnv(s.state.Config()), resolved.Env)
 	hints := sessionCreateHints(resolved, sessionEnv, mcpServers)
+	hints.ProjectHooksForbidden = spec.Agent.ForbidsProjectHooks()
 	// Route the named-session create through the worker.Handle boundary
 	// (worker-boundary migration) rather than calling session.Manager directly.
 	// SessionSpecForResolvedRuntime maps this config 1:1 onto the same

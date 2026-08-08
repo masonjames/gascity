@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/pricing"
 	"github.com/gastownhall/gascity/internal/runtime"
@@ -41,6 +42,21 @@ type LifecycleHandle interface {
 	CloseDetailed(context.Context) (sessionpkg.CloseResult, error)
 	Rename(context.Context, string) error
 	StateHandle
+}
+
+// PreparedLifecycleHandle exposes the reconciler's exact-witness start bridge.
+// Runtime-only legacy handles intentionally do not implement this boundary.
+type PreparedLifecycleHandle interface {
+	StartPreparedResolved(context.Context, string, runtime.Config, sessionpkg.LiveBoundaryWitness) (PreparedStartResult, error)
+}
+
+// PreparedStartResult reports whether the provider start boundary was reached
+// and whether a dead runtime container was recycled first.
+type PreparedStartResult struct {
+	Attempted       bool
+	Recycled        bool
+	RecycleDuration time.Duration
+	Commit          AutomaticRuntimeCommit
 }
 
 // MessagingHandle exposes live input delivery operations.
@@ -173,10 +189,12 @@ const (
 
 // NudgeRequest delivers a best-effort wake or redirect message.
 type NudgeRequest struct {
-	Text     string          `json:"text"`
-	Delivery NudgeDelivery   `json:"delivery,omitempty"`
-	Source   string          `json:"source,omitempty"`
-	Wake     NudgeWakePolicy `json:"wake,omitempty"`
+	Text                        string          `json:"text"`
+	Delivery                    NudgeDelivery   `json:"delivery,omitempty"`
+	Source                      string          `json:"source,omitempty"`
+	Wake                        NudgeWakePolicy `json:"wake,omitempty"`
+	ExpectedTriggerBeadID       string          `json:"-"`
+	ExpectedTriggerBeadStoreRef string          `json:"-"`
 }
 
 // NudgeResult reports whether the requested live delivery actually happened.
@@ -245,14 +263,56 @@ type SessionSpec struct {
 	Metadata     map[string]string
 }
 
+// LaunchAuthorizationRequest is the authoritative input presented immediately
+// before a session-backed worker starts a runtime or delivers a turn. Info is
+// nil when no persisted session row exists. When Info is non-nil, both it and
+// Metadata were reloaded from the session store for this authorization check;
+// callers must not treat Session.Metadata as persisted authority.
+type LaunchAuthorizationRequest struct {
+	Session            SessionSpec
+	Info               *sessionpkg.Info
+	Metadata           map[string]string
+	SessionStore       beads.Store
+	CanonicalCityStore beads.Store
+}
+
+// LaunchAuthorization binds an allowed live operation to one exact persisted
+// trigger pair. A zero value preserves ordinary inherited/no-agent behavior.
+type LaunchAuthorization struct {
+	TriggerBeadID       string
+	TriggerBeadStoreRef string
+	RuntimeEnforcement  *LaunchRuntimeEnforcement
+}
+
+// LaunchRuntimeEnforcement is the current configuration-owned isolation
+// envelope that must override any runtime hints cached when a handle was
+// constructed.
+type LaunchRuntimeEnforcement struct {
+	ProjectHooksForbidden bool
+	ProviderName          string
+	ProviderOverlayName   string
+	WorkDir               string
+}
+
+// LaunchAuthorizer decides whether a session-backed worker may cross a live
+// runtime boundary and returns the exact persisted authority the session layer
+// must revalidate under its mutation lock. It is role-neutral: higher layers
+// supply config-aware policy while worker guarantees ordering and reloads.
+type LaunchAuthorizer func(context.Context, LaunchAuthorizationRequest) (LaunchAuthorization, error)
+
 // SessionHandleConfig configures a [SessionHandle].
 type SessionHandleConfig struct {
-	Manager     *sessionpkg.Manager
-	SearchPaths []string
-	Adapter     SessionLogAdapter
-	Recorder    events.Recorder
-	UsageSink   usage.Sink
-	Session     SessionSpec
+	Manager            *sessionpkg.Manager
+	SearchPaths        []string
+	Adapter            SessionLogAdapter
+	Recorder           events.Recorder
+	UsageSink          usage.Sink
+	Session            SessionSpec
+	SessionStore       beads.Store
+	CanonicalCityStore beads.Store
+	// AuthorizeLaunch runs immediately before every runtime-starting or
+	// turn-delivery operation. Deferred creation deliberately does not call it.
+	AuthorizeLaunch LaunchAuthorizer
 	// Pricing estimates per-invocation cost for telemetry. Nil falls back
 	// to the registry built from shipped defaults.
 	Pricing *pricing.Registry
@@ -260,18 +320,21 @@ type SessionHandleConfig struct {
 
 // SessionHandle is the production worker handle backed by session.Manager.
 type SessionHandle struct {
-	mu             sync.Mutex
-	manager        *sessionpkg.Manager
-	adapter        SessionLogAdapter
-	recorder       events.Recorder
-	usageSink      usage.Sink
-	searchPaths    []string
-	session        SessionSpec
-	sessionID      string
-	history        *HistorySnapshot
-	historyRaw     historyGeneration
-	pricing        *pricing.Registry
-	invTelemetryMu sync.Mutex
+	mu                 sync.Mutex
+	manager            *sessionpkg.Manager
+	adapter            SessionLogAdapter
+	recorder           events.Recorder
+	usageSink          usage.Sink
+	searchPaths        []string
+	session            SessionSpec
+	sessionID          string
+	history            *HistorySnapshot
+	historyRaw         historyGeneration
+	pricing            *pricing.Registry
+	authorizeLaunch    LaunchAuthorizer
+	sessionStore       beads.Store
+	canonicalCityStore beads.Store
+	invTelemetryMu     sync.Mutex
 	// sidecarDoneID is the session id whose transcript-session sidecar has been
 	// confirmed written, guarded by sidecarMu. The keyed transcript path is stable
 	// once the session key exists, so a matching id lets repeated turn/poll calls

@@ -357,6 +357,19 @@ func markIdleSleepPendingInfo(info sessionpkg.Info, sessFront *sessionpkg.Store)
 	return sessionpkg.MetadataPatch{"sleep_intent": "idle-stop-pending"}
 }
 
+func markIdleSleepPendingInfoAtBoundary(info sessionpkg.Info, cfg *config.City, store beads.Store, boundaries ...reconcilerMutationBoundary) sessionpkg.MetadataPatch {
+	var fold sessionpkg.MetadataPatch
+	boundary := selectedReconcilerMutationBoundary(info, cfg, boundaries...).lifecycleMutation()
+	_, err := boundary.run(store, nil, func(current sessionpkg.Info, front *sessionpkg.Store) error {
+		fold = markIdleSleepPendingInfo(current, front)
+		return nil
+	})
+	if err != nil {
+		return nil
+	}
+	return fold
+}
+
 // recoverPendingIdleSleepInfo reads the idle-stop-pending intent and the
 // preserved fingerprint off Info (SleepIntent, SleepPolicyFingerprint), the
 // handle off Info.ID, and persists SleepPatch(now, "idle") via
@@ -380,6 +393,23 @@ func recoverPendingIdleSleepInfo(
 		return false
 	}
 	return true
+}
+
+func recoverPendingIdleSleepInfoAtBoundary(
+	info sessionpkg.Info,
+	cfg *config.City,
+	store beads.Store,
+	running bool,
+	clk clock.Clock,
+	boundaries ...reconcilerMutationBoundary,
+) bool {
+	var recovered bool
+	boundary := selectedReconcilerMutationBoundary(info, cfg, boundaries...).lifecycleMutation()
+	_, err := boundary.run(store, nil, func(current sessionpkg.Info, front *sessionpkg.Store) error {
+		recovered = recoverPendingIdleSleepInfo(current, front, running, clk)
+		return nil
+	})
+	return err == nil && recovered
 }
 
 func boolMetadata(v bool) string {

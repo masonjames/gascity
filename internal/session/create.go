@@ -33,6 +33,20 @@ type CreateSpec struct {
 	Metadata map[string]string
 }
 
+// BeadForCreateSpec returns the exact persisted bead envelope owned by the
+// session front door. It is useful when a caller must compose session creation
+// inside a larger store-native transaction while preserving the same type and
+// label vocabulary as CreateSessionInfo.
+func BeadForCreateSpec(spec CreateSpec) beads.Bead {
+	return beads.Bead{
+		ID:       spec.ID,
+		Title:    spec.Title,
+		Type:     BeadType,
+		Labels:   []string{LabelSession, "agent:" + spec.AgentName},
+		Metadata: spec.Metadata,
+	}
+}
+
 // CreateSessionInfo creates a session bead from spec and returns the projected
 // session.Info of the just-created bead. It is the write-returns-Info create
 // front door: the store's Create returns the persisted bead, so the Info is a
@@ -57,13 +71,7 @@ type CreateSpec struct {
 // pinned across every backend by the beadstest conformance case
 // CreateEchoMatchesGetOnMetadata, not just by the memstore-backed oracle here.
 func (s *Store) CreateSessionInfo(spec CreateSpec) (Info, error) {
-	created, err := s.store.Create(beads.Bead{
-		ID:       spec.ID,
-		Title:    spec.Title,
-		Type:     BeadType,
-		Labels:   []string{LabelSession, "agent:" + spec.AgentName},
-		Metadata: spec.Metadata,
-	})
+	created, err := s.store.Create(BeadForCreateSpec(spec))
 	if err != nil {
 		return Info{}, err
 	}

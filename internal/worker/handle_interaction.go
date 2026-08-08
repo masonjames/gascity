@@ -48,15 +48,23 @@ func (h *SessionHandle) PendingStatus(context.Context) (*PendingInteraction, boo
 }
 
 // Respond resolves the current blocking interaction.
-func (h *SessionHandle) Respond(_ context.Context, req InteractionResponse) error {
+func (h *SessionHandle) Respond(ctx context.Context, req InteractionResponse) error {
 	id := h.currentSessionID()
 	if id == "" {
+		if _, err := h.authorizeLiveBoundary(ctx, ""); err != nil {
+			return err
+		}
 		return sessionpkg.ErrNoPendingInteraction
 	}
-	return h.manager.Respond(id, runtime.InteractionResponse{
+	authorization, err := h.authorizeLiveBoundary(ctx, id)
+	if err != nil {
+		return err
+	}
+	err = h.manager.RespondWithWitness(id, runtime.InteractionResponse{
 		RequestID: req.RequestID,
 		Action:    req.Action,
 		Text:      req.Text,
 		Metadata:  cloneStringMap(req.Metadata),
-	})
+	}, liveBoundaryWitness(authorization))
+	return normalizeLiveBoundaryError(err)
 }

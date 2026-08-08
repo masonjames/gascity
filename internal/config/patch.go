@@ -28,6 +28,8 @@ type AgentPatch struct {
 	Name string `toml:"name" jsonschema:"required"`
 	// WorkDir overrides the agent's session working directory.
 	WorkDir *string `toml:"work_dir,omitempty"`
+	// ProjectHooks overrides the project-scoped hook discovery policy.
+	ProjectHooks *ProjectHooksPolicy `toml:"project_hooks,omitempty" jsonschema:"enum=inherit,enum=forbid"`
 	// TmuxAlias overrides the tmux session name template
 	// (see Agent.TmuxAlias for semantics).
 	TmuxAlias *string `toml:"tmux_alias,omitempty"`
@@ -448,6 +450,9 @@ func applyAgentPatchFields(a *Agent, p *AgentPatch) {
 func applyAgentMutation(a *Agent, p *AgentPatch, sleepSource string) {
 	if p.WorkDir != nil {
 		a.WorkDir = *p.WorkDir
+	}
+	if p.ProjectHooks != nil {
+		a.ProjectHooks = *p.ProjectHooks
 	}
 	if p.TmuxAlias != nil {
 		a.TmuxAlias = *p.TmuxAlias

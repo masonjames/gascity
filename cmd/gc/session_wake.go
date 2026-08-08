@@ -204,6 +204,30 @@ func beginSessionDrainInfo(
 	return true
 }
 
+// beginSessionDrainInfoAtBoundary starts an automatic drain only while the
+// trigger ownership captured by the reconciler decision is still current. The
+// tracker mutation is kept under the same per-session lock as the persisted
+// reload so a clear/repoint cannot leave a drain belonging to a newer owner.
+func beginSessionDrainInfoAtBoundary(
+	info sessions.Info,
+	cfg *config.City,
+	store beads.Store,
+	sp runtime.Provider,
+	dt *drainTracker,
+	reason string,
+	clk clock.Clock,
+	timeout time.Duration,
+	boundaries ...reconcilerMutationBoundary,
+) bool {
+	var began bool
+	boundary := selectedReconcilerMutationBoundary(info, cfg, boundaries...).lifecycleMutation()
+	_, err := boundary.run(store, nil, func(current sessions.Info, _ *sessions.Store) error {
+		began = beginSessionDrainInfo(current, sp, dt, reason, clk, timeout)
+		return nil
+	})
+	return err == nil && began
+}
+
 func drainReasonCancelable(reason string) bool {
 	return reason != "config-drift" && reason != "orphaned" && reason != "suspended"
 }
@@ -256,12 +280,106 @@ func clearReconcilerDrainAckMetadata(sp runtime.Provider, name string) error {
 	return errors.Join(errs...)
 }
 
+func clearReconcilerDrainAckMetadataAtBoundary(
+	info sessions.Info,
+	cfg *config.City,
+	store beads.Store,
+	sp runtime.Provider,
+	boundaries ...reconcilerMutationBoundary,
+) bool {
+	cleared := false
+	boundary := selectedReconcilerMutationBoundary(info, cfg, boundaries...).lifecycleMutation()
+	if boundary.strict || boundary.policyErr != nil {
+		if boundary.policyErr != nil {
+			return false
+		}
+		var err error
+		for _, key := range []string{"GC_DRAIN_ACK", reconcilerDrainAckSourceKey, reconcilerDrainAckReasonKey, reconcilerDrainAckGenerationKey} {
+			boundary, err = mutateStrictRuntimeMetadataAtBoundary(store, sp, cfg, boundary, key, "", true)
+			if err != nil {
+				return false
+			}
+		}
+		return true
+	}
+	_, err := boundary.run(store, nil, func(current sessions.Info, _ *sessions.Store) error {
+		name := strings.TrimSpace(current.SessionNameMetadata)
+		if name == "" {
+			return nil
+		}
+		if err := clearReconcilerDrainAckMetadata(sp, name); err != nil {
+			return err
+		}
+		cleared = true
+		return nil
+	})
+	return err == nil && cleared
+}
+
+func mutateStrictRuntimeMetadataAtBoundary(
+	store beads.Store,
+	sp runtime.Provider,
+	cfg *config.City,
+	boundary reconcilerMutationBoundary,
+	key string,
+	value string,
+	remove bool,
+) (reconcilerMutationBoundary, error) {
+	if boundary.policyErr != nil || !boundary.strict {
+		return reconcilerMutationBoundary{}, fmt.Errorf("strict exact runtime metadata mutation requires an unambiguous strict decision")
+	}
+	decision, err := boundary.automaticRuntimeDecision()
+	if err != nil {
+		return reconcilerMutationBoundary{}, err
+	}
+	factory, err := workerFactoryWithConfig("", store, sp, cfg, store)
+	if err != nil {
+		return reconcilerMutationBoundary{}, err
+	}
+	var commit sessions.AutomaticRuntimeCommit
+	if remove {
+		commit, err = factory.RemoveRuntimeMetadataForReconciler(context.Background(), boundary.captured.ID, key, decision)
+	} else {
+		commit, err = factory.SetRuntimeMetadataForReconciler(context.Background(), boundary.captured.ID, key, value, decision)
+	}
+	if err != nil {
+		return reconcilerMutationBoundary{}, err
+	}
+	return boundary.afterAutomaticRuntimeCommit(commit)
+}
+
 // cancelSessionDrainInfo removes a cancelable drain if wake reasons reappeared
 // for the same generation. If GC_DRAIN_ACK was already set by the reconciler
 // (deferred drain signal), it is cleared so the Phase 1 drain-ack check doesn't
 // kill the session. It reads the session id/generation/name off the Info snapshot.
 func cancelSessionDrainInfo(info sessions.Info, sp runtime.Provider, dt *drainTracker) bool {
 	return cancelSessionDrainIfInfo(info, sp, dt, drainReasonCancelable)
+}
+
+// cancelSessionDrainAtBoundary applies an automatic drain cancellation only to
+// the exact session incarnation that led to the decision. The supplied
+// cancellation callback may also clear provider drain metadata; it therefore
+// executes under the same ownership lock as the raw persisted reload.
+func cancelSessionDrainAtBoundary(
+	info sessions.Info,
+	cfg *config.City,
+	store beads.Store,
+	cancel func(sessions.Info) bool,
+	boundaries ...reconcilerMutationBoundary,
+) bool {
+	if cancel == nil {
+		return false
+	}
+	var canceled bool
+	boundary := selectedReconcilerMutationBoundary(info, cfg, boundaries...).lifecycleMutation()
+	if boundary.legacyAutomaticRuntimeEffectError() != nil {
+		return false
+	}
+	_, err := boundary.run(store, nil, func(current sessions.Info, _ *sessions.Store) error {
+		canceled = cancel(current)
+		return nil
+	})
+	return err == nil && canceled
 }
 
 // cancelSessionDrainForPendingInfo cancels a pending-drain-cancelable drain for
@@ -499,6 +617,75 @@ func advanceSessionDrainsWithSessionsTraced(
 	cfg *config.City,
 	clk clock.Clock,
 	trace *sessionReconcilerTraceCycle,
+	boundaryResolvers ...func(sessions.Info) reconcilerMutationBoundary,
+) {
+	for id := range dt.all() {
+		captured, ok := infoLookup(id)
+		if !ok {
+			// The durable owner is gone. Removing controller-only drain state is
+			// containment, not a live/session/work mutation.
+			dt.clearIdleProbe(id)
+			dt.remove(id)
+			continue
+		}
+		boundary := captureReconcilerMutationBoundary(captured, cfg)
+		if len(boundaryResolvers) > 0 && boundaryResolvers[0] != nil {
+			boundary = boundaryResolvers[0](captured)
+		}
+		boundary = boundary.lifecycleMutation()
+		// Strict Phase-2 drain progression includes provider Stop/Kill and a
+		// session-state commit. The worker boundary currently exposes exact leased
+		// metadata effects, but not an automatic destructive Stop/Kill/Close
+		// operation. Do not mix those exact metadata writes with the legacy
+		// name-only destructive tail: leave the strict drain parked until the whole
+		// transition can share one attested conditional decision. Policy ambiguity
+		// is the same fail-closed outcome.
+		if boundary.strict || boundary.policyErr != nil {
+			if trace != nil {
+				err := boundary.policyErr
+				if err == nil {
+					err = sessions.ErrAutomaticRuntimeExactEffectUnsupported
+				}
+				trace.RecordDecision(
+					TraceSiteDrainStale, TraceReasonUnknown, TraceOutcomeDeferred,
+					normalizedSessionTemplateInfo(captured, cfg), captured.SessionNameMetadata,
+					traceRecordPayload{"error": err.Error(), "strict_provider_effect_refused": true},
+				)
+			}
+			continue
+		}
+		_, boundaryErr := boundary.run(store, nil, func(current sessions.Info, _ *sessions.Store) error {
+			currentLookup := func(requested string) (sessions.Info, bool) {
+				if requested == id {
+					return current, true
+				}
+				return infoLookup(requested)
+			}
+			advanceSessionDrainsWithSessionsTracedCurrent(
+				dt, sp, store, currentLookup, wakeEvals, cfg, clk, trace, id,
+			)
+			return nil
+		})
+		if boundaryErr != nil && trace != nil {
+			trace.RecordDecision(
+				TraceSiteDrainStale, TraceReasonStaleGeneration, TraceOutcomeDeferred,
+				normalizedSessionTemplateInfo(captured, cfg), captured.SessionNameMetadata,
+				traceRecordPayload{"error": boundaryErr.Error(), "witness_refused": true},
+			)
+		}
+	}
+}
+
+func advanceSessionDrainsWithSessionsTracedCurrent(
+	dt *drainTracker,
+	sp runtime.Provider,
+	store beads.Store,
+	infoLookup func(id string) (sessions.Info, bool),
+	wakeEvals map[string]wakeEvaluation,
+	cfg *config.City,
+	clk clock.Clock,
+	trace *sessionReconcilerTraceCycle,
+	onlyID string,
 ) {
 	// wakeEvals is required. The reconciler builds it from the coherent infoByID
 	// snapshot via ComputeAwakeSet -> awakeSetToWakeEvals; tests supply explicit
@@ -512,6 +699,9 @@ func advanceSessionDrainsWithSessionsTraced(
 		sessFront = nil
 	}
 	for id, ds := range dt.all() {
+		if onlyID != "" && id != onlyID {
+			continue
+		}
 		info, ok := infoLookup(id)
 		if !ok {
 			dt.clearIdleProbe(id)
@@ -543,10 +733,7 @@ func advanceSessionDrainsWithSessionsTraced(
 		}
 
 		// Check if process exited.
-		running, err := workerSessionTargetRunningWithConfig("", store, sp, cfg, info.ID)
-		if err != nil {
-			running = false
-		}
+		running, _ := observeRuntimeProviderLiveness(sp, name, nil)
 		if !running {
 			// Process exited — drain complete.
 			completeDrain(info, sessFront, ds, clk)
@@ -662,10 +849,7 @@ func advanceSessionDrainsWithSessionsTraced(
 			}
 			// Re-probe after stop to confirm process actually exited
 			// before marking metadata as asleep.
-			running, err := workerSessionTargetRunningWithConfig("", store, sp, cfg, info.ID)
-			if err != nil {
-				running = false
-			}
+			running, _ := observeRuntimeProviderLiveness(sp, name, nil)
 			if !running {
 				completeDrain(info, sessFront, ds, clk)
 				dt.clearIdleProbe(id)

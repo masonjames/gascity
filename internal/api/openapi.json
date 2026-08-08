@@ -366,6 +366,12 @@
               "null"
             ]
           },
+          "ProjectHooks": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "PromptTemplate": {
             "type": [
               "string",
@@ -509,6 +515,7 @@
           "Dir",
           "Name",
           "WorkDir",
+          "ProjectHooks",
           "TmuxAlias",
           "Scope",
           "Suspended",

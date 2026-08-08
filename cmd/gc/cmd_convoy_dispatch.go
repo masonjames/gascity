@@ -24,6 +24,8 @@ import (
 	"github.com/gastownhall/gascity/internal/formula"
 	"github.com/gastownhall/gascity/internal/graphroute"
 	"github.com/gastownhall/gascity/internal/graphv2"
+	"github.com/gastownhall/gascity/internal/runtime"
+	sessionpkg "github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/sourceworkflow"
 	"github.com/gastownhall/gascity/internal/storeref"
 	"github.com/spf13/cobra"
@@ -271,7 +273,7 @@ func runControlDispatcherWithStoreAndConfig(cityPath, storePath string, store be
 				if strings.TrimSpace(subject.Assignee) == "" {
 					return fmt.Errorf("subject %s missing assignee for pooled retry recycle", subject.ID)
 				}
-				return workerKillSessionTargetWithConfig("", store, sp, cfg, subject.Assignee)
+				return recycleControlSubjectSession(store, sp, cfg, subject)
 			}
 		case "retry", "ralph":
 			opts.FormulaSearchPaths = workflowFormulaSearchPaths(cfg, bead)
@@ -283,7 +285,7 @@ func runControlDispatcherWithStoreAndConfig(cityPath, storePath string, store be
 				if strings.TrimSpace(subject.Assignee) == "" {
 					return fmt.Errorf("subject %s missing assignee for pooled retry recycle", subject.ID)
 				}
-				return workerKillSessionTargetWithConfig("", store, sp, cfg, subject.Assignee)
+				return recycleControlSubjectSession(store, sp, cfg, subject)
 			}
 		}
 	}
@@ -323,6 +325,51 @@ func runControlDispatcherWithStoreAndConfig(cityPath, storePath string, store be
 			_, _ = fmt.Fprintf(stdout, " skipped=%d", result.Skipped)
 		}
 		fmt.Fprintln(stdout) //nolint:errcheck
+	}
+	return nil
+}
+
+func recycleControlSubjectSession(store beads.Store, sp runtime.Provider, cfg *config.City, subject beads.Bead) error {
+	assignee := strings.TrimSpace(subject.Assignee)
+	boundary, err := captureReconcilerMutationBoundaryForTarget(store, cfg, assignee)
+	if err != nil {
+		identity := assignee
+		for _, label := range subject.Labels {
+			if poolIdentity := strings.TrimSpace(strings.TrimPrefix(label, "pool:")); strings.HasPrefix(label, "pool:") && poolIdentity != "" {
+				identity = poolIdentity
+				break
+			}
+		}
+		if agentCfg, ok := resolveWorkerConfigAgent(cfg, identity); ok && agentCfg.ForbidsProjectHooks() {
+			return fmt.Errorf("%w: strict retry recycle requires a bead-backed session", sessionpkg.ErrLiveBoundaryWitnessMismatch)
+		}
+		// Legacy control graphs may name a runtime-only pooled assignee whose
+		// session row predates durable lifecycle projection. Preserve that
+		// inherit-only containment path; configured forbid targets fail closed
+		// above because they cannot supply an exact persisted trigger witness.
+		return workerKillSessionTargetWithConfig("", store, sp, cfg, assignee)
+	}
+	boundary = boundary.lifecycleMutation()
+	if err := boundary.legacyAutomaticRuntimeEffectError(); err != nil {
+		return err
+	}
+	ran, err := boundary.run(store, func(current sessionpkg.Info) (bool, error) {
+		latestSubject, err := store.Get(subject.ID)
+		if err != nil {
+			return false, err
+		}
+		if strings.TrimSpace(latestSubject.Assignee) != assignee {
+			return false, nil
+		}
+		return strings.TrimSpace(current.SessionNameMetadata) != "", nil
+	}, func(current sessionpkg.Info, _ *sessionpkg.Store) error {
+		return workerKillSessionTargetWithConfig("", store, sp, cfg, current.ID)
+	})
+	if err != nil {
+		return err
+	}
+	if !ran {
+		return fmt.Errorf("session recycle ownership changed for subject %s", subject.ID)
 	}
 	return nil
 }

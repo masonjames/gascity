@@ -1053,6 +1053,7 @@ export const zAgentPatch = z.object({
     Pool: zPoolOverride,
     PreStart: z.array(z.string()).nullable(),
     PreStartAppend: z.array(z.string()).nullable(),
+    ProjectHooks: z.string().nullable(),
     PromptTemplate: z.string().nullable(),
     Provider: z.string().nullable(),
     ResumeCommand: z.string().nullable(),

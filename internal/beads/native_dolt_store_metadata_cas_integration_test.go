@@ -33,7 +33,239 @@ func openRealNativeDoltStoreForCAS(t *testing.T, actor string) *NativeDoltStore 
 	if err := storage.SetConfig(ctx, "issue_prefix", "gc"); err != nil {
 		t.Fatalf("set issue prefix: %v", err)
 	}
+	// Managed Gas City scopes register session as a custom bead type before
+	// the controller creates lifecycle rows. Mirror that production precondition
+	// so the real-backend witness test exercises the transaction rather than
+	// failing at upstream custom-type validation during fixture setup.
+	if err := storage.SetConfig(ctx, "types.custom", "session"); err != nil {
+		t.Fatalf("set custom types: %v", err)
+	}
 	return newNativeDoltStoreWithStorageAndPrefix(storage, actor, "gc")
+}
+
+// TestNativeDoltStoreGuardedAssignmentContentionAgainstRealDolt proves the
+// exact-assignment fence against the real embedded Dolt transaction engine.
+// The in-memory conformance fixture deliberately provides rollback without
+// isolation, so only this real-provider test can establish the single-winner
+// property NativeDoltStore advertises.
+func TestNativeDoltStoreGuardedAssignmentContentionAgainstRealDolt(t *testing.T) {
+	seedStore := openRealNativeDoltStoreForCAS(t, "guarded-contention-seed")
+	created, err := seedStore.Create(Bead{
+		Title:    "real-dolt-guarded-contention",
+		Metadata: map[string]string{"gc.routed_to": "rig/pool"},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	const racers = 8
+	rawStorage, releaseStorage, err := seedStore.acquireStorage()
+	if err != nil {
+		t.Fatalf("acquire native storage: %v", err)
+	}
+	defer releaseStorage()
+	startBarrier := &guardedAssignmentStartBarrierStorage{
+		Storage: rawStorage,
+		want:    racers,
+		release: make(chan struct{}),
+	}
+	store := newNativeDoltStoreWithStorageAndPrefix(startBarrier, "guarded-contention", "gc")
+	claimer, ok := GuardedAssignmentClaimerFor(store)
+	if !ok {
+		t.Fatal("real NativeDoltStore does not expose GuardedAssignmentClaimer")
+	}
+
+	type result struct {
+		actor string
+		bead  Bead
+		won   bool
+		err   error
+	}
+	results := make(chan result, racers)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for racer := range racers {
+		actor := "worker-" + strconv.Itoa(racer)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			bead, won, err := claimer.ClaimAssignment(t.Context(), AssignmentClaimRequest{
+				ID:               created.ID,
+				Actor:            actor,
+				ExpectedStatus:   "open",
+				ExpectedMetadata: map[string]string{"gc.routed_to": "rig/pool"},
+				ForbiddenLabels:  []string{"hold:mayor", "hold:external"},
+				AssignmentMetadata: map[string]string{
+					"gc.session_id":             "session-" + actor,
+					"gc.session_name":           "rig-" + actor,
+					"gc.session_instance_token": "instance-" + actor,
+				},
+			})
+			results <- result{actor: actor, bead: bead, won: won, err: err}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	winner := ""
+	for result := range results {
+		if result.err != nil {
+			t.Errorf("racer %s returned error (lost race must be zero,false,nil): %v", result.actor, result.err)
+			continue
+		}
+		if !result.won {
+			if result.bead.ID != "" {
+				t.Errorf("loser %s returned non-zero bead %+v", result.actor, result.bead)
+			}
+			continue
+		}
+		if winner != "" {
+			t.Errorf("multiple winners: %s and %s", winner, result.actor)
+		}
+		winner = result.actor
+		if result.bead.Assignee != result.actor || result.bead.Metadata["gc.session_instance_token"] != "instance-"+result.actor {
+			t.Errorf("winner %s returned mixed assignment/witness %+v", result.actor, result.bead)
+		}
+	}
+	if t.Failed() {
+		return
+	}
+	if winner == "" {
+		t.Fatal("no guarded-assignment winner")
+	}
+	stored, err := seedStore.Get(created.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if stored.Status != "in_progress" || stored.Assignee != winner ||
+		stored.Metadata["gc.session_id"] != "session-"+winner ||
+		stored.Metadata["gc.session_name"] != "rig-"+winner ||
+		stored.Metadata["gc.session_instance_token"] != "instance-"+winner {
+		t.Fatalf("stored assignment = %+v, want sole winner %s with matching witness", stored, winner)
+	}
+}
+
+// TestNativeDoltStoreGuardedAssignmentCoLocatedWitnessAgainstRealDolt proves
+// the second-row witness is evaluated by the real embedded Dolt transaction,
+// not only by the scripted native-storage fixture.
+func TestNativeDoltStoreGuardedAssignmentCoLocatedWitnessAgainstRealDolt(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		drift bool
+	}{
+		{name: "exact witness claims"},
+		{name: "drifted witness refuses", drift: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := openRealNativeDoltStoreForCAS(t, "guarded-witness")
+			sessionBead, err := store.Create(Bead{
+				Title:  "worker-1",
+				Type:   "session",
+				Status: "open",
+				Labels: []string{"gc:session"},
+				Metadata: map[string]string{
+					"template":       "rig/worker",
+					"session_name":   "rig-worker-1",
+					"instance_token": "instance-1",
+					"state":          "creating",
+					"alias":          "worker-1",
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			work, err := store.Create(Bead{
+				Title:    "routed work",
+				Metadata: map[string]string{"gc.routed_to": "rig/worker"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			before, err := store.Get(work.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.drift {
+				if err := store.SetMetadata(sessionBead.ID, "instance_token", "rotated"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			claimed, ok, err := store.ClaimAssignment(t.Context(), AssignmentClaimRequest{
+				ID:               work.ID,
+				Actor:            "worker-1",
+				ExpectedStatus:   "open",
+				ExpectedMetadata: map[string]string{"gc.routed_to": "rig/worker"},
+				ForbiddenLabels:  []string{"hold:mayor", "hold:external"},
+				AssignmentMetadata: map[string]string{
+					"gc.session_id":             sessionBead.ID,
+					"gc.session_name":           "rig-worker-1",
+					"gc.session_instance_token": "instance-1",
+				},
+				CoLocatedWitness: &AssignmentClaimCoLocatedWitness{
+					ID:             sessionBead.ID,
+					ExpectedStatus: "open",
+					ExpectedType:   "session",
+					RequiredLabels: []string{"gc:session"},
+					ExpectedMetadata: map[string]string{
+						"template":       "rig/worker",
+						"session_name":   "rig-worker-1",
+						"instance_token": "instance-1",
+						"state":          "creating",
+						"alias":          "worker-1",
+					},
+					AbsentOrEmptyMetadata: []string{"configured_named_identity"},
+				},
+			})
+			if err != nil {
+				t.Fatalf("ClaimAssignment: %v", err)
+			}
+			if tc.drift {
+				if ok || claimed.ID != "" {
+					t.Fatalf("drifted witness claim = (%+v, %v), want zero,false", claimed, ok)
+				}
+				after, getErr := store.Get(work.ID)
+				if getErr != nil {
+					t.Fatal(getErr)
+				}
+				if after.Revision != before.Revision || after.Status != before.Status || after.Assignee != before.Assignee {
+					t.Fatalf("drifted witness mutated work: before=%+v after=%+v", before, after)
+				}
+				return
+			}
+			if !ok || claimed.ID != work.ID || claimed.Status != "in_progress" || claimed.Assignee != "worker-1" {
+				t.Fatalf("exact witness claim = (%+v, %v), want authoritative success", claimed, ok)
+			}
+		})
+	}
+}
+
+// guardedAssignmentStartBarrierStorage proves the real-provider test starts
+// every claim concurrently without forcing two SQL transactions past the
+// provider's own writer lock. The lock is the isolation mechanism under test;
+// placing the barrier after GetIssue would deadlock behind it.
+type guardedAssignmentStartBarrierStorage struct {
+	beadslib.Storage
+	mu      sync.Mutex
+	arrived int
+	want    int
+	release chan struct{}
+}
+
+func (s *guardedAssignmentStartBarrierStorage) RunInTransaction(ctx context.Context, commitMsg string, fn func(beadslib.Transaction) error) error {
+	s.mu.Lock()
+	s.arrived++
+	if s.arrived == s.want {
+		close(s.release)
+	}
+	release := s.release
+	s.mu.Unlock()
+	select {
+	case <-release:
+		return s.Storage.RunInTransaction(ctx, commitMsg, fn)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // TestNativeDoltStoreMetadataCASSequentialAgainstRealDolt exercises the

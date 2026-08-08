@@ -7,12 +7,14 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
+	"github.com/gastownhall/gascity/internal/runtime"
 )
 
 func writeTemplateResolveCityConfig(t *testing.T, cityPath, beadsProvider string) {
@@ -25,6 +27,85 @@ func writeTemplateResolveCityConfig(t *testing.T, cityPath, beadsProvider string
 	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte(content), 0o644); err != nil {
 		t.Fatalf("write city.toml: %v", err)
 	}
+}
+
+type templateProjectHookIsolationProvider struct {
+	*runtime.Fake
+}
+
+func (p *templateProjectHookIsolationProvider) SupportsProjectHookIsolation(transport string) bool {
+	return strings.TrimSpace(transport) == "" || strings.TrimSpace(transport) == config.SessionTransportTmux
+}
+
+func TestResolveTemplateProjectHooksForbidFencesEffectiveRuntimeProvider(t *testing.T) {
+	newFixture := func(t *testing.T, configuredProvider string, provider runtime.Provider) (*agentBuildParams, *config.Agent) {
+		t.Helper()
+		cityPath := t.TempDir()
+		writeTemplateResolveCityConfig(t, cityPath, "file")
+		externalRoot, err := filepath.EvalSymlinks(t.TempDir())
+		if err != nil {
+			t.Fatalf("canonicalize external workdir root: %v", err)
+		}
+		cfg := &config.City{
+			Workspace: config.Workspace{Name: "city", Provider: "test"},
+			Session:   config.SessionConfig{Provider: configuredProvider},
+			Providers: map[string]config.ProviderSpec{
+				"test": {Command: "/bin/echo", PromptMode: "none"},
+			},
+		}
+		agent := &config.Agent{
+			Name:         "worker",
+			Provider:     "test",
+			ProjectHooks: config.ProjectHooksForbid,
+			WorkDir:      filepath.Join(externalRoot, "{{.Agent}}"),
+		}
+		cfg.Agents = []config.Agent{*agent}
+		return newAgentBuildParams("city", cityPath, cfg, provider, time.Unix(0, 0), beads.NewMemStore(), io.Discard), agent
+	}
+
+	t.Run("empty city default is the tmux fallback", func(t *testing.T) {
+		t.Setenv("GC_SESSION", "")
+		params, agent := newFixture(t, "", &templateProjectHookIsolationProvider{Fake: runtime.NewFake()})
+		tp, err := resolveTemplate(params, agent, agent.QualifiedName(), nil)
+		if err != nil {
+			t.Fatalf("resolveTemplate(default tmux): %v", err)
+		}
+		if !tp.Hints.ProjectHooksForbidden {
+			t.Fatal("ProjectHooksForbidden hint = false, want true")
+		}
+	})
+
+	t.Run("non-tmux runtime selector resolves when the actual provider attests", func(t *testing.T) {
+		t.Setenv("GC_SESSION", "pack-isolating-runtime")
+		actual := &templateProjectHookIsolationProvider{Fake: runtime.NewFake()}
+		params, agent := newFixture(t, "tmux", actual)
+		if params.sessionProvider != "pack-isolating-runtime" {
+			t.Fatalf("effective session provider = %q, want environment-selected pack runtime", params.sessionProvider)
+		}
+		tp, err := resolveTemplatePrepared(params, agent, agent.QualifiedName(), nil)
+		if err != nil {
+			t.Fatalf("resolveTemplatePrepared(attesting pack runtime): %v", err)
+		}
+		if tp.EffectiveSessionProvider != "pack-isolating-runtime" {
+			t.Fatalf("EffectiveSessionProvider = %q, want pack-isolating-runtime", tp.EffectiveSessionProvider)
+		}
+		if calls := actual.SnapshotCalls(); len(calls) != 0 {
+			t.Fatalf("runtime calls during resolution = %#v, want none", calls)
+		}
+	})
+
+	t.Run("actual unattesting provider fails at the owning boundary before launch", func(t *testing.T) {
+		t.Setenv("GC_SESSION", "pack-isolating-runtime")
+		actual := runtime.NewFake()
+		params, agent := newFixture(t, "tmux", actual)
+		_, err := resolveTemplatePrepared(params, agent, agent.QualifiedName(), nil)
+		if err == nil || !strings.Contains(err.Error(), "cannot attest project hook isolation") {
+			t.Fatalf("resolveTemplatePrepared error = %v, want actual-provider attestation failure", err)
+		}
+		if calls := actual.SnapshotCalls(); len(calls) != 0 {
+			t.Fatalf("runtime calls before attestation failure = %#v, want none", calls)
+		}
+	})
 }
 
 func TestResolveTemplateUsesWorkDirWithoutChangingRigIdentity(t *testing.T) {

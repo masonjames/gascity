@@ -24,3 +24,28 @@ func TestDispatchHoldLabelsMatchCanonicalHoldValues(t *testing.T) {
 		}
 	}
 }
+
+func TestHasDispatchHoldLabel(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		labels []string
+		want   bool
+	}{
+		{name: "none"},
+		{name: "mayor", labels: []string{HoldMayorLabel}, want: true},
+		{name: "external", labels: []string{HoldExternalLabel}, want: true},
+		{name: "both", labels: []string{HoldMayorLabel, HoldExternalLabel}, want: true},
+		{name: "unrelated", labels: []string{"priority:high", "human"}},
+		{name: "retired hold spelling", labels: []string{"on-hold"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := HasDispatchHoldLabel(tt.labels); got != tt.want {
+				t.Fatalf("HasDispatchHoldLabel(%v) = %v, want %v", tt.labels, got, tt.want)
+			}
+		})
+	}
+}

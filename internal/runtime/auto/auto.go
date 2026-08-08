@@ -25,14 +25,20 @@ type Provider struct {
 }
 
 var (
-	_ runtime.Provider                      = (*Provider)(nil)
-	_ runtime.DeadRuntimeSessionChecker     = (*Provider)(nil)
-	_ runtime.InteractionProvider           = (*Provider)(nil)
-	_ runtime.InterruptBoundaryWaitProvider = (*Provider)(nil)
-	_ runtime.InterruptedTurnResetProvider  = (*Provider)(nil)
-	_ runtime.TransportCapabilityProvider   = (*Provider)(nil)
-	_ runtime.RelaunchProvider              = (*Provider)(nil)
-	_ runtime.LivenessObserver              = (*Provider)(nil)
+	_ runtime.Provider                               = (*Provider)(nil)
+	_ runtime.DeadRuntimeSessionChecker              = (*Provider)(nil)
+	_ runtime.InteractionProvider                    = (*Provider)(nil)
+	_ runtime.InterruptBoundaryWaitProvider          = (*Provider)(nil)
+	_ runtime.InterruptedTurnResetProvider           = (*Provider)(nil)
+	_ runtime.ProjectHookIsolationCapabilityProvider = (*Provider)(nil)
+	_ runtime.TransportCapabilityProvider            = (*Provider)(nil)
+	_ runtime.RelaunchProvider                       = (*Provider)(nil)
+	_ runtime.LivenessObserver                       = (*Provider)(nil)
+	_ runtime.ExactIncarnationProvider               = (*Provider)(nil)
+	_ runtime.ExactIncarnationMetadataProvider       = (*Provider)(nil)
+	_ runtime.ExactIncarnationStartResolver          = (*Provider)(nil)
+	_ runtime.ExactIncarnationObserver               = (*Provider)(nil)
+	_ runtime.ExactIncarnationPeekProvider           = (*Provider)(nil)
 )
 
 // New creates a composite provider. defaultSP handles sessions not
@@ -71,6 +77,38 @@ func (p *Provider) route(name string) runtime.Provider {
 	return p.defaultSP
 }
 
+func (p *Provider) exactTarget(expected runtime.Incarnation) runtime.Provider {
+	if expected.Transport == "acp" {
+		return p.acpSP
+	}
+	return p.defaultSP
+}
+
+// launchTarget returns the backend that will perform a launch mutation and
+// enforces any filesystem-isolation capability carried by the launch config.
+// Resolve this from the actual name route, not only the configured transport:
+// recovered routes can differ from the current template selection.
+func (p *Provider) launchTarget(name string, cfg runtime.Config) (runtime.Provider, error) {
+	p.mu.RLock()
+	isACP := p.routes[name]
+	p.mu.RUnlock()
+	target := p.defaultSP
+	transport := ""
+	label := "default"
+	if isACP {
+		target = p.acpSP
+		transport = "acp"
+		label = "acp"
+	}
+	if cfg.ProjectHooksForbidden {
+		provider, ok := target.(runtime.ProjectHookIsolationCapabilityProvider)
+		if !ok || !provider.SupportsProjectHookIsolation(transport) {
+			return nil, fmt.Errorf("session %q: routed %s provider cannot attest project hook isolation", name, label)
+		}
+	}
+	return target, nil
+}
+
 // SupportsTransport reports whether this provider can route the requested
 // session transport.
 func (p *Provider) SupportsTransport(transport string) bool {
@@ -81,6 +119,20 @@ func (p *Provider) SupportsTransport(transport string) bool {
 		return provider.SupportsTransport(transport)
 	}
 	return false
+}
+
+// SupportsProjectHookIsolation forwards the attestation query only to the
+// backend a launch operation uses for the selected transport. ACP selections
+// route to acpSP; every other supported transport routes to defaultSP.
+func (p *Provider) SupportsProjectHookIsolation(transport string) bool {
+	var target runtime.Provider
+	if transport == "acp" {
+		target = p.acpSP
+	} else {
+		target = p.defaultSP
+	}
+	provider, ok := target.(runtime.ProjectHookIsolationCapabilityProvider)
+	return ok && provider.SupportsProjectHookIsolation(transport)
 }
 
 // DetectTransport reports the backend currently hosting the named session.
@@ -97,7 +149,39 @@ func (p *Provider) DetectTransport(name string) string {
 
 // Start delegates to the routed backend.
 func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) error {
-	return p.route(name).Start(ctx, name, cfg)
+	target, err := p.launchTarget(name, cfg)
+	if err != nil {
+		return err
+	}
+	return target.Start(ctx, name, cfg)
+}
+
+// ResolveExactIncarnationStart binds a fresh exact start to the backend named
+// by the intended transport before RouteACP or any provider effect occurs.
+func (p *Provider) ResolveExactIncarnationStart(name, transport string, cfg runtime.Config) (runtime.ExactIncarnationStart, error) {
+	target := p.defaultSP
+	label := "default"
+	if transport == "acp" {
+		target = p.acpSP
+		label = "acp"
+	}
+	if cfg.ProjectHooksForbidden {
+		isolation, ok := target.(runtime.ProjectHookIsolationCapabilityProvider)
+		if !ok || !isolation.SupportsProjectHookIsolation(transport) {
+			return nil, fmt.Errorf("session %q: routed %s provider cannot attest project hook isolation", name, label)
+		}
+	}
+	if _, ok := target.(runtime.ExactIncarnationProvider); !ok {
+		return nil, fmt.Errorf("%w: session %q routed %s provider cannot contain an exact fresh start", runtime.ErrExactIncarnationUnsupported, name, label)
+	}
+	if _, ok := target.(runtime.ExactIncarnationObserver); !ok {
+		return nil, fmt.Errorf("%w: session %q routed %s provider cannot attest an exact fresh start", runtime.ErrExactIncarnationUnsupported, name, label)
+	}
+	start, err := runtime.ResolveExactIncarnationStart(target, name, transport, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return start, nil
 }
 
 // Stop delegates to the routed backend and cleans up the route entry
@@ -284,7 +368,11 @@ func (p *Provider) ResetInterruptedTurn(ctx context.Context, name string) error 
 // supports one, so the reconciler's RelaunchProvider type-assert is not masked
 // by the auto router.
 func (p *Provider) Relaunch(ctx context.Context, name string, cfg runtime.Config) error {
-	if rp, ok := p.route(name).(runtime.RelaunchProvider); ok {
+	target, err := p.launchTarget(name, cfg)
+	if err != nil {
+		return err
+	}
+	if rp, ok := target.(runtime.RelaunchProvider); ok {
 		return rp.Relaunch(ctx, name, cfg)
 	}
 	return runtime.ErrRelaunchUnsupported
@@ -370,7 +458,84 @@ func (p *Provider) SendKeys(name string, keys ...string) error {
 
 // RunLive delegates to the routed backend.
 func (p *Provider) RunLive(name string, cfg runtime.Config) error {
-	return p.route(name).RunLive(name, cfg)
+	target, err := p.launchTarget(name, cfg)
+	if err != nil {
+		return err
+	}
+	return target.RunLive(name, cfg)
+}
+
+// RunLiveExact forwards an exact-incarnation live operation only to the
+// backend selected by the captured transport, independent of mutable routes.
+func (p *Provider) RunLiveExact(name string, expected runtime.Incarnation, cfg runtime.Config) error {
+	target := p.exactTarget(expected)
+	if cfg.ProjectHooksForbidden {
+		isolation, ok := target.(runtime.ProjectHookIsolationCapabilityProvider)
+		if !ok || !isolation.SupportsProjectHookIsolation(expected.Transport) {
+			return fmt.Errorf("%w: session %q exact provider cannot attest project hook isolation", runtime.ErrExactIncarnationUnsupported, name)
+		}
+	}
+	exact, ok := target.(runtime.ExactIncarnationProvider)
+	if !ok {
+		return fmt.Errorf("%w: session %q routed provider does not support exact-incarnation live operations", runtime.ErrExactIncarnationUnsupported, name)
+	}
+	return exact.RunLiveExact(name, expected, cfg)
+}
+
+// NudgeExact forwards exact-incarnation delivery only to the routed backend.
+func (p *Provider) NudgeExact(name string, expected runtime.Incarnation, content []runtime.ContentBlock) error {
+	exact, ok := p.exactTarget(expected).(runtime.ExactIncarnationProvider)
+	if !ok {
+		return fmt.Errorf("%w: session %q routed provider does not support exact-incarnation nudges", runtime.ErrExactIncarnationUnsupported, name)
+	}
+	return exact.NudgeExact(name, expected, content)
+}
+
+// StopExact forwards exact-incarnation teardown only to the routed backend.
+// It does not use Stop's cross-backend fallback or clear a name route that may
+// already belong to a replacement incarnation.
+func (p *Provider) StopExact(name string, expected runtime.Incarnation) error {
+	exact, ok := p.exactTarget(expected).(runtime.ExactIncarnationProvider)
+	if !ok {
+		return fmt.Errorf("%w: session %q routed provider does not support exact-incarnation stops", runtime.ErrExactIncarnationUnsupported, name)
+	}
+	return exact.StopExact(name, expected)
+}
+
+// ObserveExact forwards exact-incarnation observation only to the routed backend.
+func (p *Provider) ObserveExact(name string, expected runtime.Incarnation, processNames []string) (runtime.IncarnationObservation, error) {
+	observer, ok := p.exactTarget(expected).(runtime.ExactIncarnationObserver)
+	if !ok {
+		return runtime.IncarnationObservation{}, fmt.Errorf("%w: session %q routed provider does not support exact-incarnation observation", runtime.ErrExactIncarnationUnsupported, name)
+	}
+	return observer.ObserveExact(name, expected, processNames)
+}
+
+// PeekExact forwards exact-incarnation output reads only to the routed backend.
+func (p *Provider) PeekExact(name string, expected runtime.Incarnation, lines int) (string, error) {
+	peeker, ok := p.exactTarget(expected).(runtime.ExactIncarnationPeekProvider)
+	if !ok {
+		return "", fmt.Errorf("%w: session %q routed provider does not support exact-incarnation peek", runtime.ErrExactIncarnationUnsupported, name)
+	}
+	return peeker.PeekExact(name, expected, lines)
+}
+
+// SetMetaExact forwards exact-incarnation metadata only to the routed backend.
+func (p *Provider) SetMetaExact(name string, expected runtime.Incarnation, key, value string) error {
+	exact, ok := p.exactTarget(expected).(runtime.ExactIncarnationMetadataProvider)
+	if !ok {
+		return fmt.Errorf("%w: session %q routed provider does not support exact-incarnation metadata", runtime.ErrExactIncarnationUnsupported, name)
+	}
+	return exact.SetMetaExact(name, expected, key, value)
+}
+
+// RemoveMetaExact forwards exact-incarnation metadata removal only to the routed backend.
+func (p *Provider) RemoveMetaExact(name string, expected runtime.Incarnation, key string) error {
+	exact, ok := p.exactTarget(expected).(runtime.ExactIncarnationMetadataProvider)
+	if !ok {
+		return fmt.Errorf("%w: session %q routed provider does not support exact-incarnation metadata", runtime.ErrExactIncarnationUnsupported, name)
+	}
+	return exact.RemoveMetaExact(name, expected, key)
 }
 
 // Capabilities returns the intersection of both backends' capabilities.

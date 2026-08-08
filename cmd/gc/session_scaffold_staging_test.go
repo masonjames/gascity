@@ -13,6 +13,7 @@ import (
 	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/runtime"
+	sessionpkg "github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/session/sessiontest"
 	"github.com/gastownhall/gascity/internal/shellquote"
 )
@@ -92,7 +93,7 @@ func TestPrepareStartCandidateStagesScaffoldInResolvedTaskWorkDirWhenCWDIsShared
 				MaxActiveSessions: intPtrScaffoldRegression(2),
 			},
 		},
-	}, nil, store, &clock.Fake{Time: time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)}, io.Discard, nil)
+	}, nil, store, beads.WorkStore{Store: store}, &clock.Fake{Time: time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)}, io.Discard, nil)
 	if err != nil {
 		t.Fatalf("prepareStartCandidateForCity: %v", err)
 	}
@@ -138,6 +139,87 @@ func TestPrepareStartCandidateStagesScaffoldInResolvedTaskWorkDirWhenCWDIsShared
 	} else if !os.IsNotExist(err) {
 		t.Fatalf("stat leaked workdir %q: %v", leakedWorkDir, err)
 	}
+}
+
+func TestBuildPreparedStartProjectHooksForbidRejectsWorkDirOverride(t *testing.T) {
+	root := t.TempDir()
+	canonicalRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatalf("canonicalize temp root: %v", err)
+	}
+	attested := filepath.Join(canonicalRoot, "bootstrap", "worker-1")
+	override := filepath.Join(canonicalRoot, "task-worktree")
+	if err := os.MkdirAll(attested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(override, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	isolationHome := filepath.Join(filepath.Dir(attested), ".worker-1-home")
+	isolationEnv := map[string]string{
+		"HOME":       isolationHome,
+		"CODEX_HOME": filepath.Join(isolationHome, ".codex"),
+		"PATH":       os.Getenv("PATH"),
+	}
+	for _, key := range runtime.ProjectHookIsolationWithheldEnvKeys() {
+		isolationEnv[key] = ""
+	}
+	base := startCandidate{
+		info: sessionpkg.Info{
+			SessionNameMetadata: "worker-1",
+			InstanceToken:       "fixture-instance-token",
+			Generation:          "1",
+			ContinuationEpoch:   "1",
+		},
+		tp: TemplateParams{
+			SessionName:  "worker-1",
+			TemplateName: "worker",
+			Command:      "codex --disable hooks",
+			Env:          isolationEnv,
+			WorkDir:      attested,
+			Hints: agent.StartupHints{
+				ProviderName:          "codex",
+				ProjectHooksForbidden: true,
+			},
+		},
+	}
+
+	t.Run("assigned task override", func(t *testing.T) {
+		_, _, err := buildPreparedStartWithWorkDirResolver(base, root, &config.City{}, nil, func(startCandidate, *config.City) string {
+			return override
+		})
+		if err == nil || !strings.Contains(err.Error(), "project hook isolation") {
+			t.Fatalf("error = %v, want project hook isolation refusal", err)
+		}
+	})
+
+	t.Run("session metadata override", func(t *testing.T) {
+		candidate := base
+		candidate.info.WorkDir = override
+		_, _, err := buildPreparedStartWithWorkDirResolver(candidate, root, &config.City{}, nil, nil)
+		if err == nil || !strings.Contains(err.Error(), "project hook isolation") {
+			t.Fatalf("error = %v, want project hook isolation refusal", err)
+		}
+	})
+
+	t.Run("canonical alias of attested path", func(t *testing.T) {
+		alias := filepath.Join(root, "bootstrap-alias")
+		if err := os.Symlink(filepath.Dir(attested), alias); err != nil {
+			t.Fatal(err)
+		}
+		candidate := base
+		candidate.info.WorkDir = filepath.Join(alias, filepath.Base(attested))
+		prepared, _, err := buildPreparedStartWithWorkDirResolver(candidate, root, &config.City{}, nil, nil)
+		if err != nil {
+			t.Fatalf("canonical alias rejected: %v", err)
+		}
+		if prepared.cfg.WorkDir != attested {
+			t.Fatalf("prepared workdir = %q, want attested canonical path %q", prepared.cfg.WorkDir, attested)
+		}
+		if err := runtime.PreflightSessionWorkDir(prepared.cfg); err != nil {
+			t.Fatalf("runtime preflight rejected preserved attested workdir: %v", err)
+		}
+	})
 }
 
 func writeScaffoldFixture(t *testing.T, path, content string) {

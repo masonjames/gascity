@@ -342,6 +342,28 @@ func normalizeNonExpandingPoolSessionInfo(
 	cfgAgent *config.Agent,
 	info session.Info,
 ) (session.Info, error) {
+	return normalizeNonExpandingPoolSessionInfoLocked(bp, cfgAgent, info)
+}
+
+// normalizeNonExpandingPoolSessionInfoLocked is the lock-aware normalization
+// core. It deliberately does not acquire the per-session mutation lock: strict
+// reuse holds that non-reentrant lock across its persisted reload, guarded work
+// claim, normalization, and trigger bind. Legacy/inherit callers retain their
+// existing wrapper behavior above.
+func normalizeNonExpandingPoolSessionInfoLocked(
+	bp *agentBuildParams,
+	cfgAgent *config.Agent,
+	info session.Info,
+) (session.Info, error) {
+	return normalizeNonExpandingPoolSessionInfoWithPersistedLocked(bp, cfgAgent, info, nil)
+}
+
+func normalizeNonExpandingPoolSessionInfoWithPersistedLocked(
+	bp *agentBuildParams,
+	cfgAgent *config.Agent,
+	info session.Info,
+	expectedPersisted *session.PersistedResponse,
+) (session.Info, error) {
 	if bp == nil || bp.beadStore == nil || !cfgAgent.UsesCanonicalSingletonPoolIdentity() || isManualSessionInfoForAgent(info, cfgAgent) || isNamedSessionInfo(info) || info.ID == "" {
 		return info, nil
 	}
@@ -393,12 +415,23 @@ func normalizeNonExpandingPoolSessionInfo(
 	}
 
 	apply := func() error {
-		return bp.beadStore.Update(info.ID, beads.UpdateOpts{
+		opts := beads.UpdateOpts{
 			Title:        title,
 			Metadata:     metadata,
 			Labels:       addLabels,
 			RemoveLabels: removeLabels,
-		})
+		}
+		if expectedPersisted == nil {
+			return bp.beadStore.Update(info.ID, opts)
+		}
+		if err := session.RequireNoConditionalMutationLease(*expectedPersisted); err != nil {
+			return err
+		}
+		writer, ok := beads.ConditionalWriterFor(bp.beadStore)
+		if !ok {
+			return beads.ErrConditionalWriteUnsupported
+		}
+		return writer.UpdateIfMatch(info.ID, expectedPersisted.Revision, opts)
 	}
 	if aliasNeedsUpdate {
 		if err := session.WithCitySessionAliasLock(bp.cityPath, canonical, func() error {
@@ -450,6 +483,26 @@ func recordDeferredNonExpandingPoolAliasConflictInfo(
 	cfgAgent *config.Agent,
 	info session.Info,
 ) (session.Info, error) {
+	return recordDeferredNonExpandingPoolAliasConflictInfoLocked(bp, cfgAgent, info)
+}
+
+// recordDeferredNonExpandingPoolAliasConflictInfoLocked is the lock-aware
+// deferred-alias write core used by strict normalization without attempting to
+// reacquire the same session mutation lock.
+func recordDeferredNonExpandingPoolAliasConflictInfoLocked(
+	bp *agentBuildParams,
+	cfgAgent *config.Agent,
+	info session.Info,
+) (session.Info, error) {
+	return recordDeferredNonExpandingPoolAliasConflictInfoWithPersistedLocked(bp, cfgAgent, info, nil)
+}
+
+func recordDeferredNonExpandingPoolAliasConflictInfoWithPersistedLocked(
+	bp *agentBuildParams,
+	cfgAgent *config.Agent,
+	info session.Info,
+	expectedPersisted *session.PersistedResponse,
+) (session.Info, error) {
 	canonical := cfgAgent.QualifiedName()
 	count := 0
 	if existing, err := strconv.Atoi(strings.TrimSpace(info.PoolAliasConflictCount)); err == nil && existing > 0 {
@@ -460,7 +513,20 @@ func recordDeferredNonExpandingPoolAliasConflictInfo(
 	metadata[poolAliasConflictCountMetadataKey] = strconv.Itoa(count + 1)
 	metadata[poolAliasConflictAtMetadataKey] = time.Now().UTC().Format(time.RFC3339)
 	if bp != nil && bp.beadStore != nil && info.ID != "" {
-		if err := bp.beadStore.Update(info.ID, beads.UpdateOpts{Metadata: metadata}); err != nil {
+		var err error
+		if expectedPersisted == nil {
+			err = bp.beadStore.Update(info.ID, beads.UpdateOpts{Metadata: metadata})
+		} else {
+			err = session.RequireNoConditionalMutationLease(*expectedPersisted)
+			if err == nil {
+				if writer, ok := beads.ConditionalWriterFor(bp.beadStore); ok {
+					err = writer.UpdateIfMatch(info.ID, expectedPersisted.Revision, beads.UpdateOpts{Metadata: metadata})
+				} else {
+					err = beads.ErrConditionalWriteUnsupported
+				}
+			}
+		}
+		if err != nil {
 			return info, fmt.Errorf("recording deferred singleton pool alias conflict for bead %s: %w", info.ID, err)
 		}
 	}
@@ -476,7 +542,36 @@ func normalizeNonExpandingPoolSessionInfoForSelection(
 	cfgAgent *config.Agent,
 	info session.Info,
 ) (session.Info, error) {
-	folded, err := normalizeNonExpandingPoolSessionInfo(bp, cfgAgent, info)
+	return normalizeNonExpandingPoolSessionInfoForSelectionLocked(bp, cfgAgent, info)
+}
+
+// normalizeNonExpandingPoolSessionInfoForSelectionLocked is the lock-aware
+// selection core. Strict reuse calls it while holding SessionMutationLock;
+// inherit compatibility continues through the wrapper above.
+func normalizeNonExpandingPoolSessionInfoForSelectionLocked(
+	bp *agentBuildParams,
+	cfgAgent *config.Agent,
+	info session.Info,
+) (session.Info, error) {
+	return normalizeNonExpandingPoolSessionInfoForSelectionWithPersistedLocked(bp, cfgAgent, info, nil)
+}
+
+func normalizeNonExpandingPoolSessionInfoForSelectionAtPersistedLocked(
+	bp *agentBuildParams,
+	cfgAgent *config.Agent,
+	info session.Info,
+	expectedPersisted session.PersistedResponse,
+) (session.Info, error) {
+	return normalizeNonExpandingPoolSessionInfoForSelectionWithPersistedLocked(bp, cfgAgent, info, &expectedPersisted)
+}
+
+func normalizeNonExpandingPoolSessionInfoForSelectionWithPersistedLocked(
+	bp *agentBuildParams,
+	cfgAgent *config.Agent,
+	info session.Info,
+	expectedPersisted *session.PersistedResponse,
+) (session.Info, error) {
+	folded, err := normalizeNonExpandingPoolSessionInfoWithPersistedLocked(bp, cfgAgent, info, expectedPersisted)
 	if err == nil {
 		return folded, nil
 	}
@@ -486,5 +581,5 @@ func normalizeNonExpandingPoolSessionInfoForSelection(
 	if bp != nil && bp.stderr != nil {
 		fmt.Fprintf(bp.stderr, "buildDesiredState: pool %q: deferring singleton pool identity normalization for bead %s: %v\n", cfgAgent.QualifiedName(), info.ID, err) //nolint:errcheck
 	}
-	return recordDeferredNonExpandingPoolAliasConflictInfo(bp, cfgAgent, info)
+	return recordDeferredNonExpandingPoolAliasConflictInfoWithPersistedLocked(bp, cfgAgent, info, expectedPersisted)
 }

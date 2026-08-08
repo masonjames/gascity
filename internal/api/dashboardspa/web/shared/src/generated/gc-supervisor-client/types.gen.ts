@@ -93,6 +93,7 @@ export type AgentPatch = {
     Pool: PoolOverride;
     PreStart: Array<string> | null;
     PreStartAppend: Array<string> | null;
+    ProjectHooks: string | null;
     PromptTemplate: string | null;
     Provider: string | null;
     ResumeCommand: string | null;

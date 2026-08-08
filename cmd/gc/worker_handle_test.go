@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/convergence"
@@ -19,6 +21,15 @@ import (
 type failingSessionLookupStore struct {
 	beads.Store
 	err error
+}
+
+type projectHookIsolationWorkerProvider struct {
+	*runtime.Fake
+	supported bool
+}
+
+func (p *projectHookIsolationWorkerProvider) SupportsProjectHookIsolation(transport string) bool {
+	return p != nil && p.supported && (strings.TrimSpace(transport) == "" || strings.TrimSpace(transport) == config.SessionTransportTmux)
 }
 
 func (s *failingSessionLookupStore) Get(string) (beads.Bead, error) {
@@ -2501,6 +2512,263 @@ func TestResolvedWorkerSessionConfigStagesProviderOverlayForRigBasePiProvider(t 
 	}
 	if slots := runtime.OverlayProviderNames(sessionCfg.Runtime.Hints); len(slots) == 0 {
 		t.Fatal("runtime.OverlayProviderNames(create Hints) is empty; per-provider overlay would never stage")
+	}
+}
+
+func TestWorkerDirectCreateProjectHooksForbidRequiresAttestingProvider(t *testing.T) {
+	cityDir := t.TempDir()
+	workDir := t.TempDir()
+	store := beads.NewMemStore()
+	resolved := &config.ResolvedProvider{Name: "stub", Command: "/bin/echo"}
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name:         "worker",
+			Provider:     "stub",
+			ProjectHooks: config.ProjectHooksForbid,
+			WorkDir:      workDir,
+		}},
+		Providers: map[string]config.ProviderSpec{
+			"stub": {Command: "/bin/echo"},
+		},
+	}
+
+	t.Run("attested provider alone cannot authorize direct strict start", func(t *testing.T) {
+		sp := &projectHookIsolationWorkerProvider{Fake: runtime.NewFake(), supported: true}
+		handle, err := newWorkerSessionHandleForResolvedRuntimeWithConfig(
+			cityDir, store, sp, cfg,
+			"worker", "", "worker", "Worker", "/bin/echo", "stub", workDir, config.SessionTransportTmux,
+			resolved, nil,
+		)
+		if err != nil {
+			t.Fatalf("newWorkerSessionHandleForResolvedRuntimeWithConfig: %v", err)
+		}
+		if _, err := handle.Create(context.Background(), worker.CreateModeStarted); !errors.Is(err, worker.ErrLaunchUnauthorized) {
+			t.Fatalf("Create(started) error = %v, want ErrLaunchUnauthorized without persisted trigger authority", err)
+		}
+		if calls := sp.SnapshotCalls(); len(calls) != 0 {
+			t.Fatalf("provider calls = %+v, want none before persisted trigger authority", calls)
+		}
+	})
+
+	t.Run("unattested provider fails before start", func(t *testing.T) {
+		sp := runtime.NewFake()
+		_, err := newWorkerSessionHandleForResolvedRuntimeWithConfig(
+			cityDir, beads.NewMemStore(), sp, cfg,
+			"worker-unsupported", "", "worker", "Worker", "/bin/echo", "stub", workDir, config.SessionTransportTmux,
+			resolved, nil,
+		)
+		if err == nil || !strings.Contains(err.Error(), "cannot attest project hook isolation") {
+			t.Fatalf("error = %v, want project-hook-isolation attestation failure", err)
+		}
+		if len(sp.Calls) != 0 {
+			t.Fatalf("runtime calls = %#v, want none", sp.Calls)
+		}
+	})
+}
+
+func TestWorkerStoredSessionResumeProjectHooksForbidRequiresAttestingProvider(t *testing.T) {
+	cityDir := t.TempDir()
+	workDir := t.TempDir()
+	maxActive := 1
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name:              "worker",
+			Provider:          "codex",
+			ProjectHooks:      config.ProjectHooksForbid,
+			WorkDir:           workDir,
+			MaxActiveSessions: &maxActive,
+		}},
+		Providers: map[string]config.ProviderSpec{
+			"codex": {Command: "codex", PathCheck: "true"},
+		},
+	}
+
+	createStored := func(t *testing.T, store beads.Store) session.Info {
+		t.Helper()
+		mgr := newSessionManagerWithConfig(cityDir, store, runtime.NewFake(), cfg)
+		info, err := mgr.CreateSession(context.Background(), session.CreateOptions{
+			BeadOnly:  true,
+			Template:  "worker",
+			Title:     "Worker",
+			Command:   "codex",
+			WorkDir:   workDir,
+			Provider:  "codex",
+			Transport: config.SessionTransportTmux,
+			ExtraMeta: map[string]string{
+				beadmeta.TriggerBeadIDMetadataKey:       "work-exact",
+				beadmeta.TriggerBeadStoreRefMetadataKey: "city:test-city",
+			},
+		})
+		if err != nil {
+			t.Fatalf("CreateSession(bead-only): %v", err)
+		}
+		return info
+	}
+
+	t.Run("stale persisted cwd fails before provider mutation", func(t *testing.T) {
+		store := beads.NewMemStore()
+		mgr := newSessionManagerWithConfig(cityDir, store, runtime.NewFake(), cfg)
+		info, err := mgr.CreateSession(context.Background(), session.CreateOptions{
+			BeadOnly:  true,
+			Template:  "worker",
+			Title:     "Worker",
+			Command:   "codex",
+			WorkDir:   cityDir,
+			Provider:  "codex",
+			Transport: config.SessionTransportTmux,
+			ExtraMeta: map[string]string{
+				beadmeta.TriggerBeadIDMetadataKey:       "work-exact",
+				beadmeta.TriggerBeadStoreRefMetadataKey: "city:test-city",
+			},
+		})
+		if err != nil {
+			t.Fatalf("CreateSession(bead-only): %v", err)
+		}
+		sp := &projectHookIsolationWorkerProvider{Fake: runtime.NewFake(), supported: true}
+		_, err = workerHandleForSessionWithConfig(cityDir, store, sp, cfg, info.ID)
+		if err == nil || !strings.Contains(err.Error(), "differs from current attested work_dir") {
+			t.Fatalf("workerHandleForSessionWithConfig error = %v, want stale cwd refusal", err)
+		}
+		if calls := sp.SnapshotCalls(); len(calls) != 0 {
+			t.Fatalf("runtime calls = %#v, want none before cwd attestation", calls)
+		}
+	})
+
+	t.Run("attested tmux resume carries policy", func(t *testing.T) {
+		store := beads.NewMemStore()
+		info := createStored(t, store)
+		sp := &projectHookIsolationWorkerProvider{Fake: runtime.NewFake(), supported: true}
+		handle, err := workerHandleForSessionWithConfig(cityDir, store, sp, cfg, info.ID)
+		if err != nil {
+			t.Fatalf("workerHandleForSessionWithConfig: %v", err)
+		}
+		if err := handle.Start(context.Background()); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		start := sp.LastStartConfig(info.SessionName)
+		if start == nil {
+			t.Fatalf("LastStartConfig(%q) = nil", info.SessionName)
+		}
+		if !start.ProjectHooksForbidden {
+			t.Fatal("ProjectHooksForbidden = false, want true")
+		}
+	})
+
+	t.Run("unattested provider fails before start", func(t *testing.T) {
+		store := beads.NewMemStore()
+		info := createStored(t, store)
+		sp := runtime.NewFake()
+		_, err := workerHandleForSessionWithConfig(cityDir, store, sp, cfg, info.ID)
+		if err == nil || !strings.Contains(err.Error(), "cannot attest project hook isolation") {
+			t.Fatalf("error = %v, want project-hook-isolation attestation failure", err)
+		}
+		if len(sp.Calls) != 0 {
+			t.Fatalf("runtime calls = %#v, want none", sp.Calls)
+		}
+	})
+}
+
+func TestWorkerStoredPoolInstanceResumeProjectHooksForbidUsesResolvedAgentPolicy(t *testing.T) {
+	cityDir := t.TempDir()
+	externalRoot := t.TempDir()
+	maxActive := 2
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name:              "worker",
+			Dir:               "rig",
+			Provider:          "codex",
+			ProjectHooks:      config.ProjectHooksForbid,
+			MaxActiveSessions: &maxActive,
+			WorkDir:           filepath.Join(externalRoot, "{{.Agent}}"),
+		}},
+		Providers: map[string]config.ProviderSpec{
+			"codex": {Command: "codex", PathCheck: "true"},
+		},
+	}
+
+	createStored := func(t *testing.T, template string) (beads.Store, session.Info) {
+		t.Helper()
+		resolvedAgent, ok := resolveWorkerConfigAgent(cfg, template)
+		if !ok {
+			t.Fatalf("resolveWorkerConfigAgent(%q) = false", template)
+		}
+		workDir, err := resolveConfiguredWorkDir(
+			cityDir,
+			cfg.EffectiveCityName(),
+			resolvedAgent.QualifiedName(),
+			&resolvedAgent,
+			cfg.Rigs,
+		)
+		if err != nil {
+			t.Fatalf("resolveConfiguredWorkDir(%q): %v", template, err)
+		}
+		store := beads.NewMemStore()
+		mgr := newSessionManagerWithConfig(cityDir, store, runtime.NewFake(), cfg)
+		info, err := mgr.CreateSession(context.Background(), session.CreateOptions{
+			BeadOnly:  true,
+			Template:  template,
+			Title:     "Worker",
+			Command:   "codex",
+			WorkDir:   workDir,
+			Provider:  "codex",
+			Transport: config.SessionTransportTmux,
+			ExtraMeta: map[string]string{
+				"agent_name":                            resolvedAgent.QualifiedName(),
+				"pool_managed":                          "true",
+				"pool_slot":                             "1",
+				beadmeta.TriggerBeadIDMetadataKey:       "work-exact",
+				beadmeta.TriggerBeadStoreRefMetadataKey: "city:test-city",
+			},
+		})
+		if err != nil {
+			t.Fatalf("CreateSession(bead-only): %v", err)
+		}
+		if info.Template != template {
+			t.Fatalf("stored Template = %q, want %q", info.Template, template)
+		}
+		return store, info
+	}
+
+	for _, template := range []string{"rig/worker-1", "worker-1"} {
+		t.Run(strings.ReplaceAll(template, "/", "_"), func(t *testing.T) {
+			resolvedAgent, ok := resolveWorkerConfigAgent(cfg, template)
+			if !ok || !resolvedAgent.ForbidsProjectHooks() {
+				t.Fatalf("resolveWorkerConfigAgent(%q) = {%+v, %v}, want forbidden configured instance", template, resolvedAgent, ok)
+			}
+			t.Run("unattested provider fails before start", func(t *testing.T) {
+				store, info := createStored(t, template)
+				sp := runtime.NewFake()
+				_, err := workerHandleForSessionWithConfig(cityDir, store, sp, cfg, info.ID)
+				if err == nil || !strings.Contains(err.Error(), "cannot attest project hook isolation") {
+					t.Fatalf("error = %v, want project-hook-isolation attestation failure", err)
+				}
+				if len(sp.Calls) != 0 {
+					t.Fatalf("runtime calls = %#v, want none", sp.Calls)
+				}
+			})
+
+			t.Run("attested resume carries policy", func(t *testing.T) {
+				store, info := createStored(t, template)
+				sp := &projectHookIsolationWorkerProvider{Fake: runtime.NewFake(), supported: true}
+				handle, err := workerHandleForSessionWithConfig(cityDir, store, sp, cfg, info.ID)
+				if err != nil {
+					t.Fatalf("workerHandleForSessionWithConfig: %v", err)
+				}
+				if err := handle.Start(context.Background()); err != nil {
+					t.Fatalf("Start: %v", err)
+				}
+				start := sp.LastStartConfig(info.SessionName)
+				if start == nil {
+					t.Fatalf("LastStartConfig(%q) = nil", info.SessionName)
+				}
+				if !start.ProjectHooksForbidden {
+					t.Fatal("ProjectHooksForbidden = false, want true")
+				}
+			})
+		})
 	}
 }
 

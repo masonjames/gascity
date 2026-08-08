@@ -58,7 +58,7 @@ func loadCityConfigFS(fs fsys.FS, tomlPath string, warningWriter ...io.Writer) (
 // forcing refresh work on every shell invocation. That means completion may
 // briefly reflect stale builtin-pack content after an upgrade until a normal
 // gc command refreshes the generated packs.
-func loadCityConfigWithoutBuiltinPackRefreshFS(fs fsys.FS, tomlPath string, warningWriter ...io.Writer) (*config.City, error) {
+func loadCityConfigWithoutBuiltinPackRefreshFS(fs fsys.FS, tomlPath string, warningWriter ...io.Writer) (*config.City, error) { //nolint:unparam // Explicit filesystem seam documents the no-refresh loader boundary.
 	cfg, prov, err := config.LoadWithIncludes(fs, tomlPath)
 	if err != nil {
 		return nil, err

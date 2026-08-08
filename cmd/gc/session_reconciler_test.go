@@ -5323,7 +5323,7 @@ func TestCachedSessionPeekRetriesAfterError(t *testing.T) {
 		t.Fatalf("Start(worker): %v", err)
 	}
 	sp.SetPeekOutput("worker", "You've hit your limit, Pro plan\n\n/rate-limit-options")
-	peek := cachedSessionPeek("", nil, sp, &config.City{}, "worker", nil)
+	peek := cachedSessionPeek("", nil, sp, &config.City{}, sessionpkg.Info{SessionNameMetadata: "worker"}, nil)
 
 	if output, err := peek(rateLimitPeekLines); err == nil {
 		t.Fatalf("first peek err = nil, output = %q; want transient error", output)
@@ -6838,7 +6838,7 @@ func TestResolvePreservedConfiguredNamedSessionTemplate_StoreOnlyClosedDuplicate
 	closedTwin.ID = "closed-twin"
 	closedTwin.Closed = true
 
-	preservedTP, err := resolvePreservedConfiguredNamedSessionTemplate(".", env.cfg.Workspace.Name, env.cfg, env.sp, env.store, []sessionpkg.Info{closedTwin, sessionInfo}, sessionInfo, env.clk, io.Discard)
+	preservedTP, err := resolvePreservedConfiguredNamedSessionTemplate(".", env.cfg.Workspace.Name, env.cfg, env.sp, env.store, beads.WorkStore{Store: env.store}, []sessionpkg.Info{closedTwin, sessionInfo}, sessionInfo, env.clk, io.Discard)
 	if err != nil {
 		t.Fatalf("resolve preserved named session: %v", err)
 	}
@@ -6866,7 +6866,7 @@ func TestReconcileSessionBeads_PreservedRunningNamedSessionStillIdleDrains(t *te
 		namedSessionModeMetadata:     "on_demand",
 	})
 	sessionInfo := env.sessionInfo(session.ID)
-	preservedTP, err := resolvePreservedConfiguredNamedSessionTemplate(".", env.cfg.Workspace.Name, env.cfg, env.sp, env.store, []sessionpkg.Info{sessionInfo}, sessionInfo, env.clk, io.Discard)
+	preservedTP, err := resolvePreservedConfiguredNamedSessionTemplate(".", env.cfg.Workspace.Name, env.cfg, env.sp, env.store, beads.WorkStore{Store: env.store}, []sessionpkg.Info{sessionInfo}, sessionInfo, env.clk, io.Discard)
 	if err != nil {
 		t.Fatalf("resolve preserved named session: %v", err)
 	}
@@ -7024,7 +7024,7 @@ func TestReconcileSessionBeads_PreservedRunningNamedSessionHonorsRestartRequest(
 		t.Fatalf("restart_requested = %q, want cleared", got.Metadata["restart_requested"])
 	}
 	if got.Metadata["started_config_hash"] != "" {
-		t.Fatalf("started_config_hash = %q, want cleared", got.Metadata["started_config_hash"])
+		t.Fatalf("started_config_hash = %q, want cleared; stderr=%q", got.Metadata["started_config_hash"], env.stderr.String())
 	}
 	if got.Metadata["continuation_reset_pending"] != "true" {
 		t.Fatalf("continuation_reset_pending = %q, want true", got.Metadata["continuation_reset_pending"])
@@ -10670,7 +10670,7 @@ func TestReconcileSessionBeads_BeadMetadataRestartRequestedWhenSessionDead(t *te
 		t.Fatalf("restart_requested = %q, want cleared", got.Metadata["restart_requested"])
 	}
 	if got.Metadata["started_config_hash"] != "" {
-		t.Fatalf("started_config_hash = %q, want cleared", got.Metadata["started_config_hash"])
+		t.Fatalf("started_config_hash = %q, want cleared; stderr=%q", got.Metadata["started_config_hash"], env.stderr.String())
 	}
 	if got.Metadata["continuation_reset_pending"] != "true" {
 		t.Fatalf("continuation_reset_pending = %q, want true", got.Metadata["continuation_reset_pending"])

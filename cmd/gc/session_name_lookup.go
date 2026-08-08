@@ -27,6 +27,60 @@ type poolSessionCreateIdentity struct {
 	Metadata  map[string]string
 }
 
+func preparePoolSessionCreateSpec(
+	template string,
+	now time.Time,
+	identity poolSessionCreateIdentity,
+	instanceToken string,
+	sessionName string,
+	explicitID string,
+) sessionpkg.CreateSpec {
+	agentName := strings.TrimSpace(identity.AgentName)
+	title := targetBasename(template)
+	if agentName == "" {
+		agentName = template
+	} else {
+		title = agentName
+	}
+	meta := map[string]string{
+		"template":                  template,
+		"agent_name":                agentName,
+		"state":                     string(sessionpkg.StateStartPending),
+		"pending_create_claim":      "true",
+		"pending_create_started_at": pendingCreateStartedAtNow(now),
+		"session_origin":            "ephemeral",
+		"generation":                "1",
+		"continuation_epoch":        "1",
+		"instance_token":            instanceToken,
+		"session_name":              sessionName,
+		poolManagedMetadataKey:      boolMetadata(true),
+	}
+	if alias := strings.TrimSpace(identity.Alias); alias != "" {
+		meta["alias"] = alias
+	}
+	if identity.Slot > 0 {
+		meta["pool_slot"] = strconv.Itoa(identity.Slot)
+	}
+	for key, value := range identity.Metadata {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		meta[key] = strings.TrimSpace(value)
+	}
+	// Durable canonical identity wins over any caller-supplied metadata.
+	meta[sessionpkg.CanonicalInstanceNameMetadata] = agentName
+	if identity.Slot > 0 {
+		meta[sessionpkg.CanonicalPoolSlotMetadata] = strconv.Itoa(identity.Slot)
+	}
+	return sessionpkg.CreateSpec{
+		ID:        explicitID,
+		Title:     title,
+		AgentName: agentName,
+		Metadata:  meta,
+	}
+}
+
 func isPoolManagedSessionBead(bead beads.Bead) bool {
 	if isEphemeralSessionBead(bead) {
 		return true
@@ -231,69 +285,22 @@ func createPoolSessionBeadWithAlias(
 		return sessionpkg.Info{}, err
 	}
 	instanceToken := sessionpkg.NewInstanceToken()
-	agentName := strings.TrimSpace(identity.AgentName)
-	title := targetBasename(template)
-	if agentName == "" {
-		agentName = template
-	} else {
-		title = agentName
-	}
 	explicitID := poolSessionExplicitBeadID(store, instanceToken)
 	sessionName := pendingPoolSessionName(template, instanceToken)
 	if explicitID != "" {
 		sessionName = PoolSessionName(template, explicitID)
 	}
-	meta := map[string]string{
-		"template":                  template,
-		"agent_name":                agentName,
-		"state":                     string(sessionpkg.StateStartPending),
-		"pending_create_claim":      "true",
-		"pending_create_started_at": pendingCreateStartedAtNow(now),
-		"session_origin":            "ephemeral",
-		"generation":                "1",
-		"continuation_epoch":        "1",
-		"instance_token":            instanceToken,
-		"session_name":              sessionName,
-		poolManagedMetadataKey:      boolMetadata(true),
-	}
-	if alias := strings.TrimSpace(identity.Alias); alias != "" {
-		meta["alias"] = alias
-	}
-	if identity.Slot > 0 {
-		meta["pool_slot"] = strconv.Itoa(identity.Slot)
-	}
-	for key, value := range identity.Metadata {
-		key = strings.TrimSpace(key)
-		if key == "" {
-			continue
-		}
-		meta[key] = strings.TrimSpace(value)
-	}
-	// Durable canonical-identity record (S19 Stage 2, WRITE-ONLY). Stamped AFTER
-	// the identity.Metadata copy so a caller-supplied metadata entry can never
-	// overwrite the config-resolved record — the canonical record is the one
-	// authoritative identity (S2-3 honesty). The identity here is pool-resolved
-	// config identity, so it is safe to stamp; agentName is non-empty. Slot is
-	// coupled to the name.
-	meta[sessionpkg.CanonicalInstanceNameMetadata] = agentName
-	if identity.Slot > 0 {
-		meta[sessionpkg.CanonicalPoolSlotMetadata] = strconv.Itoa(identity.Slot)
-	}
+	spec := preparePoolSessionCreateSpec(template, now, identity, instanceToken, sessionName, explicitID)
 	// CreateSessionInfo projects the just-created bead (no post-create store.Get),
 	// so the returned session_name derivation + fold below run over Info directly.
-	info, err := sessionFrontDoor(store).CreateSessionInfo(sessionpkg.CreateSpec{
-		ID:        explicitID,
-		Title:     title,
-		AgentName: agentName,
-		Metadata:  meta,
-	})
+	info, err := sessionFrontDoor(store).CreateSessionInfo(spec)
 	if err != nil {
 		return sessionpkg.Info{}, err
 	}
 	// S19 Stage 3 shadow: record the legacy canonical-identity stamp on the
 	// pool-create path now that the bead ID exists (no-op unless the shadow
 	// harness is enabled).
-	recordLegacyCompareWrites(info.ID, "poolSessionCreate", meta)
+	recordLegacyCompareWrites(info.ID, "poolSessionCreate", spec.Metadata)
 	sessionName, err = derivePoolSessionName(store, cfg, template, info.ID, resolvedTmuxAlias, sessionBeads)
 	if err != nil {
 		_ = sessionFrontDoor(store).CloseWithoutReason(info.ID)

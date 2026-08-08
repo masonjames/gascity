@@ -76,6 +76,10 @@ func carriedPoolRoute(b beads.Bead) string {
 // that collapses to "open" (gc-4zb). Blocked work is therefore excluded at the
 // snapshot, by the Live query below, and not here.
 func restoreCarriedWorkRoutes(store beads.Store) (int, error) {
+	return restoreCarriedWorkRoutesWithPredicate(store, nil)
+}
+
+func restoreCarriedWorkRoutesWithPredicate(store beads.Store, allow func(route string, store beads.Store) bool) (int, error) {
 	if store == nil {
 		return 0, nil
 	}
@@ -114,6 +118,9 @@ func restoreCarriedWorkRoutes(store beads.Store) (int, error) {
 	for _, b := range items {
 		route := carriedPoolRoute(b)
 		if route == "" {
+			continue
+		}
+		if allow != nil && !allow(route, store) {
 			continue
 		}
 		// Only re-route open, unassigned work: an assigned bead is already
@@ -173,7 +180,15 @@ func (cr *CityRuntime) recoverUnroutedWorkRoutes() {
 		if sc.store == nil {
 			continue
 		}
-		restored, err := restoreCarriedWorkRoutes(sc.store)
+		restored, err := restoreCarriedWorkRoutesWithPredicate(sc.store, func(route string, candidateStore beads.Store) bool {
+			return strictWorkMutationAuthorized(
+				cr.cfg,
+				route,
+				cr.sessionsBeadStore(),
+				cr.cityWorkStore(),
+				candidateStore,
+			)
+		})
 		if err != nil {
 			fmt.Fprintf(cr.stderr, "%s: route recovery (%s): %v\n", cr.logPrefix, sc.label, err) //nolint:errcheck // best-effort stderr
 		}

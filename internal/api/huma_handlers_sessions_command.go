@@ -17,7 +17,6 @@ import (
 	"github.com/gastownhall/gascity/internal/api/apierr"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
-	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/sessionlog"
 	"github.com/gastownhall/gascity/internal/worker"
@@ -161,6 +160,7 @@ func (s *Server) humaHandleSessionCreate(ctx context.Context, input *SessionCrea
 			s.emitSessionCreateFailed(reqID, "create_failed", cfgErr.Error())
 			return
 		}
+		resolvedCfg.Runtime.Hints.ProjectHooksForbidden = agentCfg.ForbidsProjectHooks()
 		handle, handleErr := s.newResolvedWorkerSessionHandle(store.Store, resolvedCfg)
 		if handleErr != nil {
 			s.emitSessionCreateFailed(reqID, "create_failed", handleErr.Error())
@@ -906,7 +906,7 @@ func (s *Server) humaHandleSessionKill(_ context.Context, input *SessionIDInput)
 
 // humaHandleSessionRespond is the Huma-typed handler for POST /v0/session/{id}/respond.
 
-func (s *Server) humaHandleSessionRespond(_ context.Context, input *SessionRespondInput) (*SessionRespondOutput, error) {
+func (s *Server) humaHandleSessionRespond(ctx context.Context, input *SessionRespondInput) (*SessionRespondOutput, error) {
 	store := s.state.SessionsBeadStore()
 	if store.Store == nil {
 		return nil, apierr.ServiceUnavailable.Msg("no bead store configured")
@@ -918,8 +918,11 @@ func (s *Server) humaHandleSessionRespond(_ context.Context, input *SessionRespo
 	}
 
 	// Huma validates Body.Action (minLength:1); no handler guard needed.
-	mgr := s.sessionManager(store.Store)
-	if err := mgr.Respond(id, runtime.InteractionResponse{
+	handle, err := s.workerHandleForSession(store.Store, id)
+	if err != nil {
+		return nil, humaSessionManagerError(err)
+	}
+	if err := handle.Respond(ctx, worker.InteractionResponse{
 		RequestID: input.Body.RequestID,
 		Action:    input.Body.Action,
 		Text:      input.Body.Text,
@@ -1019,6 +1022,10 @@ func (s *Server) humaHandleSessionWake(ctx context.Context, input *SessionIDInpu
 	if err != nil {
 		return nil, humaResolveError(err)
 	}
+	handle, err := s.workerHandleForSession(store.Store, id)
+	if err != nil {
+		return nil, humaSessionManagerError(err)
+	}
 
 	res, err := session.NewStore(store).WakeSession(id, time.Now().UTC(), session.WakeOpts{RejectClosed: true})
 	if err != nil {
@@ -1047,10 +1054,6 @@ func (s *Server) humaHandleSessionWake(ctx context.Context, input *SessionIDInpu
 	sessionName := res.Info.SessionNameMetadata
 	if sessionName != "" {
 		s.state.ClearCrashHistory(sessionName)
-	}
-	handle, err := s.workerHandleForSession(store.Store, id)
-	if err != nil {
-		return nil, humaSessionManagerError(err)
 	}
 	go func() {
 		if err := handle.Start(context.Background()); err != nil {

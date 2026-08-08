@@ -35,13 +35,14 @@ var instanceTokenReader = rand.Reader
 
 // Compile-time check.
 var (
-	_ runtime.Provider                      = (*Provider)(nil)
-	_ runtime.DeadRuntimeSessionChecker     = (*Provider)(nil)
-	_ runtime.ImmediateNudgeProvider        = (*Provider)(nil)
-	_ runtime.InterruptBoundaryWaitProvider = (*Provider)(nil)
-	_ runtime.InterruptedTurnResetProvider  = (*Provider)(nil)
-	_ runtime.ProcessTableScanner           = (*Provider)(nil)
-	_ runtime.ServerLifecycleProvider       = (*Provider)(nil)
+	_ runtime.Provider                               = (*Provider)(nil)
+	_ runtime.DeadRuntimeSessionChecker              = (*Provider)(nil)
+	_ runtime.ImmediateNudgeProvider                 = (*Provider)(nil)
+	_ runtime.InterruptBoundaryWaitProvider          = (*Provider)(nil)
+	_ runtime.InterruptedTurnResetProvider           = (*Provider)(nil)
+	_ runtime.ProcessTableScanner                    = (*Provider)(nil)
+	_ runtime.ProjectHookIsolationCapabilityProvider = (*Provider)(nil)
+	_ runtime.ServerLifecycleProvider                = (*Provider)(nil)
 )
 
 // NewProvider returns a [Provider] backed by a real tmux installation
@@ -62,13 +63,27 @@ func NewProviderWithConfig(cfg Config) *Provider {
 	}
 }
 
+// SupportsProjectHookIsolation reports that the local tmux provider performs
+// the final real-cwd project-hook preflight for its native transport.
+func (p *Provider) SupportsProjectHookIsolation(transport string) bool {
+	transport = strings.TrimSpace(transport)
+	return transport == "" || transport == "tmux"
+}
+
 // Start creates a new detached tmux session and performs a multi-step
 // startup sequence to ensure agent readiness. The sequence handles zombie
 // detection, command launch verification, permission warning dismissal,
 // and runtime readiness polling. Steps are conditional on Config fields;
 // an agent with no startup hints gets fire-and-forget.
 func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) error {
-	var err error
+	finalized, err := runtime.FinalizeProjectHookIsolatedConfig(cfg)
+	if err != nil {
+		return err
+	}
+	cfg = finalized
+	if err := runtime.MaterializeProjectHookIsolatedConfigRoots(cfg); err != nil {
+		return err
+	}
 	cfg.Env, err = ensureInstanceToken(cfg.Env)
 	if err != nil {
 		return fmt.Errorf("ensuring instance token: %w", err)
@@ -99,39 +114,7 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 }
 
 func stageStartFiles(cfg runtime.Config, warnings io.Writer) error {
-	// Copy overlays and CopyFiles before creating the tmux session.
-	// Local provider: files are on the same filesystem.
-	// V2 per-provider overlay support: StageProviderOverlayDir copies universal
-	// files then flattened per-provider/<provider>/ slots for ProviderOverlayName
-	// with ProviderName fallback, plus any InstallAgentHooks entries.
-	overlayProviders := runtime.EffectiveOverlayProviderNames(cfg)
-	if cfg.WorkDir != "" {
-		for _, od := range cfg.PackOverlayDirs {
-			if err := runtime.StageProviderOverlayDir(od, cfg.WorkDir, overlayProviders, warnings); err != nil {
-				return fmt.Errorf("copying pack overlay %s: %w", od, err)
-			}
-		}
-	}
-	// Agent-level overlay (highest priority; merges known settings files, overwrites others).
-	if cfg.OverlayDir != "" && cfg.WorkDir != "" {
-		if err := runtime.StageProviderOverlayDir(cfg.OverlayDir, cfg.WorkDir, overlayProviders, warnings); err != nil {
-			return fmt.Errorf("copying overlay %s: %w", cfg.OverlayDir, err)
-		}
-	}
-	for _, cf := range cfg.CopyFiles {
-		dst := cfg.WorkDir
-		if cf.RelDst != "" {
-			dst = filepath.Join(cfg.WorkDir, cf.RelDst)
-		}
-		// Skip if src and dst are the same path.
-		if absSrc, err := filepath.Abs(cf.Src); err == nil {
-			if absDst, err := filepath.Abs(dst); err == nil && absSrc == absDst {
-				continue
-			}
-		}
-		_ = overlay.CopyFileOrDir(cf.Src, dst, io.Discard)
-	}
-	return nil
+	return runtime.PrepareSessionWorkDirWithWarnings(cfg, warnings)
 }
 
 func ensureInstanceToken(env map[string]string) (map[string]string, error) {
@@ -221,6 +204,17 @@ func (p *Provider) cleanupFailedStart(name string, cfg runtime.Config) {
 // RunLive re-applies session_live commands to a running session.
 // Called by the reconciler when only session_live config has changed.
 func (p *Provider) RunLive(name string, cfg runtime.Config) error {
+	finalized, err := runtime.FinalizeProjectHookIsolatedConfig(cfg)
+	if err != nil {
+		return err
+	}
+	cfg = finalized
+	if err := runtime.MaterializeProjectHookIsolatedConfigRoots(cfg); err != nil {
+		return err
+	}
+	if err := runtime.PreflightSessionWorkDir(cfg); err != nil {
+		return fmt.Errorf("run live: final project hook preflight: %w", err)
+	}
 	runSessionLive(context.Background(), &tmuxStartOps{tm: p.tm, setupMaxTimeout: p.cfg.SetupMaxTimeout}, name, cfg, os.Stderr, p.cfg.SetupTimeout)
 	return nil
 }
@@ -235,6 +229,14 @@ func (p *Provider) RunLive(name string, cfg runtime.Config) error {
 // re-stage files (those are provision-half and unchanged on a launch-only change),
 // and on failure it leaves the warm box in place rather than tearing it down.
 func (p *Provider) Relaunch(ctx context.Context, name string, cfg runtime.Config) error {
+	finalized, err := runtime.FinalizeProjectHookIsolatedConfig(cfg)
+	if err != nil {
+		return err
+	}
+	cfg = finalized
+	if err := runtime.MaterializeProjectHookIsolatedConfigRoots(cfg); err != nil {
+		return err
+	}
 	if err := doRelaunchSession(ctx, &tmuxStartOps{tm: p.tm, setupMaxTimeout: p.cfg.SetupMaxTimeout}, name, cfg, p.cfg.SetupTimeout); err != nil {
 		return err
 	}
@@ -827,6 +829,10 @@ type tmuxStartOps struct {
 	setupMaxTimeout time.Duration
 }
 
+func (o *tmuxStartOps) waitCreateRetry() {
+	time.Sleep(50 * time.Millisecond)
+}
+
 const (
 	defaultReadyProbeTimeout = 15 * time.Second
 	minReadyProbeTimeout     = 5 * time.Second
@@ -853,17 +859,23 @@ func (o *tmuxStartOps) createSession(name, workDir, command string, env map[stri
 // launch-half of the un-weld relaunch path.
 //
 // respawn-pane takes no env argument: the new process inherits the tmux server's
-// global environment as filtered by the SESSION environment, so a withheld
-// credential has to already be marked removed there. NewSessionWithCommandAndEnv
-// does that at provision time, and this re-asserts it because a warm box is
-// explicitly long-lived — one provisioned by an older gc, whose create path only
-// built the one-shot `env -u` prefix, would otherwise hand the respawned agent
-// the controller's real value for the rest of the box's life. Re-marking a key
-// already marked is a no-op, and only controller-scope keys are marked, so a
-// relaunch that withholds no credential costs no extra tmux call at all.
+// global environment as filtered by the SESSION environment. A finalized
+// project-hook-isolated launch therefore reconciles and reads back its complete
+// authoritative environment before respawn; a legacy warm box may otherwise
+// retain contaminated HOME, CODEX_HOME, PATH, or injection variables. Other
+// launches retain the narrower durable credential-withholding behavior.
 func (o *tmuxStartOps) respawnAgent(name, workDir, command string, env map[string]string) error {
-	if err := o.tm.markSessionEnvRemoved(name, durableWithholdKeys(env)); err != nil {
-		return err
+	if err := runtime.ValidateEnvironmentKeys(env); err != nil {
+		return fmt.Errorf("respawning session %q environment: %w", name, err)
+	}
+	if isFinalizedProjectHookIsolationEnv(env) {
+		if err := o.tm.reconcileSessionEnvironment(name, env); err != nil {
+			return err
+		}
+	} else {
+		if err := o.tm.markSessionEnvRemoved(name, durableWithholdKeys(env)); err != nil {
+			return err
+		}
 	}
 	return o.tm.RespawnPaneWithWorkDir(name, workDir, command)
 }
@@ -1152,6 +1164,9 @@ func doStartSession(ctx context.Context, ops startOps, name string, cfg runtime.
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if err := runtime.PreflightSessionWorkDir(cfg); err != nil {
+		return fmt.Errorf("preflighting session workdir before pre_start: %w", err)
+	}
 
 	// Step 0: Run pre-start commands (directory/worktree preparation).
 	if err := runPreStart(ctx, ops, name, cfg, setupTimeout); err != nil {
@@ -1159,6 +1174,9 @@ func doStartSession(ctx context.Context, ops startOps, name string, cfg runtime.
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if err := runtime.PreflightSessionWorkDir(cfg); err != nil {
+		return fmt.Errorf("preflighting session workdir after pre_start: %w", err)
 	}
 
 	// Step 1: Ensure fresh session (zombie detection).
@@ -1227,6 +1245,9 @@ func doRelaunchSession(ctx context.Context, ops startOps, name string, cfg runti
 	if !alive {
 		return fmt.Errorf("relaunch: %w: %s (box must be provisioned first)", runtime.ErrSessionNotFound, name)
 	}
+	if err := runtime.PreflightSessionWorkDir(cfg); err != nil {
+		return fmt.Errorf("relaunch: preflighting session workdir before pre_start: %w", err)
+	}
 
 	// Run pre_start before respawning: relaunch re-homes the agent into a
 	// possibly different (or not-yet-prepared) WorkDir, and launching into an
@@ -1238,10 +1259,16 @@ func doRelaunchSession(ctx context.Context, ops startOps, name string, cfg runti
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if err := runtime.PreflightSessionWorkDir(cfg); err != nil {
+		return fmt.Errorf("relaunch: preflighting session workdir after pre_start: %w", err)
+	}
 
 	fullCommand, promptFile, err := buildLaunchCommand(name, cfg)
 	if err != nil {
 		return err
+	}
+	if err := runtime.PreflightSessionWorkDir(cfg); err != nil {
+		return cleanupPromptFileOnError(promptFile, fmt.Errorf("relaunch: final project hook preflight: %w", err))
 	}
 	if err := ops.respawnAgent(name, cfg.WorkDir, fullCommand, cfg.Env); err != nil {
 		return cleanupPromptFileOnError(promptFile, fmt.Errorf("relaunch: respawning agent in session %q: %w", name, err))
@@ -1488,13 +1515,13 @@ func ensureFreshSession(ops startOps, name string, cfg runtime.Config) error {
 	if err != nil {
 		return err
 	}
-	err = ops.createSession(name, cfg.WorkDir, fullCommand, cfg.Env)
+	err = createSessionAfterProjectHookPreflight(ops, name, cfg, fullCommand)
 	if err == nil {
 		return nil // created successfully
 	}
 	if errors.Is(err, ErrNoServer) {
-		time.Sleep(50 * time.Millisecond)
-		err = ops.createSession(name, cfg.WorkDir, fullCommand, cfg.Env)
+		waitCreateRetry(ops)
+		err = createSessionAfterProjectHookPreflight(ops, name, cfg, fullCommand)
 		if err == nil {
 			return nil
 		}
@@ -1509,7 +1536,7 @@ func ensureFreshSession(ops startOps, name string, cfg runtime.Config) error {
 		if err := ops.killSession(name); err != nil {
 			return cleanupPromptFileOnError(promptFile, fmt.Errorf("killing dead session: %w", err))
 		}
-		if err := recreateSessionAfterCleanup(ops, name, cfg.WorkDir, fullCommand, cfg.Env, promptFile); err != nil {
+		if err := recreateSessionAfterCleanup(ops, name, cfg, fullCommand, promptFile); err != nil {
 			return cleanupPromptFileOnError(promptFile, fmt.Errorf("creating session after dead-session cleanup: %w", err))
 		}
 		return nil
@@ -1530,7 +1557,7 @@ func ensureFreshSession(ops startOps, name string, cfg runtime.Config) error {
 	if err := ops.killSession(name); err != nil {
 		return cleanupPromptFileOnError(promptFile, fmt.Errorf("killing zombie session: %w", err))
 	}
-	if err := recreateSessionAfterCleanup(ops, name, cfg.WorkDir, fullCommand, cfg.Env, promptFile); err != nil {
+	if err := recreateSessionAfterCleanup(ops, name, cfg, fullCommand, promptFile); err != nil {
 		return cleanupPromptFileOnError(promptFile, fmt.Errorf("creating session after zombie cleanup: %w", err))
 	}
 	return nil
@@ -1569,17 +1596,36 @@ func cleanupPromptFileOnError(promptFile string, err error) error {
 	return err
 }
 
-func recreateSessionAfterCleanup(ops startOps, name, workDir, command string, env map[string]string, promptFile string) error {
-	err := ops.createSession(name, workDir, command, env)
+func recreateSessionAfterCleanup(ops startOps, name string, cfg runtime.Config, command, promptFile string) error {
+	err := createSessionAfterProjectHookPreflight(ops, name, cfg, command)
 	if errors.Is(err, ErrNoServer) {
-		time.Sleep(50 * time.Millisecond)
-		err = ops.createSession(name, workDir, command, env)
+		waitCreateRetry(ops)
+		err = createSessionAfterProjectHookPreflight(ops, name, cfg, command)
 	}
 	if errors.Is(err, ErrSessionExists) {
 		_ = removePromptFile(promptFile)
 		return nil // race: another process created it
 	}
 	return err
+}
+
+func createSessionAfterProjectHookPreflight(ops startOps, name string, cfg runtime.Config, command string) error {
+	if err := runtime.PreflightSessionWorkDir(cfg); err != nil {
+		return fmt.Errorf("final project hook preflight before creating session %q: %w", name, err)
+	}
+	return ops.createSession(name, cfg.WorkDir, command, cfg.Env)
+}
+
+type createRetryWaiter interface {
+	waitCreateRetry()
+}
+
+func waitCreateRetry(ops startOps) {
+	if waiter, ok := ops.(createRetryWaiter); ok {
+		waiter.waitCreateRetry()
+		return
+	}
+	time.Sleep(50 * time.Millisecond)
 }
 
 // writePromptFile writes a shell-quoted prompt string to a temp file for

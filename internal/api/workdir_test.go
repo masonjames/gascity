@@ -23,6 +23,29 @@ func TestCanAttributeSessionUsesResolvedWorkDir(t *testing.T) {
 	}
 }
 
+func TestCanAttributeSessionUsesForbiddenExternalWorkDirForReadOnlyAttribution(t *testing.T) {
+	cityPath := t.TempDir()
+	externalRoot := t.TempDir()
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "gastown", Provider: "claude"},
+		Rigs:      []config.Rig{{Name: "demo", Path: filepath.Join(cityPath, "repos", "demo")}},
+		Agents: []config.Agent{
+			{
+				Name:              "refinery",
+				Dir:               "demo",
+				WorkDir:           filepath.Join(externalRoot, "{{.AgentBase}}"),
+				ProjectHooks:      config.ProjectHooksForbid,
+				MaxActiveSessions: intPtr(1),
+			},
+			{Name: "witness", Dir: "demo", WorkDir: filepath.Join(externalRoot, "witness"), MaxActiveSessions: intPtr(1)},
+		},
+	}
+
+	if !canAttributeSession(cfg.Agents[0], "demo/refinery", cfg, cityPath) {
+		t.Fatal("canAttributeSession() = false, want true for a distinct forbidden external workdir")
+	}
+}
+
 func TestCanAttributeSessionRejectsSharedRigRootWhenClaudePoolExists(t *testing.T) {
 	cityPath := t.TempDir()
 	rigRoot := filepath.Join(t.TempDir(), "demo-repo")

@@ -1,0 +1,9 @@
+[pack]
+name = "bd"
+schema = 1
+
+[[agent]]
+name = "dog"
+scope = "city"
+min_active_sessions = 0
+max_active_sessions = 2

@@ -47,11 +47,11 @@ func recordCurrentBeadIDOnWake(info sessionpkg.Info, sessFront *sessionpkg.Store
 // cycleAliveSessionForFreshReassign tears down a live wake_mode=fresh
 // session whose assigned bead has changed, then primes the bead so the
 // next reconciler tick wakes the session on a brand-new conversation.
-// Returns (true, fold) when the cycle ran; the caller must `continue` so it
-// does not double-process the drain/idle bookkeeping for a session it just
-// killed. The fold is the in-memory mirror it applied (RestartRequestPatch
-// minus ResetCommittedAtKey), for the reconciler to fold onto the infoByID
-// snapshot (write-returns-Info).
+// Returns (handled, fold). handled is true both when the cycle ran and when a
+// strict witness refused it; the caller must continue in either case so stale
+// current-work/drain bookkeeping cannot run after a refused strict cycle. fold
+// is the in-memory mirror of a successful RestartRequestPatch minus
+// ResetCommittedAtKey.
 //
 // The teardown path mirrors the agent-initiated restart handoff
 // (`gc runtime request-restart`): kill the process, reset the named-session
@@ -81,6 +81,50 @@ func cycleAliveSessionForFreshReassign(
 	if newBeadID == "" {
 		return false, nil
 	}
+	candidate := captureStartCandidateForWake(info, tp, 0, cfg, newBeadID)
+	if strings.TrimSpace(info.ID) != "" {
+		if err := candidate.mutationBoundary().lifecycleMutation().legacyAutomaticRuntimeEffectError(); err != nil {
+			if stderr != nil {
+				fmt.Fprintf(stderr, "session reconciler: refusing fresh-cycle %s: %v\n", name, err) //nolint:errcheck
+			}
+			return true, nil
+		}
+		var fold sessionpkg.MetadataPatch
+		err := sessionpkg.WithSessionMutationLock(info.ID, func() error {
+			current, _, err := sessionFrontDoor(store).GetPersistedResponse(info.ID)
+			if err != nil {
+				return err
+			}
+			if err := candidate.validateAutomaticWakeCurrent(current); err != nil {
+				return err
+			}
+			_, fold = cycleAliveSessionForFreshReassignLocked(current, tp, sp, store, cfg, cb, name, newBeadID, now, stdout, stderr, trace)
+			return nil
+		})
+		if err != nil {
+			if stderr != nil {
+				fmt.Fprintf(stderr, "session reconciler: refusing fresh-cycle %s: %v\n", name, err) //nolint:errcheck
+			}
+			return true, nil
+		}
+		return true, fold
+	}
+	return cycleAliveSessionForFreshReassignLocked(info, tp, sp, store, cfg, cb, name, newBeadID, now, stdout, stderr, trace)
+}
+
+func cycleAliveSessionForFreshReassignLocked(
+	info sessionpkg.Info,
+	tp TemplateParams,
+	sp runtime.Provider,
+	store beads.Store,
+	cfg *config.City,
+	cb *sessionCircuitBreaker,
+	name string,
+	newBeadID string,
+	now time.Time,
+	stdout, stderr io.Writer,
+	trace *sessionReconcilerTraceCycle,
+) (bool, sessionpkg.MetadataPatch) {
 	prevBeadID := strings.TrimSpace(info.CurrentlyProcessingBeadID)
 	if err := workerKillSessionTargetWithConfig("", store, sp, cfg, name); err != nil {
 		if stderr != nil {

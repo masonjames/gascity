@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -14,6 +15,11 @@ func (h *SessionHandle) Start(ctx context.Context) (err error) {
 	event := h.beginOperationEvent(ctx, workerOperationStart)
 	defer func() { event.finish(err) }()
 
+	if h.currentSessionID() == "" {
+		if _, err := h.authorizeLiveBoundary(ctx, ""); err != nil {
+			return err
+		}
+	}
 	id, err := h.ensureSessionID()
 	if err != nil {
 		return err
@@ -22,8 +28,18 @@ func (h *SessionHandle) Start(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
-	err = h.manager.Start(ctx, id, startCommand, h.runtimeHints())
-	return err
+	authorization, err := h.authorizeLiveBoundary(ctx, id)
+	if err != nil {
+		return err
+	}
+	err = h.manager.StartWithWitness(
+		ctx,
+		id,
+		startCommand,
+		h.runtimeHintsWithAuthorization(h.runtimeHints(), authorization),
+		liveBoundaryWitness(authorization),
+	)
+	return normalizeLiveBoundaryError(err)
 }
 
 // StartResolved starts or resumes the worker using a caller-supplied runtime
@@ -34,6 +50,11 @@ func (h *SessionHandle) StartResolved(ctx context.Context, startCommand string, 
 	event := h.beginOperationEvent(ctx, workerOperationStartResolved)
 	defer func() { event.finish(err) }()
 
+	if h.currentSessionID() == "" {
+		if _, err := h.authorizeLiveBoundary(ctx, ""); err != nil {
+			return err
+		}
+	}
 	id, err := h.ensureSessionID()
 	if err != nil {
 		return err
@@ -49,8 +70,68 @@ func (h *SessionHandle) StartResolved(ctx context.Context, startCommand string, 
 	if strings.TrimSpace(startHints.Command) == "" {
 		startHints = h.runtimeHints()
 	}
-	err = h.manager.StartRuntimeOnly(ctx, id, command, startHints)
-	return err
+	authorization, err := h.authorizeLiveBoundary(ctx, id)
+	if err != nil {
+		return err
+	}
+	err = h.manager.StartRuntimeOnlyWithWitness(
+		ctx,
+		id,
+		command,
+		h.runtimeHintsWithAuthorization(startHints, authorization),
+		liveBoundaryWitness(authorization),
+	)
+	return normalizeLiveBoundaryError(err)
+}
+
+// StartPreparedResolved starts a reconciler-prepared session only while the
+// exact trigger captured with that candidate remains authoritative. Unlike the
+// ordinary StartResolved bridge, it also keeps runtime observation and zombie
+// recycling behind the same under-lock witness validation.
+func (h *SessionHandle) StartPreparedResolved(
+	ctx context.Context,
+	startCommand string,
+	hints runtime.Config,
+	expected sessionpkg.LiveBoundaryWitness,
+) (result PreparedStartResult, err error) {
+	event := h.beginOperationEvent(ctx, workerOperationStartResolved)
+	defer func() { event.finish(err) }()
+
+	id := h.currentSessionID()
+	if id == "" {
+		return PreparedStartResult{}, fmt.Errorf("%w: prepared start requires an existing bead-backed session", ErrOperationUnsupported)
+	}
+	authorization, err := h.authorizeLiveBoundary(ctx, id)
+	if err != nil {
+		return PreparedStartResult{}, err
+	}
+	if err := requireReconcilerExpectedWitness(expected, authorization); err != nil {
+		return PreparedStartResult{}, err
+	}
+	command := strings.TrimSpace(startCommand)
+	if command == "" {
+		command, err = h.startCommand(id)
+		if err != nil {
+			return PreparedStartResult{}, err
+		}
+	}
+	startHints := hints
+	if strings.TrimSpace(startHints.Command) == "" {
+		startHints = h.runtimeHints()
+	}
+	started, err := h.manager.StartPreparedRuntimeOnlyWithWitness(
+		ctx,
+		id,
+		command,
+		h.runtimeHintsWithAuthorization(startHints, authorization),
+		expected,
+	)
+	result = PreparedStartResult{
+		Attempted:       started.Attempted,
+		Recycled:        started.Recycled,
+		RecycleDuration: started.RecycleDuration,
+	}
+	return result, normalizeLiveBoundaryError(err)
 }
 
 // Attach ensures the worker runtime is live and then attaches the caller's
@@ -59,6 +140,11 @@ func (h *SessionHandle) Attach(ctx context.Context) (err error) {
 	event := h.beginOperationEvent(ctx, workerOperationAttach)
 	defer func() { event.finish(err) }()
 
+	if h.currentSessionID() == "" {
+		if _, err := h.authorizeLiveBoundary(ctx, ""); err != nil {
+			return err
+		}
+	}
 	id, err := h.ensureSessionID()
 	if err != nil {
 		return err
@@ -67,8 +153,18 @@ func (h *SessionHandle) Attach(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
-	err = h.manager.Attach(ctx, id, resumeCommand, h.runtimeHints())
-	return err
+	authorization, err := h.authorizeLiveBoundary(ctx, id)
+	if err != nil {
+		return err
+	}
+	err = h.manager.AttachWithWitness(
+		ctx,
+		id,
+		resumeCommand,
+		h.runtimeHintsWithAuthorization(h.runtimeHints(), authorization),
+		liveBoundaryWitness(authorization),
+	)
+	return normalizeLiveBoundaryError(err)
 }
 
 // Create materializes the worker session without requiring API callers to
@@ -90,6 +186,9 @@ func (h *SessionHandle) Create(ctx context.Context, mode CreateMode) (info sessi
 		info, err = h.createDeferredLocked()
 		return info, err
 	case CreateModeStarted:
+		if _, err = h.authorizeLiveBoundary(ctx, ""); err != nil {
+			return sessionpkg.Info{}, err
+		}
 		info, err = h.createStartedLocked(ctx)
 		return info, err
 	default:
@@ -266,6 +365,11 @@ func (h *SessionHandle) Message(ctx context.Context, req MessageRequest) (result
 		err = fmt.Errorf("message text is required")
 		return MessageResult{}, err
 	}
+	if h.currentSessionID() == "" {
+		if _, err := h.authorizeLiveBoundary(ctx, ""); err != nil {
+			return MessageResult{}, err
+		}
+	}
 	id, err := h.ensureSessionID()
 	if err != nil {
 		return MessageResult{}, err
@@ -274,9 +378,21 @@ func (h *SessionHandle) Message(ctx context.Context, req MessageRequest) (result
 	if err != nil {
 		return MessageResult{}, err
 	}
-	outcome, err := h.manager.Submit(ctx, id, req.Text, resumeCommand, h.runtimeHints(), submitIntent(req.Delivery))
+	authorization, err := h.authorizeLiveBoundary(ctx, id)
 	if err != nil {
 		return MessageResult{}, err
+	}
+	outcome, err := h.manager.SubmitWithWitness(
+		ctx,
+		id,
+		req.Text,
+		resumeCommand,
+		h.runtimeHintsWithAuthorization(h.runtimeHints(), authorization),
+		submitIntent(req.Delivery),
+		liveBoundaryWitness(authorization),
+	)
+	if err != nil {
+		return MessageResult{}, normalizeLiveBoundaryError(err)
 	}
 	result = MessageResult{Queued: outcome.Queued}
 	return result, nil
@@ -310,6 +426,11 @@ func (h *SessionHandle) Nudge(ctx context.Context, req NudgeRequest) (result Nud
 		err = fmt.Errorf("nudge text is required")
 		return NudgeResult{}, err
 	}
+	if h.currentSessionID() == "" {
+		if _, err := h.authorizeLiveBoundary(ctx, ""); err != nil {
+			return NudgeResult{}, err
+		}
+	}
 	id, err := h.ensureSessionID()
 	if err != nil {
 		return NudgeResult{}, err
@@ -318,47 +439,56 @@ func (h *SessionHandle) Nudge(ctx context.Context, req NudgeRequest) (result Nud
 	if err != nil {
 		return NudgeResult{}, err
 	}
+	authorization, err := h.authorizeLiveBoundary(ctx, id)
+	if err != nil {
+		return NudgeResult{}, err
+	}
+	if err := requireExpectedTriggerAuthorization(req.ExpectedTriggerBeadID, req.ExpectedTriggerBeadStoreRef, authorization); err != nil {
+		return NudgeResult{}, err
+	}
+	witness := liveBoundaryWitness(authorization)
+	hints := h.runtimeHintsWithAuthorization(h.runtimeHints(), authorization)
 	switch req.Delivery {
 	case "", NudgeDeliveryDefault:
 		if normalizeNudgeWakePolicy(req.Wake) == NudgeWakeLiveOnly {
-			delivered, err := h.manager.SendLiveOnly(ctx, id, req.Text)
+			delivered, err := h.manager.SendLiveOnlyWithWitness(ctx, id, req.Text, witness)
 			if err != nil {
-				return NudgeResult{}, err
+				return NudgeResult{}, normalizeLiveBoundaryError(err)
 			}
 			result = NudgeResult{Delivered: delivered}
 			return result, nil
 		}
-		if err := h.manager.Send(ctx, id, req.Text, resumeCommand, h.runtimeHints()); err != nil {
-			return NudgeResult{}, err
+		if err := h.manager.SendWithWitness(ctx, id, req.Text, resumeCommand, hints, witness); err != nil {
+			return NudgeResult{}, normalizeLiveBoundaryError(err)
 		}
 		result = NudgeResult{Delivered: true}
 		return result, nil
 	case NudgeDeliveryImmediate:
 		if normalizeNudgeWakePolicy(req.Wake) == NudgeWakeLiveOnly {
-			delivered, err := h.manager.SendImmediateLiveOnly(ctx, id, req.Text)
+			delivered, err := h.manager.SendImmediateLiveOnlyWithWitness(ctx, id, req.Text, witness)
 			if err != nil {
-				return NudgeResult{}, err
+				return NudgeResult{}, normalizeLiveBoundaryError(err)
 			}
 			result = NudgeResult{Delivered: delivered}
 			return result, nil
 		}
-		if err := h.manager.SendImmediate(ctx, id, req.Text, resumeCommand, h.runtimeHints()); err != nil {
-			return NudgeResult{}, err
+		if err := h.manager.SendImmediateWithWitness(ctx, id, req.Text, resumeCommand, hints, witness); err != nil {
+			return NudgeResult{}, normalizeLiveBoundaryError(err)
 		}
 		result = NudgeResult{Delivered: true}
 		return result, nil
 	case NudgeDeliveryWaitIdle:
 		if normalizeNudgeWakePolicy(req.Wake) == NudgeWakeLiveOnly {
-			delivered, err := h.manager.TryWaitIdleNudgeLiveOnly(ctx, id, req.Source, req.Text)
+			delivered, err := h.manager.TryWaitIdleNudgeLiveOnlyWithWitness(ctx, id, req.Source, req.Text, witness)
 			if err != nil {
-				return NudgeResult{}, err
+				return NudgeResult{}, normalizeLiveBoundaryError(err)
 			}
 			result = NudgeResult{Delivered: delivered}
 			return result, nil
 		}
-		delivered, err := h.manager.TryWaitIdleNudge(ctx, id, req.Source, req.Text, resumeCommand, h.runtimeHints())
+		delivered, err := h.manager.TryWaitIdleNudgeWithWitness(ctx, id, req.Source, req.Text, resumeCommand, hints, witness)
 		if err != nil {
-			return NudgeResult{}, err
+			return NudgeResult{}, normalizeLiveBoundaryError(err)
 		}
 		result = NudgeResult{Delivered: delivered}
 		return result, nil
@@ -366,6 +496,47 @@ func (h *SessionHandle) Nudge(ctx context.Context, req NudgeRequest) (result Nud
 		err = fmt.Errorf("unknown nudge delivery %q", req.Delivery)
 		return NudgeResult{}, err
 	}
+}
+
+func requireExpectedTriggerAuthorization(expectedID, expectedStoreRef string, authorization LaunchAuthorization) error {
+	expectedID = strings.TrimSpace(expectedID)
+	expectedStoreRef = strings.TrimSpace(expectedStoreRef)
+	if expectedID == "" && expectedStoreRef == "" {
+		return nil
+	}
+	if expectedID == "" || expectedStoreRef == "" ||
+		strings.TrimSpace(authorization.TriggerBeadID) != expectedID ||
+		strings.TrimSpace(authorization.TriggerBeadStoreRef) != expectedStoreRef {
+		return fmt.Errorf("%w: live delivery expected trigger (%q, %q) does not match current authorization", ErrLaunchUnauthorized, expectedID, expectedStoreRef)
+	}
+	return nil
+}
+
+// authorizeLiveBoundary presents either a proposed new session (id empty) or
+// an authoritative, freshly reloaded persisted record to the configured
+// authorizer. It deliberately performs no write and no provider operation.
+func (h *SessionHandle) authorizeLiveBoundary(ctx context.Context, id string) (LaunchAuthorization, error) {
+	if h.authorizeLaunch == nil {
+		return LaunchAuthorization{}, nil
+	}
+	req := LaunchAuthorizationRequest{
+		Session:            cloneSessionSpec(h.session),
+		Metadata:           cloneStringMap(h.session.Metadata),
+		SessionStore:       h.sessionStore,
+		CanonicalCityStore: h.canonicalCityStore,
+	}
+	if strings.TrimSpace(id) != "" {
+		// Authorization is a persisted-authority read, not a live observation.
+		// The ordinary worker read model enriches Info by routing ACP and probing
+		// the provider; either would be an unauthorized side effect here.
+		info, persisted, err := h.manager.PersistedStore().GetPersistedResponse(id)
+		if err != nil {
+			return LaunchAuthorization{}, bridgeSessionRecordError(id, err)
+		}
+		req.Info = &info
+		req.Metadata = cloneStringMap(persisted.Metadata)
+	}
+	return h.authorizeLaunch(ctx, req)
 }
 
 func (h *SessionHandle) ensureSessionID() (string, error) {
@@ -431,9 +602,12 @@ func (h *SessionHandle) currentSessionID() string {
 }
 
 func (h *SessionHandle) startCommand(id string) (string, error) {
-	info, pr, err := sessionRecordViaManager(h.manager, id)
+	// Command construction is part of the authorization prelude. Read only the
+	// persisted row here: the enriched worker read model can route ACP and probe
+	// the provider before strict launch authority has been established.
+	info, pr, err := h.manager.PersistedStore().GetPersistedResponse(id)
 	if err != nil {
-		return "", err
+		return "", bridgeSessionRecordError(id, err)
 	}
 	if firstProviderSessionStart(info.State, pr.Metadata) &&
 		h.session.Resume.SessionIDFlag != "" &&
@@ -505,6 +679,43 @@ func (h *SessionHandle) runtimeHints() runtime.Config {
 	cfg := cloneRuntimeConfig(h.session.Hints)
 	cfg.Env = mergeStringMaps(cfg.Env, h.session.Env)
 	return cfg
+}
+
+func (h *SessionHandle) runtimeHintsWithAuthorization(hints runtime.Config, authorization LaunchAuthorization) runtime.Config {
+	cfg := cloneRuntimeConfig(hints)
+	if enforcement := authorization.RuntimeEnforcement; enforcement != nil {
+		cfg.ProjectHooksForbidden = enforcement.ProjectHooksForbidden
+		cfg.ProviderName = strings.TrimSpace(enforcement.ProviderName)
+		cfg.ProviderOverlayName = strings.TrimSpace(enforcement.ProviderOverlayName)
+		cfg.WorkDir = strings.TrimSpace(enforcement.WorkDir)
+	}
+	triggerID := strings.TrimSpace(authorization.TriggerBeadID)
+	storeRef := strings.TrimSpace(authorization.TriggerBeadStoreRef)
+	if triggerID == "" || storeRef == "" {
+		return cfg
+	}
+	if cfg.Env == nil {
+		cfg.Env = make(map[string]string)
+	}
+	cfg.Env["GC_TRIGGER_BEAD_ID"] = triggerID
+	cfg.Env["GC_TRIGGER_WORK_BEAD_ID"] = triggerID
+	cfg.Env["GC_TRIGGER_BEAD_STORE_REF"] = storeRef
+	cfg.Env["GC_TRIGGER_WORK_STORE_REF"] = storeRef
+	return cfg
+}
+
+func liveBoundaryWitness(authorization LaunchAuthorization) sessionpkg.LiveBoundaryWitness {
+	return sessionpkg.LiveBoundaryWitness{
+		TriggerBeadID:       authorization.TriggerBeadID,
+		TriggerBeadStoreRef: authorization.TriggerBeadStoreRef,
+	}
+}
+
+func normalizeLiveBoundaryError(err error) error {
+	if errors.Is(err, sessionpkg.ErrLiveBoundaryWitnessMismatch) {
+		return fmt.Errorf("%w: %w", ErrLaunchUnauthorized, err)
+	}
+	return err
 }
 
 func submitIntent(intent DeliveryIntent) sessionpkg.SubmitIntent {

@@ -1,0 +1,1 @@
+Frozen Mayor fixture.

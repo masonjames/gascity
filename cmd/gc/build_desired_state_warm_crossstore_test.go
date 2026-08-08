@@ -168,6 +168,11 @@ func TestBuildDesiredState_WarmRigPoolCityProbeDoesNotDoubleCountRigDemand(t *te
 // the city DB.
 type aliasStore struct{ beads.Store }
 
+// StoreIdentityTarget explicitly declares that aliasStore is only another
+// view of its embedded backing store. Production wrappers make the same typed
+// declaration; demand deduplication must not infer wrapper internals.
+func (s aliasStore) StoreIdentityTarget() beads.Store { return s.Store }
+
 // TestBuildDesiredState_WarmAliasedRigStoreDoesNotDoubleCountDemand: when the
 // rig "store" is a distinct object over the SAME backing as the city store,
 // the rig-group and city-group probes both see the same beads. The

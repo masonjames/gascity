@@ -174,6 +174,26 @@ func TestConfigValidCheck_BadAgent(t *testing.T) {
 	}
 }
 
+func TestConfigValidCheck_RejectsWorkspaceHookInheritanceForProjectHooksForbid(t *testing.T) {
+	cfg := &config.City{
+		Workspace: config.Workspace{
+			Name:              "test",
+			InstallAgentHooks: []string{"fixture-hook"},
+		},
+		Agents: []config.Agent{{
+			Name:         "worker",
+			ProjectHooks: config.ProjectHooksForbid,
+		}},
+	}
+	r := NewConfigValidCheck(cfg).Run(&CheckContext{})
+	if r.Status != StatusError {
+		t.Fatalf("status = %d, want Error; msg = %s", r.Status, r.Message)
+	}
+	if !strings.Contains(r.Message, "workspace install_agent_hooks") {
+		t.Fatalf("message = %q, want inherited workspace hook conflict", r.Message)
+	}
+}
+
 func TestConfigValidCheck_BadRig(t *testing.T) {
 	cfg := &config.City{
 		Workspace: config.Workspace{Name: "test"},

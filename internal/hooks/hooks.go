@@ -192,6 +192,13 @@ func installOverlayManaged(fs fsys.FS, cityDir, workDir, provider string) error 
 			return fmt.Errorf("reading %s: %w", name, err)
 		}
 		dst := filepath.Join(workDir, filepath.FromSlash(rel))
+		// The registry is authoritative for hook-bearing project paths. Core
+		// overlays may also carry harmless provider companions (for example
+		// Kiro's AGENTS.md); those remain installable, but never receive
+		// hook-specific merge or managed-upgrade treatment.
+		if !IsProjectHookArtifactForProvider(provider, filepath.FromSlash(rel)) {
+			return writeEmbeddedManaged(fs, dst, data, nil)
+		}
 		if provider == "antigravity" && rel == path.Join(".agents", "hooks.json") {
 			return writeJSONOverlayManaged(fs, dst, data)
 		}

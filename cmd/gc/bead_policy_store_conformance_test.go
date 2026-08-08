@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/beads"
@@ -293,5 +294,41 @@ func TestBeadPolicyStoreContextReadyIsPolicyAware(t *testing.T) {
 	}
 	if len(backing.readyQueries) != 1 || backing.readyQueries[0].TierMode != beads.TierBoth {
 		t.Fatalf("ReadyContext queries = %#v, want one TierBoth query", backing.readyQueries)
+	}
+}
+
+func TestBeadPolicyStorePreservesReadyExcludedLabelsAcrossReadSurfaces(t *testing.T) {
+	backing := &recordingPolicyReadStore{MemStore: beads.NewMemStore()}
+	store := wrapStoreWithBeadPolicies(backing, &config.City{})
+	want := beads.ReadyQuery{TierMode: beads.TierBoth, ExcludeLabels: []string{"hold:mayor", "hold:external"}}
+
+	tests := []struct {
+		name string
+		run  func() error
+	}{
+		{name: "store", run: func() error { _, err := store.Ready(beads.ReadyQuery{ExcludeLabels: want.ExcludeLabels}); return err }},
+		{name: "context", run: func() error {
+			_, err := store.(beads.ContextReadyReader).ReadyContext(context.Background(), beads.ReadyQuery{ExcludeLabels: want.ExcludeLabels})
+			return err
+		}},
+		{name: "cached handle", run: func() error {
+			_, err := beads.HandlesFor(store).Cached.Ready(beads.ReadyQuery{ExcludeLabels: want.ExcludeLabels})
+			return err
+		}},
+		{name: "live handle", run: func() error {
+			_, err := beads.HandlesFor(store).Live.Ready(beads.ReadyQuery{ExcludeLabels: want.ExcludeLabels})
+			return err
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			backing.readyQueries = nil
+			if err := tt.run(); err != nil {
+				t.Fatalf("Ready: %v", err)
+			}
+			if len(backing.readyQueries) != 1 || !reflect.DeepEqual(backing.readyQueries[0], want) {
+				t.Fatalf("Ready queries = %+v, want [%+v]", backing.readyQueries, want)
+			}
+		})
 	}
 }

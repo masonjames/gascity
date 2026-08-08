@@ -24,7 +24,9 @@ type SessionRequest struct {
 	WorkBeadTitle string // title of the work bead driving this request, when known
 	WorkPack      string // pack route key from the work bead, when known
 	WorkWorkspace string // explicit pack workspace route key from the work bead, when known
-	WorkStoreRef  string // city or rig:<name> store reference for WorkBeadID when known
+	WorkStoreRef  string // canonical city:<name> or rig:<name> store reference for WorkBeadID when known
+	WorkRouteKey  string // exact routing metadata key observed for WorkBeadID
+	WorkRoute     string // exact routing metadata value observed for WorkBeadID
 	// BrainParentSID is gc.brain_parent_sid from the driving work bead, when
 	// set: the parent session to fork this launch off of (warm-arm fork-launch).
 	BrainParentSID string
@@ -114,6 +116,32 @@ func computePoolDesiredStates(
 	scaleCheckDemand map[string]scaleCheckDemand,
 	trace *sessionReconcilerTraceCycle,
 ) []PoolDesiredState {
+	return computePoolDesiredStatesWithAssignedStoreRefs(
+		cfg,
+		assignedWorkBeads,
+		nil,
+		sessionInfos,
+		scaleCheckCounts,
+		scaleCheckDemand,
+		trace,
+	)
+}
+
+// computePoolDesiredStatesWithAssignedStoreRefs is the controller realization
+// form of computePoolDesiredStates. assignedWorkStoreRefs is index-aligned with
+// assignedWorkBeads and carries the exact physical store provenance needed to
+// recover a claim that committed before its session trigger pair was bound.
+// Public compatibility helpers intentionally continue through the wrapper
+// above with nil refs; they remain pure count/request projections.
+func computePoolDesiredStatesWithAssignedStoreRefs(
+	cfg *config.City,
+	assignedWorkBeads []beads.Bead,
+	assignedWorkStoreRefs []string,
+	sessionInfos []sessionpkg.Info,
+	scaleCheckCounts map[string]int,
+	scaleCheckDemand map[string]scaleCheckDemand,
+	trace *sessionReconcilerTraceCycle,
+) []PoolDesiredState {
 	// Build reverse lookup: any identifier → session bead ID.
 	// Assignee on work beads may be a bead ID, session name, alias, or
 	// a prior alias preserved in alias_history. Resume-tier dispatch
@@ -159,7 +187,7 @@ func computePoolDesiredStates(
 
 		// Resume tier: actionable assigned work beads whose assignee resolves
 		// to a non-closed session bead. These sessions must stay alive.
-		for _, wb := range assignedWorkBeads {
+		for workIndex, wb := range assignedWorkBeads {
 			routedTo := routedToOrLegacyWorkflowTarget(wb)
 			if wb.Status != "in_progress" && wb.Status != "open" {
 				continue
@@ -185,6 +213,15 @@ func computePoolDesiredStates(
 			if routedTo != template {
 				continue
 			}
+			workStoreRef := ""
+			if workIndex < len(assignedWorkStoreRefs) {
+				workStoreRef = strings.TrimSpace(assignedWorkStoreRefs[workIndex])
+			}
+			_, workRouteKey, workRoute := controllerDemandRouteTargetAndWitness(
+				cfg,
+				wb,
+				map[string]struct{}{template: {}},
+			)
 			if sessionBeadID != "" {
 				// Named-session beads are materialized by the named-session
 				// loop in buildDesiredState, not by the pool path. Skipping
@@ -204,6 +241,9 @@ func computePoolDesiredStates(
 					WorkBeadTitle:  strings.TrimSpace(wb.Title),
 					WorkPack:       strings.TrimSpace(wb.Metadata[beadmeta.PackMetadataKey]),
 					WorkWorkspace:  strings.TrimSpace(wb.Metadata[beadmeta.PackWorkspaceMetadataKey]),
+					WorkStoreRef:   workStoreRef,
+					WorkRouteKey:   workRouteKey,
+					WorkRoute:      workRoute,
 					BrainParentSID: strings.TrimSpace(wb.Metadata[beadmeta.BrainParentSIDMetadataKey]),
 				})
 				continue
@@ -238,6 +278,9 @@ func computePoolDesiredStates(
 				WorkBeadTitle:  strings.TrimSpace(wb.Title),
 				WorkPack:       strings.TrimSpace(wb.Metadata[beadmeta.PackMetadataKey]),
 				WorkWorkspace:  strings.TrimSpace(wb.Metadata[beadmeta.PackWorkspaceMetadataKey]),
+				WorkStoreRef:   workStoreRef,
+				WorkRouteKey:   workRouteKey,
+				WorkRoute:      workRoute,
 				BrainParentSID: strings.TrimSpace(wb.Metadata[beadmeta.BrainParentSIDMetadataKey]),
 			})
 			if trace != nil {
@@ -292,45 +335,36 @@ func computePoolDesiredStates(
 					"anonymous_new": newCount - inFlightCount,
 				})
 			}
+			consumedWitnesses := make(map[int]struct{}, inFlightCount)
 			for j := 0; j < inFlightCount; j++ {
-				req := inFlight[j]
+				req, witnessIndex := sessionRequestWithAvailableDemandWitness(
+					inFlight[j],
+					scaleCheckDemand[template],
+					j,
+					consumedWitnesses,
+				)
+				if witnessIndex >= 0 {
+					consumedWitnesses[witnessIndex] = struct{}{}
+				}
 				allRequests = append(allRequests, req)
 				usage.accept(req, limits)
 			}
+			nextWitnessIndex := 0
 			for j := inFlightCount; j < newCount; j++ {
-				workBeadID := ""
-				workBeadTitle := ""
-				workPack := ""
-				workWorkspace := ""
-				workStoreRef := ""
-				workParentSID := ""
-				if demand := scaleCheckDemand[template]; len(demand.WorkBeadIDs) > j {
-					workBeadID = strings.TrimSpace(demand.WorkBeadIDs[j])
-					if demand.Titles != nil {
-						workBeadTitle = strings.TrimSpace(demand.Titles[workBeadID])
-					}
-					if demand.Packs != nil {
-						workPack = strings.TrimSpace(demand.Packs[workBeadID])
-					}
-					if demand.Workspaces != nil {
-						workWorkspace = strings.TrimSpace(demand.Workspaces[workBeadID])
-					}
-					if demand.StoreRefs != nil {
-						workStoreRef = strings.TrimSpace(demand.StoreRefs[workBeadID])
-					}
-					if demand.ParentSIDs != nil {
-						workParentSID = strings.TrimSpace(demand.ParentSIDs[workBeadID])
-					}
-				}
-				req := SessionRequest{
-					Template:       template,
-					Tier:           "new",
-					WorkBeadID:     workBeadID,
-					WorkBeadTitle:  workBeadTitle,
-					WorkPack:       workPack,
-					WorkWorkspace:  workWorkspace,
-					WorkStoreRef:   workStoreRef,
-					BrainParentSID: workParentSID,
+				nextWitnessIndex = nextAvailableDemandWitnessIndex(
+					scaleCheckDemand[template],
+					nextWitnessIndex,
+					consumedWitnesses,
+				)
+				req, witnessIndex := sessionRequestWithAvailableDemandWitness(
+					SessionRequest{Template: template, Tier: "new"},
+					scaleCheckDemand[template],
+					nextWitnessIndex,
+					consumedWitnesses,
+				)
+				if witnessIndex >= 0 {
+					consumedWitnesses[witnessIndex] = struct{}{}
+					nextWitnessIndex = witnessIndex + 1
 				}
 				allRequests = append(allRequests, req)
 				usage.accept(req, limits)
@@ -339,6 +373,107 @@ func computePoolDesiredStates(
 	}
 
 	return applyNestedCaps(cfg, allRequests, aliasHeldTemplates, trace)
+}
+
+// sessionRequestWithDemandWitness enriches one deterministic new-demand slot
+// with its exact bead/store/route provenance. The ordered witness vector is
+// authoritative because bare-ID maps cannot distinguish same-ID rows in two
+// stores. A recovered request's existing ID/ref must match its indexed witness
+// (or one unambiguous exact witness) before any provenance is copied.
+func sessionRequestWithDemandWitness(request SessionRequest, demand scaleCheckDemand, index int) SessionRequest {
+	request, _ = sessionRequestWithAvailableDemandWitness(request, demand, index, nil)
+	return request
+}
+
+func sessionRequestWithAvailableDemandWitness(request SessionRequest, demand scaleCheckDemand, index int, consumed map[int]struct{}) (SessionRequest, int) {
+	witness, witnessIndex, ok := scaleCheckDemandWitnessForRequestIndex(request, demand, index, consumed)
+	if !ok {
+		return request, -1
+	}
+	request.WorkBeadID = witness.ID
+	request.WorkBeadTitle = strings.TrimSpace(witness.Title)
+	request.WorkPack = strings.TrimSpace(witness.Pack)
+	request.WorkWorkspace = strings.TrimSpace(witness.Workspace)
+	request.WorkStoreRef = strings.TrimSpace(witness.StoreRef)
+	request.WorkRouteKey = strings.TrimSpace(witness.RouteKey)
+	request.WorkRoute = strings.TrimSpace(witness.Route)
+	request.BrainParentSID = strings.TrimSpace(witness.ParentSID)
+	return request, witnessIndex
+}
+
+func scaleCheckDemandWitnessForRequestIndex(request SessionRequest, demand scaleCheckDemand, index int, consumed map[int]struct{}) (scaleCheckDemandWitness, int, bool) {
+	requestID := strings.TrimSpace(request.WorkBeadID)
+	requestStoreRef := strings.TrimSpace(request.WorkStoreRef)
+	_, indexedConsumed := consumed[index]
+	if witness, ok := scaleCheckDemandWitnessAt(demand, index); ok && !indexedConsumed {
+		if requestID == "" && (requestStoreRef == "" || scaleCheckDemandStoreRefsMatch(requestStoreRef, witness.StoreRef)) {
+			return witness, index, true
+		}
+		if requestStoreRef != "" && requestID == witness.ID && scaleCheckDemandStoreRefsMatch(requestStoreRef, witness.StoreRef) {
+			return witness, index, true
+		}
+	}
+	if requestID == "" {
+		if requestStoreRef != "" {
+			return scaleCheckDemandWitness{}, -1, false
+		}
+		available := nextAvailableDemandWitnessIndex(demand, 0, consumed)
+		witness, ok := scaleCheckDemandWitnessAt(demand, available)
+		return witness, available, ok
+	}
+
+	witnessCount := len(demand.Witnesses)
+	if witnessCount == 0 {
+		witnessCount = len(demand.WorkBeadIDs)
+	}
+	var matched scaleCheckDemandWitness
+	matchedIndex := -1
+	matches := 0
+	for i := 0; i < witnessCount; i++ {
+		if _, alreadyConsumed := consumed[i]; alreadyConsumed {
+			continue
+		}
+		witness, ok := scaleCheckDemandWitnessAt(demand, i)
+		if !ok || witness.ID != requestID {
+			continue
+		}
+		if requestStoreRef != "" && !scaleCheckDemandStoreRefsMatch(requestStoreRef, witness.StoreRef) {
+			continue
+		}
+		matched = witness
+		matchedIndex = i
+		matches++
+	}
+	return matched, matchedIndex, matches == 1
+}
+
+func nextAvailableDemandWitnessIndex(demand scaleCheckDemand, start int, consumed map[int]struct{}) int {
+	witnessCount := len(demand.Witnesses)
+	if witnessCount == 0 {
+		witnessCount = len(demand.WorkBeadIDs)
+	}
+	if start < 0 {
+		start = 0
+	}
+	for index := start; index < witnessCount; index++ {
+		if _, alreadyConsumed := consumed[index]; !alreadyConsumed {
+			return index
+		}
+	}
+	return witnessCount
+}
+
+func scaleCheckDemandStoreRefsMatch(left, right string) bool {
+	left = strings.TrimSpace(left)
+	right = strings.TrimSpace(right)
+	if left == right {
+		return true
+	}
+	// Retain only the legacy bare-city compatibility. Two canonical city refs
+	// with different names are never equivalent and must not be laundered by
+	// the demand planner before the exact-store claim fence.
+	return (left == "city" && strings.HasPrefix(right, "city:")) ||
+		(right == "city" && strings.HasPrefix(left, "city:"))
 }
 
 func canonicalSingletonAliasHeldTemplates(cfg *config.City, sessionInfos []sessionpkg.Info) map[string]struct{} {

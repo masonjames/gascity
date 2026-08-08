@@ -174,6 +174,7 @@ const (
 	ScopeRoleMetadataKey                 = "gc.scope_role"
 	SessionAffinityMetadataKey           = "gc.session_affinity"
 	SessionIDMetadataKey                 = "gc.session_id"
+	SessionInstanceTokenMetadataKey      = "gc.session_instance_token"
 	// SessionIDCamelMetadataKey is the camelCase variant some bead writers stamp
 	// alongside the snake_case SessionIDMetadataKey; both are read when resolving a
 	// bead's session link.
@@ -424,6 +425,7 @@ var KnownMetadataKeys = []string{
 	ScopeRoleMetadataKey,
 	SessionAffinityMetadataKey,
 	SessionIDMetadataKey,
+	SessionInstanceTokenMetadataKey,
 	SessionIDCamelMetadataKey,
 	SessionNameMetadataKey,
 	SessionNameCamelMetadataKey,

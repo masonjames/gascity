@@ -493,7 +493,7 @@ func canAttributeSession(agentCfg config.Agent, qualifiedName string, cfg *confi
 		return false
 	}
 	cityName := workdirutil.CityName(cityPath, cfg)
-	target := workdirutil.ResolveWorkDirPath(cityPath, cityName, qualifiedName, agentCfg, cfg.Rigs)
+	target := resolveConfiguredAgentWorkDir(cityPath, cityName, qualifiedName, agentCfg, cfg.Rigs)
 	if target == "" {
 		return false
 	}
@@ -510,7 +510,7 @@ func canAttributeSession(agentCfg config.Agent, qualifiedName string, cfg *confi
 				}
 				continue
 			}
-			if workdirutil.ResolveWorkDirPath(cityPath, cityName, a.QualifiedName(), a, cfg.Rigs) == target {
+			if resolveConfiguredAgentWorkDir(cityPath, cityName, a.QualifiedName(), a, cfg.Rigs) == target {
 				count++
 			}
 		}
@@ -527,7 +527,7 @@ func multiSessionSharesWorkDir(cityPath, cityName, target string, a config.Agent
 	isUnlimited := maxSess == nil || *maxSess < 0
 	if !isUnlimited {
 		for slot := 1; slot <= *maxSess; slot++ {
-			if workdirutil.ResolveWorkDirPath(cityPath, cityName, poolQualifiedNameForSlot(a, slot), a, rigs) == target {
+			if resolveConfiguredAgentWorkDir(cityPath, cityName, poolQualifiedNameForSlot(a, slot), a, rigs) == target {
 				return true
 			}
 		}
@@ -538,7 +538,7 @@ func multiSessionSharesWorkDir(cityPath, cityName, target string, a config.Agent
 		poolQualifiedNameForSlot(a, 1),
 		poolQualifiedNameForSlot(a, 2),
 	} {
-		if workdirutil.ResolveWorkDirPath(cityPath, cityName, qualifiedName, a, rigs) == target {
+		if resolveConfiguredAgentWorkDir(cityPath, cityName, qualifiedName, a, rigs) == target {
 			return true
 		}
 	}

@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/gastownhall/gascity/internal/agent"
+	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/runtime"
@@ -56,6 +57,24 @@ func runAdoptionBarrier(
 	sessFront *sessionpkg.Store,
 	sp runtime.Provider,
 	cfg *config.City,
+	cityName string, //nolint:unparam // Compatibility seam retained for focused adoption tests.
+	clk clock.Clock,
+	stderr io.Writer,
+	dryRun bool,
+) (adoptionResult, bool) {
+	workStore := beads.WorkStore{}
+	if sessFront != nil {
+		workStore = beads.WorkStore{Store: sessFront.Store().Store}
+	}
+	return runAdoptionBarrierWithWorkStore(cityPath, sessFront, workStore, sp, cfg, cityName, clk, stderr, dryRun)
+}
+
+func runAdoptionBarrierWithWorkStore(
+	cityPath string,
+	sessFront *sessionpkg.Store,
+	canonicalWorkStore beads.WorkStore,
+	sp runtime.Provider,
+	cfg *config.City,
 	cityName string,
 	clk clock.Clock,
 	stderr io.Writer,
@@ -95,14 +114,14 @@ func runAdoptionBarrier(
 		fmt.Fprintf(stderr, "adoption barrier: listing beads: %v\n", err) //nolint:errcheck
 		return result, false
 	}
-	bySessionName := make(map[string]bool, len(existing))
+	bySessionName := make(map[string]sessionpkg.Info, len(existing))
 	for _, info := range existing {
 		// ListAll already filters via IsSessionBeadOrRepairable and excludes closed.
 		if info.Closed {
 			continue // closed beads don't count for dedup
 		}
 		if sn := info.SessionNameMetadata; sn != "" {
-			bySessionName[sn] = true
+			bySessionName[sn] = info
 		}
 	}
 
@@ -151,7 +170,22 @@ func runAdoptionBarrier(
 			result.Total--
 			continue
 		}
-		if bySessionName[sessionName] {
+		existingInfo, hasExistingInfo := bySessionName[sessionName]
+		if isConfigAgent && cfgAgent.ForbidsProjectHooks() {
+			if !hasExistingInfo {
+				fmt.Fprintf(stderr, "adoption barrier: refusing project_hooks=forbid runtime %s without an existing exact session witness\n", sessionName) //nolint:errcheck
+				result.Skipped++
+				result.Details = append(result.Details, adoptionDetail{SessionName: sessionName, AgentName: cfgAgent.QualifiedName()})
+				continue
+			}
+			if err := strictSessionOwnershipAuthorized(cfg, cityPath, cityName, sessFront.Store().Store, canonicalWorkStore, existingInfo); err != nil {
+				fmt.Fprintf(stderr, "adoption barrier: refusing project_hooks=forbid runtime %s: %v\n", sessionName, err) //nolint:errcheck
+				result.Skipped++
+				result.Details = append(result.Details, adoptionDetail{SessionName: sessionName, AgentName: cfgAgent.QualifiedName(), HasBead: true})
+				continue
+			}
+		}
+		if hasExistingInfo {
 			result.AlreadyHadBead++
 			result.Details = append(result.Details, adoptionDetail{
 				SessionName: sessionName,

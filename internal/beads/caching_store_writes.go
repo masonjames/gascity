@@ -549,6 +549,14 @@ func newCachingStoreTx() *cachingStoreTx {
 	}
 }
 
+func (tx *cachingStoreTx) Get(id string) (Bead, error) {
+	reader, ok := tx.backing.(ReadTx)
+	if !ok {
+		return Bead{}, ErrCreateAssignmentClaimUnsupported
+	}
+	return reader.Get(id)
+}
+
 func (tx *cachingStoreTx) Create(b Bead) (Bead, error) {
 	created, err := tx.backing.Create(b)
 	if err != nil {

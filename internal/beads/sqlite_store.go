@@ -1462,6 +1462,13 @@ func sqliteReadySQL(q ReadyQuery, projection string) (string, []any) {
 		sqlText += " AND b.assignee=?"
 		args = append(args, q.Assignee)
 	}
+	if len(q.ExcludeLabels) > 0 {
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(q.ExcludeLabels)), ",")
+		sqlText += " AND NOT EXISTS (SELECT 1 FROM labels l WHERE l.bead_id=b.id AND l.label IN (" + placeholders + "))"
+		for _, label := range q.ExcludeLabels {
+			args = append(args, label)
+		}
+	}
 	sqlText += " ORDER BY b.created_at ASC, b.id ASC"
 	if q.Limit > 0 && q.TierMode != TierWisps {
 		sqlText += fmt.Sprintf(" LIMIT %d", q.Limit)
@@ -1592,6 +1599,10 @@ type sqliteStoreTx struct {
 	store *SQLiteStore
 	ctx   context.Context
 	tx    *sql.Tx
+}
+
+func (t *sqliteStoreTx) Get(id string) (Bead, error) {
+	return t.store.getTx(t.ctx, t.tx, id)
 }
 
 func (t *sqliteStoreTx) Create(b Bead) (Bead, error) {

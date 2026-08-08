@@ -806,6 +806,7 @@ func TestDeepCopyAgentCoversAllFields(t *testing.T) {
 		Description:                  "test agent description",
 		Dir:                          "original-dir",
 		WorkDir:                      ".gc/agents/original",
+		ProjectHooks:                 config.ProjectHooksForbid,
 		Scope:                        "city",
 		Suspended:                    true,
 		PreStart:                     []string{"pre-cmd"},
@@ -836,6 +837,8 @@ func TestDeepCopyAgentCoversAllFields(t *testing.T) {
 		SleepAfterIdle:               "30s",
 		SleepAfterIdleSource:         "agent",
 		InstallAgentHooks:            []string{"claude"},
+		Skills:                       []string{"legacy-skill"},
+		MCP:                          []string{"legacy-mcp"},
 		SkillsDir:                    "/skills",
 		MCPDir:                       "/mcp",
 		HooksInstalled:               &trueVal,
@@ -845,6 +848,8 @@ func TestDeepCopyAgentCoversAllFields(t *testing.T) {
 		SessionLive:                  []string{"live-cmd"},
 		OverlayDir:                   "overlays/test",
 		SourceDir:                    "/src",
+		SharedSkills:                 []string{"shared-legacy-skill"},
+		SharedMCP:                    []string{"shared-legacy-mcp"},
 		DefaultSlingFormula:          strPtr("mol-work"),
 		InheritedDefaultSlingFormula: strPtr("mol-pack"),
 		InjectFragments:              []string{"frag1"},
@@ -869,32 +874,21 @@ func TestDeepCopyAgentCoversAllFields(t *testing.T) {
 		AssignedWorkDeferLimit:       intPtr(3),
 	}
 
-	// Tombstone fields (deprecated in v0.15.1, removed in v0.16) are not
-	// deep-copied; they are accepted by the TOML parser but not propagated
-	// through the runtime. The deep-copy contract deliberately drops them.
-	//
-	// The unexported `source` (ga-tpfc) and `layout` (ga-9ogb) fields
-	// are also intentionally dropped: they are config-package-internal
-	// provenance enums that describe the agent's discovery origin. Pool
-	// instances are derived objects, not discovery sites, so leaving
-	// them at the zero value is semantically correct and the deep-copy
-	// in cmd/gc cannot reach across the package boundary to set an
-	// unexported field anyway.
-	tombstones := map[string]bool{
-		"Skills":       true,
-		"MCP":          true,
-		"SharedSkills": true,
-		"SharedMCP":    true,
-		"source":       true,
-		"layout":       true,
+	// The unexported source/layout provenance fields cannot be populated from
+	// this package. Agent.Clone owns their value-copy contract; every exported
+	// field is populated here so additions cannot silently disappear from pool
+	// instances.
+	uninspectable := map[string]bool{
+		"source": true,
+		"layout": true,
 	}
 
-	// Verify every non-tombstone Agent field is set (non-zero) in the test data.
+	// Verify every inspectable Agent field is set (non-zero) in the test data.
 	sv := reflect.ValueOf(src)
 	st := sv.Type()
 	for i := 0; i < st.NumField(); i++ {
 		fname := st.Field(i).Name
-		if tombstones[fname] {
+		if uninspectable[fname] {
 			continue
 		}
 		if sv.Field(i).IsZero() {
@@ -912,14 +906,14 @@ func TestDeepCopyAgentCoversAllFields(t *testing.T) {
 		t.Errorf("Dir = %q, want %q", dst.Dir, "copy-dir")
 	}
 
-	// All other non-tombstone fields should match the source.
+	// Every other inspectable field must survive the clone.
 	dv := reflect.ValueOf(dst)
 	for i := 0; i < st.NumField(); i++ {
 		fname := st.Field(i).Name
 		if fname == "Name" || fname == "Dir" {
 			continue // Intentionally overridden.
 		}
-		if tombstones[fname] {
+		if uninspectable[fname] {
 			continue
 		}
 		if dv.Field(i).IsZero() {
@@ -937,6 +931,10 @@ func TestDeepCopyAgentCoversAllFields(t *testing.T) {
 	src.AppendFragments[0] = "MUTATED"
 	src.InheritedAppendFragments[0] = "MUTATED"
 	src.InstallAgentHooks[0] = "MUTATED"
+	src.Skills[0] = "MUTATED"
+	src.MCP[0] = "MUTATED"
+	src.SharedSkills[0] = "MUTATED"
+	src.SharedMCP[0] = "MUTATED"
 	newMin := 999
 	src.MinActiveSessions = &newMin
 
@@ -966,6 +964,9 @@ func TestDeepCopyAgentCoversAllFields(t *testing.T) {
 	}
 	if dst.InstallAgentHooks[0] == "MUTATED" {
 		t.Error("InstallAgentHooks is not a deep copy")
+	}
+	if dst.Skills[0] == "MUTATED" || dst.MCP[0] == "MUTATED" || dst.SharedSkills[0] == "MUTATED" || dst.SharedMCP[0] == "MUTATED" {
+		t.Error("legacy attachment fields are not a deep copy")
 	}
 	if dst.MinActiveSessions != nil && *dst.MinActiveSessions == 999 {
 		t.Error("MinActiveSessions is not a deep copy")

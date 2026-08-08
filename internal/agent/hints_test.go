@@ -81,6 +81,7 @@ func TestStartupHintsToRuntimeConfigCopiesValues(t *testing.T) {
 		PackOverlayDirs:        []string{"/pack/overlay"},
 		OverlayDir:             "/agent/overlay",
 		CopyFiles:              make([]runtime.CopyEntry, 1),
+		ProjectHooksForbidden:  true,
 	}
 
 	cfg := hints.ToRuntimeConfig()
@@ -138,5 +139,8 @@ func TestStartupHintsToRuntimeConfigCopiesValues(t *testing.T) {
 	}
 	if len(cfg.CopyFiles) != 1 {
 		t.Errorf("CopyFiles len = %d, want 1", len(cfg.CopyFiles))
+	}
+	if !cfg.ProjectHooksForbidden {
+		t.Error("ProjectHooksForbidden = false, want true")
 	}
 }

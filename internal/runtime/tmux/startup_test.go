@@ -42,14 +42,16 @@ type fakeStartOps struct {
 	// createSession returns errors from this slice sequentially.
 	// First call returns createErrs[0], second call returns createErrs[1], etc.
 	// If the slice is exhausted, returns nil.
-	createErrs []error
-	createIdx  int
+	createErrs        []error
+	createIdx         int
+	createSessionHook func(int)
 
 	respawnErr error
 
 	isSessionRunningResult     *bool
 	isRuntimeRunningResult     bool
 	killErr                    error
+	killSessionHook            func()
 	waitCommandErr             error
 	acceptStartupDialogsErr    error
 	waitReadyErr               error
@@ -84,6 +86,10 @@ func (f *fakeStartOps) createSession(name, workDir, command string, env map[stri
 		command: command,
 		env:     env,
 	})
+	callIndex := f.createIdx
+	if f.createSessionHook != nil {
+		f.createSessionHook(callIndex)
+	}
 	if f.createIdx < len(f.createErrs) {
 		err := f.createErrs[f.createIdx]
 		f.createIdx++
@@ -125,8 +131,15 @@ func (f *fakeStartOps) isRuntimeRunning(name string, processNames []string) bool
 
 func (f *fakeStartOps) killSession(name string) error {
 	f.calls = append(f.calls, startCall{method: "killSession", name: name})
+	if f.killSessionHook != nil {
+		f.killSessionHook()
+	}
 	return f.killErr
 }
+
+// waitCreateRetry keeps retry-path tests deterministic and sleep-free. Real
+// tmux start operations retain the bounded retry delay.
+func (f *fakeStartOps) waitCreateRetry() {}
 
 func (f *fakeStartOps) waitForCommand(_ context.Context, name string, timeout time.Duration) error {
 	f.calls = append(f.calls, startCall{

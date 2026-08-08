@@ -1165,7 +1165,10 @@ func (s *NativeDoltStore) Ready(queries ...ReadyQuery) ([]Bead, error) {
 		now := time.Now().UTC()
 	statusLoop:
 		for _, status := range nativeDoltOpenReadyStatuses {
-			filter := beadslib.WorkFilter{Status: status}
+			filter := beadslib.WorkFilter{
+				Status:        status,
+				ExcludeLabels: append([]string(nil), q.ExcludeLabels...),
+			}
 			if q.TierMode == TierBoth || q.TierMode == TierWisps {
 				filter.IncludeEphemeral = true
 			}
@@ -1434,6 +1437,21 @@ type nativeDoltTx struct {
 	store *NativeDoltStore
 	ctx   context.Context
 	tx    beadslib.Transaction
+}
+
+func (t *nativeDoltTx) Get(id string) (Bead, error) {
+	issue, err := t.tx.GetIssue(t.ctx, id)
+	if err != nil {
+		return Bead{}, nativeStoreError(id, err)
+	}
+	if issue == nil {
+		return Bead{}, fmt.Errorf("reading bead %q in native transaction: %w", id, ErrNotFound)
+	}
+	labels, err := t.tx.GetLabels(t.ctx, id)
+	if err != nil {
+		return Bead{}, nativeStoreError(id, err)
+	}
+	return nativeAssignmentClaimBead(issue, labels, id)
 }
 
 func (t *nativeDoltTx) Create(b Bead) (Bead, error) {
@@ -1837,6 +1855,7 @@ func nativeIssueFromBead(b Bead) (*beadslib.Issue, error) {
 		Ephemeral:   b.Ephemeral,
 		NoHistory:   b.NoHistory,
 		DeferUntil:  cloneTimePtr(b.DeferUntil),
+		RowVersion:  b.Revision,
 	}
 	if b.Priority != nil {
 		issue.Priority = *b.Priority
@@ -1901,6 +1920,7 @@ func beadFromNativeIssue(issue *beadslib.Issue) (Bead, error) {
 		Ephemeral:   issue.Ephemeral,
 		NoHistory:   issue.NoHistory,
 		DeferUntil:  cloneTimePtr(issue.DeferUntil),
+		Revision:    issue.RowVersion,
 	}
 	for _, dep := range issue.Dependencies {
 		if dep == nil {

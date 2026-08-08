@@ -157,12 +157,32 @@ func (q ListQuery) Validate() error {
 type ReadyQuery struct {
 	Assignee string
 	Limit    int
+	// ExcludeLabels removes a bead when it carries ANY listed label. Stores
+	// must apply the predicate before Limit so a held prefix cannot hide later
+	// eligible work.
+	ExcludeLabels []string
 	// TierMode selects the storage tier(s) to read from. Zero value
 	// (TierIssues) preserves raw Ready's historical main-tier behavior.
 	// Policy-aware callers should use the policy store wrapper, which expands
 	// default Ready reads to TierBoth so no-history and ephemeral policy rows
 	// remain reachable under bd 1.0.4.
 	TierMode TierMode
+}
+
+// IsZero reports whether q preserves Ready's historical unfiltered behavior.
+func (q ReadyQuery) IsZero() bool {
+	return q.Assignee == "" && q.Limit == 0 && len(q.ExcludeLabels) == 0 && q.TierMode == TierIssues
+}
+
+func (q ReadyQuery) excludesAnyLabel(labels []string) bool {
+	for _, label := range labels {
+		for _, excluded := range q.ExcludeLabels {
+			if label == excluded {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func readyQueryFromArgs(queries []ReadyQuery) ReadyQuery {

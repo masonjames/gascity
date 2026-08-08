@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gastownhall/gascity/internal/runtime"
 )
 
 // fakeExecutor captures tmux command arguments for unit testing.
@@ -66,18 +68,44 @@ func TestNewSessionWithCommandAndEnvClearsEmptyVars(t *testing.T) {
 	if !strings.Contains(joined, "\x00-e\x00LANG=en_US.UTF-8\x00") {
 		t.Fatalf("new-session args missing LANG -e flag: %v", args)
 	}
+	for _, key := range []string{"LC_ALL", "LC_CTYPE"} {
+		if !strings.Contains(joined, "\x00-e\x00"+key+"=\x00") {
+			t.Fatalf("new-session args missing atomic empty %s -e flag: %v", key, args)
+		}
+	}
 	if got := args[len(args)-1]; got != "env -u LC_ALL -u LC_CTYPE claude" {
 		t.Fatalf("command = %q, want env -u LC_ALL -u LC_CTYPE claude", got)
+	}
+}
+
+func TestNewSessionWithCommandAndEnvRejectsMalformedKeyBeforeTmux(t *testing.T) {
+	for _, key := range []string{"", "-r", "BAD-NAME", "BAD;touch-marker"} {
+		t.Run(key, func(t *testing.T) {
+			exec := &fakeExecutor{}
+			tm := NewTmux()
+			tm.exec = exec
+
+			err := tm.NewSessionWithCommandAndEnv("gc-test-invalid-env-key", "", "codex --disable hooks", map[string]string{
+				"VALID_1": "ok",
+				key:       "",
+			})
+			if err == nil || !strings.Contains(err.Error(), "environment key") {
+				t.Fatalf("NewSessionWithCommandAndEnv error = %v, want malformed environment-key rejection", err)
+			}
+			if len(exec.calls) != 0 {
+				t.Fatalf("tmux calls = %v, want zero before malformed-key rejection", exec.calls)
+			}
+		})
 	}
 }
 
 // The controller token is withheld from agent panes by an EMPTY value, not by
 // dropping the key (convergence.ScrubTokenEnv, processenv.ControllerOnlyEnvKeys).
 // This pins the adapter half of that contract at the argv boundary: an empty
-// value must become an `env -u` prefix on the pane command, never a `-e KEY=`
-// flag, because -e alone would leave the tmux server's global copy visible to
-// the shell. A key the caller dropped emits neither, which is why dropping
-// withholds nothing.
+// value must become both an atomic empty `-e KEY=` session value (so tmux's
+// parsing shell cannot consume a server-global injection value) and an `env -u`
+// prefix on the pane command (so the launched child sees the key absent). A key
+// the caller dropped emits neither, which is why dropping withholds nothing.
 func TestNewSessionWithCommandAndEnvUnsetsControllerToken(t *testing.T) {
 	exec := &fakeExecutor{}
 	tm := NewTmux()
@@ -96,8 +124,8 @@ func TestNewSessionWithCommandAndEnvUnsetsControllerToken(t *testing.T) {
 
 	args := exec.calls[0]
 	joined := strings.Join(args, "\x00")
-	if strings.Contains(joined, "\x00-e\x00GC_CONTROLLER_TOKEN=") {
-		t.Fatalf("new-session exported GC_CONTROLLER_TOKEN with -e instead of unsetting it: %v", args)
+	if !strings.Contains(joined, "\x00-e\x00GC_CONTROLLER_TOKEN=\x00") {
+		t.Fatalf("new-session did not atomically neutralize GC_CONTROLLER_TOKEN before its parsing shell: %v", args)
 	}
 	if got := args[len(args)-1]; got != "env -u GC_CONTROLLER_TOKEN claude" {
 		t.Fatalf("command = %q, want %q", got, "env -u GC_CONTROLLER_TOKEN claude")
@@ -495,6 +523,179 @@ func TestRespawnAgentMarksControllerTokenRemovedFromSessionEnv(t *testing.T) {
 	if strings.Contains(setEnv, "GC_CITY") {
 		t.Errorf("first call = %q marked GC_CITY removed; only empty-valued keys are withheld", setEnv)
 	}
+}
+
+func TestRespawnAgentKeepsProjectHookLaunchInjectionEnvWithheld(t *testing.T) {
+	exec := &fakeExecutor{}
+	tm := NewTmux()
+	tm.exec = exec
+	ops := &tmuxStartOps{tm: tm}
+
+	env := map[string]string{
+		"BASH_ENV": "",
+		"ZDOTDIR":  "",
+	}
+	if err := ops.respawnAgent("gc-test-project-hook-env-pin", "/proj", "codex --disable hooks", env); err != nil {
+		t.Fatalf("respawnAgent: %v", err)
+	}
+	if len(exec.calls) != 3 {
+		t.Fatalf("tmux calls = %d (%v), want 3 (two set-environment removals then respawn-pane)", len(exec.calls), exec.calls)
+	}
+	for i, key := range []string{"BASH_ENV", "ZDOTDIR"} {
+		setEnv := strings.Join(exec.calls[i], " ")
+		if !strings.Contains(setEnv, "set-environment -t gc-test-project-hook-env-pin -r "+key) {
+			t.Errorf("call %d = %q, want durable %s removal", i, setEnv, key)
+		}
+	}
+	if respawn := strings.Join(exec.calls[2], " "); !strings.Contains(respawn, "respawn-pane") {
+		t.Errorf("third call = %q, want respawn-pane", respawn)
+	}
+}
+
+func TestRespawnAgentReconcilesFinalizedProjectHookEnvironmentBeforeRespawn(t *testing.T) {
+	env := finalizedProjectHookRespawnEnv()
+	exec := &sessionEnvironmentExecutor{
+		values: map[string]string{
+			"HOME":       "/contaminated/home",
+			"CODEX_HOME": "/contaminated/home/.codex",
+			"PATH":       "/project/bin",
+			"GC_BIN":     "/project/gc",
+			"BASH_ENV":   "/project/bash-env",
+		},
+		removed: make(map[string]bool),
+	}
+	tm := NewTmux()
+	tm.exec = exec
+	ops := &tmuxStartOps{tm: tm}
+
+	if err := ops.respawnAgent("gc-test-project-hook-env-reconcile", "/isolated/work", "codex --disable hooks", env); err != nil {
+		t.Fatalf("respawnAgent: %v", err)
+	}
+	for key, want := range env {
+		if want == "" {
+			if !exec.removed[key] {
+				t.Errorf("session env %s was not marked removed", key)
+			}
+			continue
+		}
+		if got := exec.values[key]; got != want {
+			t.Errorf("session env %s = %q, want %q", key, got, want)
+		}
+	}
+	if !exec.respawned {
+		t.Fatal("respawn-pane was not called after environment attestation")
+	}
+}
+
+func TestRespawnAgentRejectsProjectHookEnvironmentReadbackDriftBeforeRespawn(t *testing.T) {
+	env := finalizedProjectHookRespawnEnv()
+	exec := &sessionEnvironmentExecutor{
+		values: map[string]string{
+			"HOME":       "/contaminated/home",
+			"CODEX_HOME": "/contaminated/home/.codex",
+			"PATH":       "/project/bin",
+			"GC_BIN":     "/project/gc",
+		},
+		removed:      make(map[string]bool),
+		ignoreSetKey: "HOME",
+	}
+	tm := NewTmux()
+	tm.exec = exec
+	ops := &tmuxStartOps{tm: tm}
+
+	err := ops.respawnAgent("gc-test-project-hook-env-drift", "/isolated/work", "codex --disable hooks", env)
+	if err == nil || !strings.Contains(err.Error(), "HOME") {
+		t.Fatalf("respawnAgent error = %v, want HOME readback drift", err)
+	}
+	if exec.respawned {
+		t.Fatal("respawn-pane was called despite environment readback drift")
+	}
+}
+
+func TestRespawnAgentRejectsMalformedEnvironmentKeyBeforeSetOrRespawn(t *testing.T) {
+	for _, key := range []string{"-r", "BAD-NAME", "BAD;touch-marker"} {
+		t.Run(key, func(t *testing.T) {
+			env := finalizedProjectHookRespawnEnv()
+			env[key] = ""
+			exec := &sessionEnvironmentExecutor{
+				values:  make(map[string]string),
+				removed: make(map[string]bool),
+			}
+			tm := NewTmux()
+			tm.exec = exec
+			ops := &tmuxStartOps{tm: tm}
+
+			err := ops.respawnAgent("gc-test-project-hook-invalid-env-key", "/isolated/work", "codex --disable hooks", env)
+			if err == nil || !strings.Contains(err.Error(), "environment key") {
+				t.Fatalf("respawnAgent error = %v, want malformed environment-key rejection", err)
+			}
+			if len(exec.calls) != 0 {
+				t.Fatalf("tmux calls = %v, want zero set-environment/respawn calls", exec.calls)
+			}
+			if exec.respawned {
+				t.Fatal("respawn-pane was called despite malformed environment key")
+			}
+		})
+	}
+}
+
+func finalizedProjectHookRespawnEnv() map[string]string {
+	env := map[string]string{
+		"HOME":       "/isolated/home",
+		"CODEX_HOME": "/isolated/home/.codex",
+		"PATH":       "/trusted/bin:/usr/bin",
+		"GC_BIN":     "/trusted/bin/gc",
+	}
+	for _, key := range runtime.ProjectHookIsolationWithheldEnvKeys() {
+		env[key] = ""
+	}
+	return env
+}
+
+type sessionEnvironmentExecutor struct {
+	calls        [][]string
+	values       map[string]string
+	removed      map[string]bool
+	ignoreSetKey string
+	respawned    bool
+}
+
+func (e *sessionEnvironmentExecutor) execute(args []string) (string, error) {
+	call := append([]string(nil), args...)
+	e.calls = append(e.calls, call)
+	if command := slices.Index(args, "set-environment"); command >= 0 {
+		if removed := slices.Index(args[command+1:], "-r"); removed >= 0 {
+			keyIndex := command + 1 + removed + 1
+			key := args[keyIndex]
+			if key != e.ignoreSetKey {
+				delete(e.values, key)
+				e.removed[key] = true
+			}
+			return "", nil
+		}
+		key := args[len(args)-2]
+		value := args[len(args)-1]
+		if key != e.ignoreSetKey {
+			e.values[key] = value
+			delete(e.removed, key)
+		}
+		return "", nil
+	}
+	if slices.Contains(args, "show-environment") {
+		key := args[len(args)-1]
+		if e.removed[key] {
+			return "-" + key, nil
+		}
+		return key + "=" + e.values[key], nil
+	}
+	if slices.Contains(args, "respawn-pane") {
+		e.respawned = true
+	}
+	return "", nil
+}
+
+func (e *sessionEnvironmentExecutor) executeCtx(_ context.Context, args []string) (string, error) {
+	return e.execute(args)
 }
 
 // No withheld CREDENTIAL means no extra tmux round-trip. The nesting-detection

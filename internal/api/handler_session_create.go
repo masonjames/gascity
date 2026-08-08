@@ -185,6 +185,7 @@ func (s *Server) handleSessionCreate(w http.ResponseWriter, r *http.Request) {
 		writeSessionManagerError(w, err)
 		return
 	}
+	resolvedCfg.Runtime.Hints.ProjectHooksForbidden = createCtx.Agent.ForbidsProjectHooks()
 	handle, err := s.newResolvedWorkerSessionHandle(store.Store, resolvedCfg)
 	if err != nil {
 		s.idem.unreserve(idemKey)

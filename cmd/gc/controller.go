@@ -994,7 +994,7 @@ func tryReloadConfig(tomlPath, lockedWorkspaceName, cityRoot string) (*reloadRes
 			warnings: warnings,
 		}
 	}
-	if err := config.ValidateAgents(newCfg.Agents); err != nil {
+	if err := config.ValidateCityAgents(newCfg); err != nil {
 		return failWithWarnings(fmt.Errorf("validating agents: %w", err))
 	}
 	if err := config.ValidateServices(newCfg.Services); err != nil {
@@ -1284,7 +1284,7 @@ func runController(
 	cfg *config.City,
 	configRev string,
 	buildFn func(*config.City, runtime.Provider, beads.Store) DesiredStateResult,
-	buildFnWithSessionBeads func(*config.City, runtime.Provider, beads.Store, map[string]beads.Store, *sessionBeadSnapshot, *sessionReconcilerTraceCycle) DesiredStateResult,
+	buildFnWithStores func(*config.City, runtime.Provider, beads.SessionStore, beads.WorkStore, map[string]beads.Store, *sessionBeadSnapshot, *sessionReconcilerTraceCycle) DesiredStateResult,
 	sp runtime.Provider,
 	dops drainOps,
 	poolSessions map[string]time.Duration,
@@ -1352,28 +1352,28 @@ func runController(
 	fmt.Fprintln(stdout, "Controller started.") //nolint:errcheck // best-effort stdout
 
 	cr, err := newCityRuntime(CityRuntimeParams{
-		CityPath:                cityPath,
-		CityName:                cityName,
-		TomlPath:                tomlPath,
-		WatchTargets:            initialWatchTargets,
-		ConfigRev:               configRev,
-		ConfigDirty:             configDirty,
-		Cfg:                     cfg,
-		SP:                      sp,
-		Publication:             supervisor.PublicationConfig{},
-		BuildFn:                 buildFn,
-		BuildFnWithSessionBeads: buildFnWithSessionBeads,
-		Dops:                    dops,
-		Rec:                     rec,
-		PoolSessions:            poolSessions,
-		PoolDeathHandlers:       poolDeathHandlers,
-		ForceStopShutdown:       forceShutdown,
-		ReloadReqCh:             reloadReqCh,
-		ConvergenceReqCh:        convergenceReqCh,
-		PokeCh:                  pokeCh,
-		ControlDispatcherCh:     controlDispatcherCh,
-		Stdout:                  stdout,
-		Stderr:                  stderr,
+		CityPath:            cityPath,
+		CityName:            cityName,
+		TomlPath:            tomlPath,
+		WatchTargets:        initialWatchTargets,
+		ConfigRev:           configRev,
+		ConfigDirty:         configDirty,
+		Cfg:                 cfg,
+		SP:                  sp,
+		Publication:         supervisor.PublicationConfig{},
+		BuildFn:             buildFn,
+		BuildFnWithStores:   buildFnWithStores,
+		Dops:                dops,
+		Rec:                 rec,
+		PoolSessions:        poolSessions,
+		PoolDeathHandlers:   poolDeathHandlers,
+		ForceStopShutdown:   forceShutdown,
+		ReloadReqCh:         reloadReqCh,
+		ConvergenceReqCh:    convergenceReqCh,
+		PokeCh:              pokeCh,
+		ControlDispatcherCh: controlDispatcherCh,
+		Stdout:              stdout,
+		Stderr:              stderr,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "gc start: %v\n", err) //nolint:errcheck // best-effort stderr

@@ -16,6 +16,11 @@ import "github.com/gastownhall/gascity/internal/beads"
 // LifecycleDisplayReasonWithLiveness, the NamedSessionMetadataKey lookup), never
 // by re-reading a bead.
 type PersistedResponse struct {
+	// Revision is the store's optimistic-concurrency token for the exact bead
+	// fetch that produced Info and this response. Strict ownership boundaries
+	// carry it into conditional SESSION updates so an external writer cannot be
+	// overwritten between validation and commit.
+	Revision int64
 	// Status is the persisted bead status ("open"/"closed"), used to derive the
 	// lifecycle reason and to gate the metadata-derived fields on closed beads.
 	Status string
@@ -29,6 +34,7 @@ type PersistedResponse struct {
 // the same PersistedResponse regardless of which backend stored it.
 func PersistedResponseFromBead(b beads.Bead) PersistedResponse {
 	return PersistedResponse{
+		Revision: b.Revision,
 		Status:   b.Status,
 		Metadata: b.Metadata,
 	}

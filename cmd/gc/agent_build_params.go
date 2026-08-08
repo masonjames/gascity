@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"time"
 
@@ -43,6 +44,18 @@ type agentBuildParams struct {
 	// instead of the legacy SessionNameFor function.
 	beadStore beads.Store
 
+	// canonicalCityWorkStore is the actual typed city WORK-class store for
+	// this build. It is deliberately distinct from beadStore, which is the
+	// SESSION-class store. Strict project-hook isolation requires the two
+	// handles to resolve to one physical ownership carrier before any session
+	// or work mutation can be authorized.
+	canonicalCityWorkStore beads.WorkStore
+
+	// rigStores is the exact configured rig-name to store map for this build.
+	// Routed new-pool work uses it to resolve its recorded canonical store ref
+	// without opening, walking, or federating into any ambient bead store.
+	rigStores map[string]beads.Store
+
 	// sessionBeads caches the open session-bead snapshot for the current
 	// desired-state build so per-agent resolution does not rescan the store.
 	sessionBeads *sessionBeadSnapshot
@@ -51,6 +64,11 @@ type agentBuildParams struct {
 	// build. Pool new-tier materialization uses it to avoid treating sessions
 	// that already own work as available generic capacity.
 	assignedWorkBeads []beads.Bead
+
+	// suppressedSessionBeadIDs contains session beads that failed an exact
+	// guarded work claim or trigger bind in this build. The later discovery
+	// overlay must not re-add them and bypass the fail-closed realization gate.
+	suppressedSessionBeadIDs map[string]bool
 
 	// poolSessionCreateBudget caps ordinary fresh pool session bead
 	// materialization in a single desired-state build. Existing session beads
@@ -100,39 +118,70 @@ type agentBuildParams struct {
 	// hooks that reload the broken rig catalog and fail at runtime.
 	failedRigSkillCatalogs map[string]bool
 
-	// sessionProvider is cfg.Session.Provider (the city-level session
-	// runtime selector: "" / "tmux" / "subprocess" / "acp" / "k8s" /
-	// etc.). Used by the skill materialization integration to decide
-	// stage-2 eligibility.
+	// sessionProvider is the effective city-level runtime selector after the
+	// same GC_SESSION-over-config choice used to construct sp ("" / "tmux" /
+	// "subprocess" / "acp" / "k8s" / etc.). Template resolution uses it for
+	// provider fencing and skill materialization eligibility.
 	sessionProvider string
 }
 
 // newAgentBuildParams constructs agentBuildParams from the common startup values.
 func newAgentBuildParams(cityName, cityPath string, cfg *config.City, sp runtime.Provider, beaconTime time.Time, store beads.Store, stderr io.Writer) *agentBuildParams {
+	return newAgentBuildParamsWithStores(
+		cityName,
+		cityPath,
+		cfg,
+		sp,
+		beaconTime,
+		beads.SessionStore{Store: store},
+		beads.WorkStore{Store: store},
+		stderr,
+	)
+}
+
+// newAgentBuildParamsWithStores constructs build parameters from explicit,
+// typed SESSION and WORK class handles. Production desired-state paths use
+// this constructor so a relocated session class cannot be mistaken for the
+// canonical city work ledger. newAgentBuildParams remains the same-store
+// compatibility wrapper for narrow tests and legacy no-store callers.
+func newAgentBuildParamsWithStores(
+	cityName, cityPath string,
+	cfg *config.City,
+	sp runtime.Provider,
+	beaconTime time.Time,
+	sessionStore beads.SessionStore,
+	workStore beads.WorkStore,
+	stderr io.Writer,
+) *agentBuildParams {
+	selectedSessionProvider := sessionProviderContextForCity(cfg, cityPath, os.Getenv("GC_SESSION")).providerName
 	params := &agentBuildParams{
-		city:            cfg,
-		cityName:        cityName,
-		cityPath:        cityPath,
-		workspace:       &cfg.Workspace,
-		agents:          append([]config.Agent(nil), cfg.Agents...),
-		providers:       cfg.Providers,
-		lookPath:        exec.LookPath,
-		fs:              fsys.OSFS{},
-		sp:              sp,
-		rigs:            cfg.Rigs,
-		sessionTemplate: cfg.Workspace.SessionTemplate,
-		beaconTime:      beaconTime,
-		packDirs:        cfg.PackDirs,
-		packOverlayDirs: cfg.PackOverlayDirs,
-		rigOverlayDirs:  cfg.RigOverlayDirs,
-		globalFragments: cfg.Workspace.GlobalFragments,
-		appendFragments: mergeFragmentLists(cfg.AgentDefaults.AppendFragments, cfg.AgentsDefaults.AppendFragments),
-		beadStore:       store,
-		beadNames:       make(map[string]string),
-		stderr:          stderr,
-		sessionProvider: cfg.Session.Provider,
+		city:                   cfg,
+		cityName:               cityName,
+		cityPath:               cityPath,
+		workspace:              &cfg.Workspace,
+		agents:                 append([]config.Agent(nil), cfg.Agents...),
+		providers:              cfg.Providers,
+		lookPath:               exec.LookPath,
+		fs:                     fsys.OSFS{},
+		sp:                     sp,
+		rigs:                   cfg.Rigs,
+		sessionTemplate:        cfg.Workspace.SessionTemplate,
+		beaconTime:             beaconTime,
+		packDirs:               cfg.PackDirs,
+		packOverlayDirs:        cfg.PackOverlayDirs,
+		rigOverlayDirs:         cfg.RigOverlayDirs,
+		globalFragments:        cfg.Workspace.GlobalFragments,
+		appendFragments:        mergeFragmentLists(cfg.AgentDefaults.AppendFragments, cfg.AgentsDefaults.AppendFragments),
+		beadStore:              sessionStore.Store,
+		canonicalCityWorkStore: workStore,
+		beadNames:              make(map[string]string),
+		stderr:                 stderr,
+		// Use the same env-over-config selection that constructed sp. A
+		// project-hooks=forbid template must fence the provider that will
+		// actually receive Start, not merely the city.toml default.
+		sessionProvider: selectedSessionProvider,
 	}
-	if store != nil {
+	if sessionStore.Store != nil {
 		params.poolSessionCreateBudget = poolplan.NewCreateBudget(cfg.Daemon.MaxWakesPerTickOrDefault())
 	}
 	// Load the shared skill catalog once per build cycle. Transient load

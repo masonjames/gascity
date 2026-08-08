@@ -55,3 +55,95 @@ func TestClassStoresEmbedStore(t *testing.T) {
 		})
 	}
 }
+
+func TestClassStoresExposeGuardedAssignmentCapability(t *testing.T) {
+	base := NewMemStore()
+	cases := []struct {
+		name  string
+		store Store
+	}{
+		{"WorkStore", WorkStore{Store: base}},
+		{"GraphStore", GraphStore{Store: base}},
+		{"SessionStore", SessionStore{Store: base}},
+		{"MailStore", MailStore{Store: base}},
+		{"OrdersStore", OrdersStore{Store: base}},
+		{"NudgesStore", NudgesStore{Store: base}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			claimer, ok := GuardedAssignmentClaimerFor(tc.store)
+			if !ok || claimer != base {
+				t.Fatalf("GuardedAssignmentClaimerFor(%s) = (%T, %v), want embedded MemStore", tc.name, claimer, ok)
+			}
+		})
+	}
+}
+
+func TestClassStoresExposeCreateAssignmentCapability(t *testing.T) {
+	base := NewMemStore()
+	cases := []struct {
+		name  string
+		store Store
+	}{
+		{"WorkStore", WorkStore{Store: base}},
+		{"GraphStore", GraphStore{Store: base}},
+		{"SessionStore", SessionStore{Store: base}},
+		{"MailStore", MailStore{Store: base}},
+		{"OrdersStore", OrdersStore{Store: base}},
+		{"NudgesStore", NudgesStore{Store: base}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			claimer, ok := CreateAssignmentClaimerFor(tc.store)
+			if !ok || claimer != base {
+				t.Fatalf("CreateAssignmentClaimerFor(%s) = (%T, %v), want embedded MemStore", tc.name, claimer, ok)
+			}
+		})
+	}
+}
+
+func TestClassStoresExposeAssignmentReleaseCapability(t *testing.T) {
+	base := NewMemStore()
+	cases := []struct {
+		name  string
+		store Store
+	}{
+		{"WorkStore", WorkStore{Store: base}},
+		{"GraphStore", GraphStore{Store: base}},
+		{"SessionStore", SessionStore{Store: base}},
+		{"MailStore", MailStore{Store: base}},
+		{"OrdersStore", OrdersStore{Store: base}},
+		{"NudgesStore", NudgesStore{Store: base}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			releaser, ok := AssignmentReleaserFor(tc.store)
+			if !ok || releaser != base {
+				t.Fatalf("AssignmentReleaserFor(%s) = (%T, %v), want embedded MemStore", tc.name, releaser, ok)
+			}
+		})
+	}
+
+	unsupportedBase := struct{ Store }{Store: base}
+	unsupportedCases := []struct {
+		name  string
+		store Store
+	}{
+		{"WorkStore", WorkStore{Store: unsupportedBase}},
+		{"GraphStore", GraphStore{Store: unsupportedBase}},
+		{"SessionStore", SessionStore{Store: unsupportedBase}},
+		{"MailStore", MailStore{Store: unsupportedBase}},
+		{"OrdersStore", OrdersStore{Store: unsupportedBase}},
+		{"NudgesStore", NudgesStore{Store: unsupportedBase}},
+	}
+	for _, tc := range unsupportedCases {
+		t.Run(tc.name+"Unsupported", func(t *testing.T) {
+			if releaser, ok := AssignmentReleaserFor(tc.store); ok || releaser != nil {
+				t.Fatalf("AssignmentReleaserFor(%s(store-only)) = (%T, %v), want nil,false", tc.name, releaser, ok)
+			}
+		})
+	}
+}

@@ -1,0 +1,254 @@
+[workspace]
+provider = "codex"
+
+[providers]
+[providers.codex]
+base = "builtin:codex"
+ready_delay_ms = 0
+
+[providers.codex-repaircanary-20260807]
+base = ""
+command = "/private/var/tmp/masontopia-repair-canary.PI5cSQ/worker-launch"
+path_check = "/private/var/tmp/masontopia-repair-canary.PI5cSQ/worker-launch"
+prompt_mode = "arg"
+ready_delay_ms = 3000
+ready_prompt_prefix = "› "
+process_names = ["codex", "codex-raw", "tail"]
+supports_hooks = false
+emits_permission_warning = false
+accept_startup_dialogs = false
+
+[providers.codex-repairmayor-20260807]
+base = ""
+command = "/private/var/tmp/masontopia-repair-canary.PI5cSQ/mayor-launch"
+path_check = "/private/var/tmp/masontopia-repair-canary.PI5cSQ/mayor-launch"
+prompt_mode = "arg"
+ready_delay_ms = 3000
+ready_prompt_prefix = "› "
+process_names = ["codex", "codex-raw", "tail"]
+supports_hooks = false
+emits_permission_warning = false
+accept_startup_dialogs = false
+
+[providers.codex-repairreview-20260807]
+base = ""
+command = "/private/var/tmp/masontopia-repair-canary.PI5cSQ/reviewer-launch"
+path_check = "/private/var/tmp/masontopia-repair-canary.PI5cSQ/reviewer-launch"
+prompt_mode = "arg"
+ready_delay_ms = 3000
+ready_prompt_prefix = "› "
+process_names = ["codex", "codex-raw", "tail"]
+supports_hooks = false
+emits_permission_warning = false
+accept_startup_dialogs = false
+
+[agent_defaults]
+append_fragments = ["verified-gc-boundary"]
+
+[[agent]]
+name = "repaircanary-20260807"
+provider = "codex-repaircanary-20260807"
+work_dir = "/private/var/tmp/masontopia-repair-canary.PI5cSQ/worker-cwd"
+prompt_template = "/private/var/tmp/masontopia-repair-canary.PI5cSQ/worker-prompt.template.md"
+hooks_installed = true
+suspended = true
+min_active_sessions = 0
+max_active_sessions = 1
+
+[[agent]]
+name = "reviewcanary-20260807"
+provider = "codex-repairreview-20260807"
+work_dir = "/private/var/tmp/masontopia-repair-canary.PI5cSQ/reviewer-cwd"
+prompt_template = "/private/var/tmp/masontopia-repair-canary.PI5cSQ/reviewer-prompt.template.md"
+hooks_installed = true
+suspended = true
+min_active_sessions = 0
+max_active_sessions = 1
+
+[[patches.agent]]
+name = "mayor"
+provider = "codex-repairmayor-20260807"
+work_dir = "/private/var/tmp/masontopia-repair-canary.PI5cSQ/mayor-cwd"
+prompt_template = "/private/var/tmp/masontopia-repair-canary.PI5cSQ/mayor-prompt.template.md"
+hooks_installed = true
+
+[[patches.agent]]
+name = "codex"
+hooks_installed = true
+prompt_template = "agents/codex/prompt.template.md"
+suspended = true
+
+[[patches.agent]]
+name = "bd.dog"
+suspended = true
+
+[[patches.agent]]
+name = "core.control-dispatcher"
+start_command = "sh -c 'export GC_WORKFLOW_TRACE=\"${GC_WORKFLOW_TRACE:-${GC_CONTROL_DISPATCHER_TRACE_DEFAULT:-${GC_CITY}/.gc/runtime/control-dispatcher-trace.log}}\"; trace_dir=\"${GC_WORKFLOW_TRACE%/*}\"; if [ \"$trace_dir\" = \"$GC_WORKFLOW_TRACE\" ]; then trace_dir=\".\"; elif [ -z \"$trace_dir\" ]; then trace_dir=\"/\"; fi; mkdir -p \"$trace_dir\"; exec /Users/masonjames/Projects/masontopia/.gc/scripts/verified-gc --city /Users/masonjames/Projects/masontopia convoy control --serve --follow {{.Agent}}'"
+suspended = true
+
+[[patches.agent]]
+name = "codex-repaircanary-20260807"
+hooks_installed = true
+suspended = true
+
+[[patches.agent]]
+name = "codex-repairmayor-20260807"
+hooks_installed = true
+suspended = true
+
+[[patches.agent]]
+name = "codex-repairreview-20260807"
+hooks_installed = true
+suspended = true
+
+[[patches.agent]]
+dir = "instagramtv"
+name = "codex"
+hooks_installed = true
+prompt_template = "agents/codex/prompt.template.md"
+suspended = true
+
+[[patches.agent]]
+dir = "instagramtv"
+name = "core.control-dispatcher"
+start_command = "sh -c 'export GC_WORKFLOW_TRACE=\"${GC_WORKFLOW_TRACE:-${GC_CONTROL_DISPATCHER_TRACE_DEFAULT:-${GC_CITY}/.gc/runtime/control-dispatcher-trace.log}}\"; trace_dir=\"${GC_WORKFLOW_TRACE%/*}\"; if [ \"$trace_dir\" = \"$GC_WORKFLOW_TRACE\" ]; then trace_dir=\".\"; elif [ -z \"$trace_dir\" ]; then trace_dir=\"/\"; fi; mkdir -p \"$trace_dir\"; exec /Users/masonjames/Projects/masontopia/.gc/scripts/verified-gc --city /Users/masonjames/Projects/masontopia convoy control --serve --follow {{.Agent}}'"
+suspended = true
+
+[[patches.agent]]
+dir = "instagramtv"
+name = "codex-repaircanary-20260807"
+hooks_installed = true
+suspended = true
+
+[[patches.agent]]
+dir = "instagramtv"
+name = "codex-repairmayor-20260807"
+hooks_installed = true
+suspended = true
+
+[[patches.agent]]
+dir = "instagramtv"
+name = "codex-repairreview-20260807"
+hooks_installed = true
+suspended = true
+
+[[patches.agent]]
+dir = "instagramtv"
+name = "gc.design-author"
+suspended = true
+
+[[patches.agent]]
+dir = "instagramtv"
+name = "gc.design-implementation-reviewer"
+suspended = true
+
+[[patches.agent]]
+dir = "instagramtv"
+name = "gc.design-test-risk-reviewer"
+suspended = true
+
+[[patches.agent]]
+dir = "instagramtv"
+name = "gc.gap-analyst"
+suspended = true
+
+[[patches.agent]]
+dir = "instagramtv"
+name = "gc.implementation-reviewer"
+suspended = true
+
+[[patches.agent]]
+dir = "instagramtv"
+name = "gc.implementation-worker"
+suspended = true
+
+[[patches.agent]]
+dir = "instagramtv"
+name = "gc.issue-triager"
+suspended = true
+
+[[patches.agent]]
+dir = "instagramtv"
+name = "gc.publisher"
+suspended = true
+
+[[patches.agent]]
+dir = "instagramtv"
+name = "gc.requirements-planner"
+suspended = true
+
+[[patches.agent]]
+dir = "instagramtv"
+name = "gc.review-synthesizer"
+suspended = true
+
+[[patches.agent]]
+dir = "instagramtv"
+name = "gc.run-operator"
+suspended = true
+
+[[patches.agent]]
+dir = "instagramtv"
+name = "gc.task-decomposer"
+suspended = true
+
+[[patches.agent]]
+dir = "instagramtv"
+name = "superpowers.brainstorming"
+suspended = true
+
+[[patches.agent]]
+dir = "instagramtv"
+name = "superpowers.code-quality-reviewer"
+suspended = true
+
+[[patches.agent]]
+dir = "instagramtv"
+name = "superpowers.code-reviewer"
+suspended = true
+
+[[patches.agent]]
+dir = "instagramtv"
+name = "superpowers.finisher"
+suspended = true
+
+[[patches.agent]]
+dir = "instagramtv"
+name = "superpowers.implementer"
+suspended = true
+
+[[patches.agent]]
+dir = "instagramtv"
+name = "superpowers.plan-reviewer"
+suspended = true
+
+[[patches.agent]]
+dir = "instagramtv"
+name = "superpowers.review-fixer"
+suspended = true
+
+[[patches.agent]]
+dir = "instagramtv"
+name = "superpowers.spec-reviewer"
+suspended = true
+
+[[patches.agent]]
+dir = "instagramtv"
+name = "superpowers.writing-plans"
+suspended = true
+
+[defaults]
+[defaults.rig]
+[defaults.rig.imports]
+[defaults.rig.imports.gc]
+source = "https://github.com/gastownhall/gascity-packs/tree/main/gascity/roles"
+version = "sha:3b3b89f2011e06d84459aa7bea1552382f13930a"
+
+[[rigs]]
+name = "instagramtv"
+default_branch = "main"
+suspended_on_start = true
+[rigs.imports]
+[rigs.imports.instagramtv-workflows]
+source = "./packs/instagramtv-workflows"

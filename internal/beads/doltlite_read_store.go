@@ -335,7 +335,7 @@ func (s *DoltliteReadStore) ListByMetadata(filters map[string]string, limit int,
 
 func (s *DoltliteReadStore) Ready(query ...ReadyQuery) ([]Bead, error) {
 	rq := readyQueryFromArgs(query)
-	cacheKey := fmt.Sprintf("%s\x00%d", rq.Assignee, rq.Limit)
+	cacheKey := fmt.Sprintf("%s\x00%d\x00%s", rq.Assignee, rq.Limit, strings.Join(rq.ExcludeLabels, "\x00"))
 	hash, err := s.currentDoltHash()
 	if err != nil {
 		return nil, err
@@ -357,6 +357,13 @@ func (s *DoltliteReadStore) Ready(query ...ReadyQuery) ([]Bead, error) {
 		q.Limit = rq.Limit
 	}
 	readyWhere, readyArgs := s.doltliteReadyIssueWhere(doltliteIssueTables)
+	if len(rq.ExcludeLabels) > 0 {
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(rq.ExcludeLabels)), ",")
+		readyWhere += " AND NOT EXISTS (SELECT 1 FROM " + doltliteIssueTables.labels + " ready_excluded_label WHERE ready_excluded_label.issue_id = i.id AND ready_excluded_label.label IN (" + placeholders + "))"
+		for _, label := range rq.ExcludeLabels {
+			readyArgs = append(readyArgs, label)
+		}
+	}
 	// The id tiebreaker keeps a LIMIT deterministic when rows share
 	// (priority, created_at) — same bug class as queryIssueTable (#3208).
 	//

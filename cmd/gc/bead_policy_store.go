@@ -36,9 +36,68 @@ type beadPolicyGraphStore struct {
 }
 
 var (
-	_ beads.ConditionalAssignmentReleaser    = (*beadPolicyStore)(nil)
-	_ beads.ConditionalWritesResolveTargeter = (*beadPolicyStore)(nil)
+	_ beads.ConditionalAssignmentReleaser          = (*beadPolicyStore)(nil)
+	_ beads.ConditionalWritesResolveTargeter       = (*beadPolicyStore)(nil)
+	_ beads.GuardedAssignmentClaimerHandleProvider = (*beadPolicyStore)(nil)
+	_ beads.CreateAssignmentClaimer                = (*beadPolicyStore)(nil)
+	_ beads.CreateAssignmentClaimerHandleProvider  = (*beadPolicyStore)(nil)
+	_ beads.AssignmentReleaserHandleProvider       = (*beadPolicyStore)(nil)
+	_ beads.StoreIdentityTargeter                  = (*beadPolicyStore)(nil)
 )
+
+// GuardedAssignmentClaimerHandle forwards the optional exact-assignment
+// capability only when the wrapped store really supports it. The policy layer
+// changes read tiers and create storage policy; it must neither hide a native
+// atomic claim nor invent one for a bd CLI store that cannot honor the full
+// predicate in one mutation.
+func (s *beadPolicyStore) GuardedAssignmentClaimerHandle() (beads.GuardedAssignmentClaimer, bool) {
+	if s == nil {
+		return nil, false
+	}
+	return beads.GuardedAssignmentClaimerFor(s.Store)
+}
+
+// AssignmentReleaserHandle forwards the optional atomic release capability
+// only when the wrapped physical store implements the complete predicate and
+// mutation. Policy read-tier expansion does not weaken that transaction.
+func (s *beadPolicyStore) AssignmentReleaserHandle() (beads.AssignmentReleaser, bool) {
+	if s == nil {
+		return nil, false
+	}
+	return beads.AssignmentReleaserFor(s.Store)
+}
+
+// CreateAssignmentClaimerHandle forwards the optional atomic fresh-witness
+// assignment only when the wrapped store supports the complete operation. It
+// returns the policy wrapper, not the inner handle, so witness storage policy
+// remains part of the one delegated atomic request.
+func (s *beadPolicyStore) CreateAssignmentClaimerHandle() (beads.CreateAssignmentClaimer, bool) {
+	if s == nil {
+		return nil, false
+	}
+	if _, ok := beads.CreateAssignmentClaimerFor(s.Store); !ok {
+		return nil, false
+	}
+	return s, true
+}
+
+// CreateAssignmentClaim applies the witness's configured storage flags before
+// delegating the complete create-and-claim request to the inner atomic
+// capability. It never creates the witness separately: the inner store remains
+// the sole transaction boundary for both rows.
+func (s *beadPolicyStore) CreateAssignmentClaim(ctx context.Context, req beads.CreateAssignmentClaimRequest) (beads.CreateAssignmentClaimResult, bool, error) {
+	if s == nil {
+		return beads.CreateAssignmentClaimResult{}, false, beads.ErrCreateAssignmentClaimUnsupported
+	}
+	claimer, ok := beads.CreateAssignmentClaimerFor(s.Store)
+	if !ok {
+		return beads.CreateAssignmentClaimResult{}, false, beads.ErrCreateAssignmentClaimUnsupported
+	}
+	witness := req.Witness
+	storage := s.storageForCreate(witness)
+	req.Witness = applyBeadStorage(witness, storage)
+	return claimer.CreateAssignmentClaim(ctx, req)
+}
 
 // ConditionalWritesResolveTarget declares the wrapped store as the
 // conditional-writes resolution target. The policy layer shapes creation and
@@ -49,6 +108,16 @@ var (
 // wrapper. beadPolicyGraphStore inherits this via its embedded
 // *beadPolicyStore.
 func (s *beadPolicyStore) ConditionalWritesResolveTarget() beads.Store { return s.Store }
+
+// StoreIdentityTarget declares that the policy wrapper and its inner store
+// share one ownership identity. Reads and writes still use the policy wrapper;
+// this target is only for transparent-wrapper deduplication.
+func (s *beadPolicyStore) StoreIdentityTarget() beads.Store {
+	if s == nil {
+		return nil
+	}
+	return s.Store
+}
 
 var (
 	_ beads.BatchDeleter = (*beadPolicyStore)(nil)
@@ -84,7 +153,7 @@ func unwrapBeadPolicyStore(store beads.Store) (beads.Store, *beadPolicyStore, bo
 }
 
 func (s *beadPolicyStore) Create(b beads.Bead) (beads.Bead, error) {
-	_, storage := s.policyForCreate(b)
+	storage := s.storageForCreate(b)
 	return createWithStoragePolicy(s.createTarget(coordclass.Classify(b)), b, storage)
 }
 
@@ -224,18 +293,18 @@ func (s *beadPolicyStore) ReleaseIfCurrent(id, expectedAssignee string) (bool, e
 	return releaser.ReleaseIfCurrent(id, expectedAssignee)
 }
 
-func (s *beadPolicyStore) policyForCreate(b beads.Bead) (string, string) {
+func (s *beadPolicyStore) storageForCreate(b beads.Bead) string {
 	if rootID := strings.TrimSpace(b.Metadata[beadmeta.RootBeadIDMetadataKey]); rootID != "" {
 		root, err := s.createTarget(coordclass.ClassGraph).Get(rootID)
 		if err == nil && policyNameForBead(root) == beadPolicyWisp {
-			return beadPolicyWisp, storageFromPersistedWispRoot(root)
+			return storageFromPersistedWispRoot(root)
 		}
 	}
 	policyName := policyNameForBead(b)
 	if policyName == "" {
-		return "", ""
+		return ""
 	}
-	return policyName, effectiveBeadStorage(s.cfg, policyName)
+	return effectiveBeadStorage(s.cfg, policyName)
 }
 
 func storageFromPersistedWispRoot(root beads.Bead) string {

@@ -1,0 +1,51 @@
+[pack]
+name = "gc-roles"
+schema = 1
+
+[[agent]]
+name = "design-author"
+scope = "rig"
+
+[[agent]]
+name = "design-implementation-reviewer"
+scope = "rig"
+
+[[agent]]
+name = "design-test-risk-reviewer"
+scope = "rig"
+
+[[agent]]
+name = "gap-analyst"
+scope = "rig"
+
+[[agent]]
+name = "implementation-reviewer"
+scope = "rig"
+
+[[agent]]
+name = "implementation-worker"
+scope = "rig"
+
+[[agent]]
+name = "issue-triager"
+scope = "rig"
+
+[[agent]]
+name = "publisher"
+scope = "rig"
+
+[[agent]]
+name = "requirements-planner"
+scope = "rig"
+
+[[agent]]
+name = "review-synthesizer"
+scope = "rig"
+
+[[agent]]
+name = "run-operator"
+scope = "rig"
+
+[[agent]]
+name = "task-decomposer"
+scope = "rig"

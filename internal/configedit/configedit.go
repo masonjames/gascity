@@ -157,7 +157,7 @@ func (e *Editor) Do(fn func() error) error {
 }
 
 func validateCityForEdit(cfg *config.City) error {
-	if err := config.ValidateAgents(cfg.Agents); err != nil {
+	if err := config.ValidateCityAgents(cfg); err != nil {
 		return fmt.Errorf("%w: agents: %w", ErrValidation, err)
 	}
 	if err := config.ValidateRigs(cfg.Rigs, config.EffectiveHQPrefix(cfg)); err != nil {

@@ -19,10 +19,11 @@ var (
 		"SetSequenceFloor": "writes the id-floor sidecar file under its own flock",
 	}
 	sqliteMethodsWithoutErrorResult = map[string]string{
-		"AdvanceSequenceFloor": "raises the in-memory id allocator only",
-		"AtomicTx":             "reports a constant capability",
-		"IDPrefix":             "returns an immutable field",
-		"StoreHealthPath":      "returns an immutable field",
+		"AdvanceSequenceFloor":     "raises the in-memory id allocator only",
+		"AssignmentReleaserHandle": "calls ensureOpen and returns (nil, false) after close",
+		"AtomicTx":                 "reports a constant capability",
+		"IDPrefix":                 "returns an immutable field",
+		"StoreHealthPath":          "returns an immutable field",
 	}
 )
 

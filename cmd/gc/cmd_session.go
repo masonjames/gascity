@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"os/exec"
 	"sort"
 	"strconv"
@@ -1815,24 +1816,50 @@ func cmdSessionClose(args []string, stdout, stderr io.Writer, jsonOutput ...bool
 		fmt.Fprintf(stderr, "gc session close: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	handle, err := workerHandleForSessionWithConfig(cityPath, sessStore, sp, cfg, sessionID)
+	// Classification is authority, not a best-effort display read. Fail before
+	// constructing a live handle or touching the provider when the persisted
+	// row cannot be loaded. The captured trigger pair is carried unchanged into
+	// the worker/Manager close boundary, which reloads it under the session lock.
+	_, capturedStrict, expected, err := captureExplicitSessionCloseAuthority(
+		cfg,
+		cityPath,
+		sessStore,
+		beads.WorkStore{Store: store},
+		sessionID,
+	)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc session close: loading authoritative session row: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	if capturedStrict {
+		// The automatic strict provider boundary currently has exact leased
+		// start/live/nudge/metadata effects, but no close operation. A manual
+		// CloseDetailedWithWitness would only hold the process-local session lock
+		// and could stop/close by name across a cross-process revision race. Refuse
+		// before constructing the live handle; work remains assigned for the guarded
+		// orphan-release lane.
+		fmt.Fprintln(stderr, "gc session close: strict session close requires an exact-incarnation conditional close boundary") //nolint:errcheck
+		return 1
+	}
+	factory, err := workerFactoryWithConfig(cityPath, sessStore, sp, cfg, store)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session close: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	// Capture the session bead state BEFORE close so we have its assignment
-	// identifiers (session_name, alias, etc.) for the post-close work-release
-	// pass. Lookup is best-effort: if the session bead is already missing we
-	// fall back to a synthetic shell carrying only the resolved session ID.
-	closedSessionBead, sessionBeadErr := sessStore.Get(sessionID)
-	if sessionBeadErr != nil {
-		closedSessionBead = beads.Bead{ID: sessionID}
-	}
-
-	closeResult, err := handle.CloseDetailed(context.Background())
+	closeResult, currentInfo, currentPersisted, err := factory.CloseDetailedWithWitness(context.Background(), sessionID, expected)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session close: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
+	}
+	closedSessionBead := persistedSessionBead(currentInfo, currentPersisted)
+	currentStrict, currentStrictErr := explicitSessionCloseStrictMode(cfg, cityPath, sessStore, beads.WorkStore{Store: store}, closedSessionBead)
+	strictClose := capturedStrict || currentStrict
+	if currentStrictErr != nil {
+		// The session is already closed, so never fall back to an unconditional
+		// work sweep when its authoritative pre-close identity is ambiguous.
+		// Leave work untouched for the guarded orphan-release lane.
+		strictClose = true
+		fmt.Fprintf(stderr, "gc session close: warning: strict work release refused: %v\n", currentStrictErr) //nolint:errcheck
 	}
 	if cityErr == nil {
 		if err := withdrawQueuedWaitNudges(cityPath, closeResult.WaitNudgeIDs); err != nil {
@@ -1845,11 +1872,19 @@ func cmdSessionClose(args []string, stdout, stderr io.Writer, jsonOutput ...bool
 	// Each Update fires the bd on_update hook, which emits a bead.updated
 	// event the supervisor's CachingStore absorbs — the cache-update event
 	// the close path was previously missing (gastownhall/gascity#2625).
-	var rigStores map[string]beads.Store
-	if cityErr == nil && cfg != nil {
-		rigStores = buildStandaloneRigStores(cfg, cityPath, stderr)
+	if strictClose && currentStrictErr == nil {
+		// Strict work release is an exact same-store conditional mutation. A
+		// late hold, revision/assignee drift, a newly-open owner, or a backend
+		// without the atomic capability leaves the work unchanged; never fall
+		// back to the legacy List->Update sweep.
+		releaseWorkFromClosedSessionBead(store, closedSessionBead, stderr, true)
+	} else if !strictClose {
+		var rigStores map[string]beads.Store
+		if cityErr == nil && cfg != nil {
+			rigStores = buildStandaloneRigStores(cfg, cityPath, stderr)
+		}
+		unclaimWorkAssignedToRetiredSessionBead(store, rigStores, closedSessionBead, "", stderr)
 	}
-	unclaimWorkAssignedToRetiredSessionBead(store, rigStores, closedSessionBead, "", stderr)
 
 	if asJSON {
 		if err := writeSessionActionJSON(stdout, sessionActionResult{
@@ -1865,6 +1900,60 @@ func cmdSessionClose(args []string, stdout, stderr io.Writer, jsonOutput ...bool
 	}
 	fmt.Fprintf(stdout, "Session %s closed.\n", sessionID) //nolint:errcheck // best-effort stdout
 	return 0
+}
+
+func persistedSessionBead(info session.Info, persisted session.PersistedResponse) beads.Bead {
+	return beads.Bead{
+		ID:        info.ID,
+		Type:      info.Type,
+		Title:     info.Title,
+		Status:    persisted.Status,
+		Labels:    append([]string(nil), info.Labels...),
+		Metadata:  maps.Clone(persisted.Metadata),
+		CreatedAt: info.CreatedAt,
+	}
+}
+
+func captureExplicitSessionCloseAuthority(
+	cfg *config.City,
+	cityPath string,
+	sessionStore beads.Store,
+	canonicalWorkStore beads.WorkStore,
+	sessionID string,
+) (session.Info, bool, session.LiveBoundaryWitness, error) {
+	info, persisted, err := sessionFrontDoor(sessionStore).GetPersistedResponse(sessionID)
+	if err != nil {
+		return session.Info{}, false, session.LiveBoundaryWitness{}, err
+	}
+	strict, err := explicitSessionCloseStrictMode(cfg, cityPath, sessionStore, canonicalWorkStore, persistedSessionBead(info, persisted))
+	if err != nil {
+		return session.Info{}, false, session.LiveBoundaryWitness{}, fmt.Errorf("refusing strict close: %w", err)
+	}
+	return info, strict, session.LiveBoundaryWitness{
+		TriggerBeadID:       strings.TrimSpace(info.TriggerBeadID),
+		TriggerBeadStoreRef: strings.TrimSpace(info.TriggerBeadStoreRef),
+	}, nil
+}
+
+// explicitSessionCloseStrictMode determines whether an explicit close must use
+// the strict same-store atomic work-release path and proves that topology and
+// exact trigger authority before the session is closed. Inherit sessions keep
+// the legacy cross-store release behavior.
+func explicitSessionCloseStrictMode(
+	cfg *config.City,
+	cityPath string,
+	sessionStore beads.Store,
+	canonicalWorkStore beads.WorkStore,
+	bead beads.Bead,
+) (bool, error) {
+	info := session.InfoFromPersistedBead(bead)
+	if strictConfiguredAgentForSession(cfg, info) == nil {
+		return false, nil
+	}
+	if err := strictSessionOwnershipAuthorized(cfg, cityPath, "", sessionStore, canonicalWorkStore, info); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // newSessionRenameCmd creates the "gc session rename <id-or-alias> <title>" command.

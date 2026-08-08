@@ -1,6 +1,14 @@
 package session
 
-import "strings"
+import (
+	"errors"
+	"fmt"
+	"maps"
+	"slices"
+	"strings"
+
+	"github.com/gastownhall/gascity/internal/beads"
+)
 
 // This file is the confined session-class assignee-identity vocabulary: the
 // forms under which a work bead may be assigned to a session. It is shared by
@@ -60,4 +68,114 @@ func AssigneeIdentifier(i Info) string {
 		}
 	}
 	return i.ID
+}
+
+// GuardedAssignmentCoLocatedWitness projects the exact session row predicates
+// that must remain current when a controller atomically assigns work in the
+// same bead store. Keeping this projection in session confines session schema
+// vocabulary here; the lower beads layer only evaluates generic predicates.
+func GuardedAssignmentCoLocatedWitness(i Info) (*beads.AssignmentClaimCoLocatedWitness, error) {
+	id := strings.TrimSpace(i.ID)
+	if id == "" {
+		return nil, errors.New("guarded assignment session witness: empty session ID")
+	}
+	if i.Closed {
+		return nil, fmt.Errorf("guarded assignment session witness %q: session is closed", id)
+	}
+	if i.Type != BeadType {
+		return nil, fmt.Errorf("guarded assignment session witness %q: type %q, want %q", id, i.Type, BeadType)
+	}
+	if !slices.Contains(i.Labels, LabelSession) {
+		return nil, fmt.Errorf("guarded assignment session witness %q: missing label %q", id, LabelSession)
+	}
+	for _, required := range []struct {
+		key   string
+		value string
+	}{
+		{key: "template", value: i.Template},
+		{key: "session_name", value: i.SessionNameMetadata},
+		{key: "instance_token", value: i.InstanceToken},
+		{key: "state", value: i.MetadataState},
+	} {
+		if strings.TrimSpace(required.value) == "" {
+			return nil, fmt.Errorf("guarded assignment session witness %q: empty %s metadata", id, required.key)
+		}
+	}
+
+	witness := &beads.AssignmentClaimCoLocatedWitness{
+		ID:             id,
+		ExpectedStatus: "open",
+		ExpectedType:   BeadType,
+		RequiredLabels: []string{LabelSession},
+		ExpectedMetadata: map[string]string{
+			"template":       i.Template,
+			"session_name":   i.SessionNameMetadata,
+			"instance_token": i.InstanceToken,
+			"state":          i.MetadataState,
+		},
+	}
+	for _, identity := range []struct {
+		key   string
+		value string
+	}{
+		{key: "alias", value: i.Alias},
+		{key: NamedSessionIdentityMetadata, value: i.ConfiguredNamedIdentity},
+	} {
+		if identity.value == "" {
+			witness.AbsentOrEmptyMetadata = append(witness.AbsentOrEmptyMetadata, identity.key)
+			continue
+		}
+		witness.ExpectedMetadata[identity.key] = identity.value
+	}
+	return witness, nil
+}
+
+// GuardedAssignmentCoLocatedExactWitness extends the ordinary co-located
+// session predicate with the revision and complete metadata/label snapshot
+// from the same persisted fetch. It is used when assigning WORK must be atomic
+// with one exact SESSION authority row, rather than with only the legacy
+// lifecycle/actor subset.
+func GuardedAssignmentCoLocatedExactWitness(i Info, persisted PersistedResponse) (*beads.AssignmentClaimCoLocatedWitness, error) {
+	witness, err := GuardedAssignmentCoLocatedWitness(i)
+	if err != nil {
+		return nil, err
+	}
+	if persisted.Revision <= 0 {
+		return nil, fmt.Errorf("guarded assignment session witness %q: missing positive revision", i.ID)
+	}
+	witness.ExpectedRevision = persisted.Revision
+	witness.ExactLabels = append([]string{}, i.Labels...)
+	witness.ExactMetadata = maps.Clone(persisted.Metadata)
+	if witness.ExactMetadata == nil {
+		witness.ExactMetadata = map[string]string{}
+	}
+	return witness, nil
+}
+
+// AssignmentReleaseCoLocatedMatch returns the generic co-located absence
+// predicate that recognizes every durable assignee identity of an open session
+// row. Session schema vocabulary remains confined to this package; the beads
+// layer evaluates only the generic status/type/label/value-source shape.
+func AssignmentReleaseCoLocatedMatch(assignee string) (*beads.CoLocatedMatchPredicate, error) {
+	assignee = strings.TrimSpace(assignee)
+	if assignee == "" {
+		return nil, errors.New("assignment release session match: empty assignee")
+	}
+	return &beads.CoLocatedMatchPredicate{
+		ExpectedStatus: "open",
+		ClassAnyOf: []beads.CoLocatedClassPredicate{
+			{ExpectedType: BeadType},
+			{RequiredLabels: []string{LabelSession}},
+		},
+		MatchValue: assignee,
+		MatchID:    true,
+		MetadataKeys: []string{
+			"session_name",
+			NamedSessionIdentityMetadata,
+			"alias",
+		},
+		DelimitedMetadataKeys: map[string]string{
+			aliasHistoryMetadataKey: ",",
+		},
+	}, nil
 }

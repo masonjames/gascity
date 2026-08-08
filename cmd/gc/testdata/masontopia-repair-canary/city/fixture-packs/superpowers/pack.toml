@@ -1,0 +1,42 @@
+[pack]
+name = "superpowers"
+schema = 1
+
+[imports.gc]
+source = "../gascity"
+
+[[agent]]
+name = "brainstorming"
+scope = "rig"
+
+[[agent]]
+name = "code-quality-reviewer"
+scope = "rig"
+
+[[agent]]
+name = "code-reviewer"
+scope = "rig"
+
+[[agent]]
+name = "finisher"
+scope = "rig"
+
+[[agent]]
+name = "implementer"
+scope = "rig"
+
+[[agent]]
+name = "plan-reviewer"
+scope = "rig"
+
+[[agent]]
+name = "review-fixer"
+scope = "rig"
+
+[[agent]]
+name = "spec-reviewer"
+scope = "rig"
+
+[[agent]]
+name = "writing-plans"
+scope = "rig"

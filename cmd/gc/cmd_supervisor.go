@@ -2103,27 +2103,27 @@ func reconcileCities(
 		if err := runPostPrepareStep("building_city_runtime", func() error {
 			var runtimeErr error
 			cityRuntime, runtimeErr = newCityRuntime(CityRuntimeParams{
-				CityPath:                path,
-				CityName:                cityName,
-				TomlPath:                tomlPath,
-				WatchTargets:            watchTargets,
-				ConfigRev:               configRev,
-				ConfigDirty:             configDirty,
-				Cfg:                     cfg,
-				SP:                      sp,
-				Publication:             publication,
-				BuildFn:                 supervisorBuildAgentsFn(path, cityName, stderr),
-				BuildFnWithSessionBeads: supervisorBuildAgentsFnWithSessionBeads(path, cityName, stderr),
-				Dops:                    dops,
-				Rec:                     rec,
-				PoolSessions:            poolSessions,
-				PoolDeathHandlers:       poolDeathHandlers,
-				ForceStopShutdown:       forceShutdown,
-				ReloadReqCh:             reloadReqCh,
-				ConvergenceReqCh:        convergenceReqCh,
-				PokeCh:                  pokeCh,
-				ControlDispatcherCh:     controlDispatcherCh,
-				TranscriptMetaEnabled:   transcriptmeta.Enabled(),
+				CityPath:              path,
+				CityName:              cityName,
+				TomlPath:              tomlPath,
+				WatchTargets:          watchTargets,
+				ConfigRev:             configRev,
+				ConfigDirty:           configDirty,
+				Cfg:                   cfg,
+				SP:                    sp,
+				Publication:           publication,
+				BuildFn:               supervisorBuildAgentsFn(path, cityName, stderr),
+				BuildFnWithStores:     supervisorBuildAgentsFnWithStores(path, cityName, stderr),
+				Dops:                  dops,
+				Rec:                   rec,
+				PoolSessions:          poolSessions,
+				PoolDeathHandlers:     poolDeathHandlers,
+				ForceStopShutdown:     forceShutdown,
+				ReloadReqCh:           reloadReqCh,
+				ConvergenceReqCh:      convergenceReqCh,
+				PokeCh:                pokeCh,
+				ControlDispatcherCh:   controlDispatcherCh,
+				TranscriptMetaEnabled: transcriptmeta.Enabled(),
 				OnStarted: func() {
 					cr.UpdateCallback(path, func(m *managedCity) {
 						m.started = true
@@ -2653,7 +2653,7 @@ func prepareCityForSupervisor(cityPath, cityName string, cfg *config.City, stder
 
 	// Validate agents.
 	if err := runStep("validating_agents", func() error {
-		return config.ValidateAgents(cfg.Agents)
+		return config.ValidateCityAgents(cfg)
 	}); err != nil {
 		return fmt.Errorf("validate agents: %w", err)
 	}
@@ -2726,6 +2726,13 @@ func supervisorBuildAgentsFnWithSessionBeads(cityPath, cityName string, stderr i
 	beaconTime := time.Now()
 	return func(c *config.City, sp runtime.Provider, store beads.Store, rigStores map[string]beads.Store, sessionBeads *sessionBeadSnapshot, trace *sessionReconcilerTraceCycle) DesiredStateResult {
 		return buildDesiredStateWithSessionBeads(cityName, cityPath, beaconTime, c, sp, store, rigStores, sessionBeads, trace, stderr)
+	}
+}
+
+func supervisorBuildAgentsFnWithStores(cityPath, cityName string, stderr io.Writer) func(*config.City, runtime.Provider, beads.SessionStore, beads.WorkStore, map[string]beads.Store, *sessionBeadSnapshot, *sessionReconcilerTraceCycle) DesiredStateResult {
+	beaconTime := time.Now()
+	return func(c *config.City, sp runtime.Provider, sessionStore beads.SessionStore, canonicalWorkStore beads.WorkStore, rigStores map[string]beads.Store, sessionBeads *sessionBeadSnapshot, trace *sessionReconcilerTraceCycle) DesiredStateResult {
+		return buildDesiredStateWithStores(cityName, cityPath, beaconTime, c, sp, sessionStore, canonicalWorkStore, rigStores, sessionBeads, trace, stderr)
 	}
 }
 

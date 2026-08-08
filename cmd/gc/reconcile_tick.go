@@ -1,6 +1,9 @@
 package main
 
 import (
+	"sync"
+
+	"github.com/gastownhall/gascity/internal/config"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
 )
 
@@ -40,6 +43,12 @@ type reconcileTick struct {
 	// last-write-wins, so order-sensitive rebuilds walk this instead of ranging
 	// the (unordered) map.
 	orderedIDs []string
+	// capturedRevisionByID is the optimistic-concurrency token read with each
+	// store-edge ReconcileSession row. It advances only after this tick's own
+	// successful conditional-mutation lease; action-time reloads never adopt an
+	// unrelated writer's revision.
+	revisionMu           sync.RWMutex
+	capturedRevisionByID map[string]int64
 }
 
 // newReconcileTick builds the tick snapshot from the tick's ordered, already-
@@ -49,16 +58,79 @@ type reconcileTick struct {
 // contract and the codec census guard are both preserved. The forward pass
 // mutates only the current iteration's session, so no entry goes stale before it
 // is visited.
-func newReconcileTick(ordered []sessionpkg.Info) *reconcileTick {
+func newReconcileTick(ordered []sessionpkg.Info, capturedRevisions ...map[string]int64) *reconcileTick {
 	t := &reconcileTick{
-		infoByID:   make(map[string]sessionpkg.Info, len(ordered)),
-		orderedIDs: make([]string, len(ordered)),
+		infoByID:             make(map[string]sessionpkg.Info, len(ordered)),
+		orderedIDs:           make([]string, len(ordered)),
+		capturedRevisionByID: make(map[string]int64, len(ordered)),
 	}
 	for i := range ordered {
 		t.orderedIDs[i] = ordered[i].ID
 		t.infoByID[ordered[i].ID] = ordered[i]
+		if len(capturedRevisions) > 0 {
+			if revision, ok := capturedRevisions[0][ordered[i].ID]; ok {
+				t.capturedRevisionByID[ordered[i].ID] = revision
+			}
+		}
 	}
 	return t
+}
+
+func (t *reconcileTick) capturedRevision(id string) int64 {
+	revision, _ := t.capturedRevisionToken(id)
+	return revision
+}
+
+func (t *reconcileTick) capturedRevisionToken(id string) (int64, bool) {
+	if t == nil {
+		return 0, false
+	}
+	t.revisionMu.RLock()
+	defer t.revisionMu.RUnlock()
+	revision, ok := t.capturedRevisionByID[id]
+	return revision, ok
+}
+
+// advanceCapturedRevision records the revision produced by this tick's own
+// successful conditional-mutation lease. It never reloads or adopts an
+// external writer's token.
+func (t *reconcileTick) advanceCapturedRevision(id string, revision int64) {
+	if t == nil || id == "" {
+		return
+	}
+	t.revisionMu.Lock()
+	t.capturedRevisionByID[id] = revision
+	t.revisionMu.Unlock()
+}
+
+func (t *reconcileTick) mutationBoundary(info sessionpkg.Info, cfg *config.City) reconcilerMutationBoundary {
+	if t == nil {
+		return captureReconcilerMutationBoundary(info, cfg)
+	}
+	revision, ok := t.capturedRevisionToken(info.ID)
+	if !ok {
+		return captureReconcilerMutationBoundary(info, cfg)
+	}
+	return captureReconcilerMutationBoundary(info, cfg, revision).withRevisionSink(func(revision int64) {
+		t.advanceCapturedRevision(info.ID, revision)
+	})
+}
+
+func (t *reconcileTick) startCandidateForWake(
+	info sessionpkg.Info,
+	tp TemplateParams,
+	order int,
+	cfg *config.City,
+	currentProcessingBeadID string,
+) startCandidate {
+	if t == nil {
+		return captureStartCandidateForWake(info, tp, order, cfg, currentProcessingBeadID)
+	}
+	revision, ok := t.capturedRevisionToken(info.ID)
+	if !ok {
+		return captureStartCandidateForWake(info, tp, order, cfg, currentProcessingBeadID)
+	}
+	return captureStartCandidateForWake(info, tp, order, cfg, currentProcessingBeadID, revision)
 }
 
 // apply folds a metadata patch onto the snapshot entry for id and returns the

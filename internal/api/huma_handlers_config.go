@@ -177,7 +177,7 @@ func (s *Server) humaHandleConfigValidate(_ context.Context, _ *ConfigValidateIn
 
 	var errors []string
 
-	if err := config.ValidateAgents(cfg.Agents); err != nil {
+	if err := config.ValidateCityAgents(cfg); err != nil {
 		errors = append(errors, err.Error())
 	}
 	if err := config.ValidateRigs(cfg.Rigs, config.EffectiveHQPrefix(cfg)); err != nil {

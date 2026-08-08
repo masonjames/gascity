@@ -1,9 +1,22 @@
 package beads
 
+import "errors"
+
 // NewNativeDoltStoreForConformance returns a NativeDoltStore backed by the
 // in-memory native storage fixture for the external conformance suite.
 func NewNativeDoltStoreForConformance() Store {
 	return newNativeDoltStoreForTest(newNativeDoltMemStorage())
+}
+
+// NewNativeDoltStoreForPredicateCommitThenError returns a NativeDoltStore and
+// a one-shot arming function. The next successful Native transaction commits
+// and then reports an injected error, modeling an ambiguous provider result.
+func NewNativeDoltStoreForPredicateCommitThenError() (Store, func()) {
+	storage := &nativePredicateCommitThenErrorStorage{
+		nativeDoltMemStorage: newNativeDoltMemStorage(),
+		err:                  errors.New("injected error after committed predicate transaction"),
+	}
+	return newNativeDoltStoreForTest(storage), func() { storage.armed = true }
 }
 
 // NotifyChangeForTest drives the real producer (CachingStore.notifyChange) with

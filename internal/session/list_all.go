@@ -185,7 +185,10 @@ func (s *Store) ListAll(opts ListAllOptions) ([]Info, error) {
 }
 
 // ReconcileSession is one row of the reconciler tick feed: the session's domain
-// projection paired with its persisted circuit-breaker cluster. The pair exists
+// projection paired with its persisted circuit-breaker cluster and raw persisted
+// response. The response carries the exact store revision read with the two
+// projections, allowing strict automatic mutations to fence against that
+// decision-time row without adding persistence fields to Info. The pair exists
 // because the breaker cluster (the session_circuit_* keys) is deliberately NOT
 // on Info (a separate concern from lifecycle-decision facts); the reconciler is
 // the one consumer that needs both, read once per tick from the same bead. A
@@ -194,8 +197,9 @@ func (s *Store) ListAll(opts ListAllOptions) ([]Info, error) {
 // (a retired row must carry its circuit with it), so the row carries both. This
 // mirrors the ListedSession{Info, Response} precedent.
 type ReconcileSession struct {
-	Info    Info
-	Circuit CircuitState
+	Info      Info
+	Circuit   CircuitState
+	Persisted PersistedResponse
 }
 
 // ListAllForReconcile returns every session bead projected to a ReconcileSession,
@@ -216,8 +220,9 @@ func (s *Store) ListAllForReconcile(opts ListAllOptions) ([]ReconcileSession, er
 	out := make([]ReconcileSession, 0, len(rows))
 	for _, b := range rows {
 		out = append(out, ReconcileSession{
-			Info:    infoFromPersistedBead(b),
-			Circuit: CircuitStateFromMetadata(b.Metadata),
+			Info:      infoFromPersistedBead(b),
+			Circuit:   CircuitStateFromMetadata(b.Metadata),
+			Persisted: PersistedResponseFromBead(b),
 		})
 	}
 	return out, err
@@ -236,8 +241,9 @@ func ReconcileRowsFromBeads(beadsIn []beads.Bead) []ReconcileSession {
 	out := make([]ReconcileSession, 0, len(beadsIn))
 	for _, b := range beadsIn {
 		out = append(out, ReconcileSession{
-			Info:    infoFromPersistedBead(b),
-			Circuit: CircuitStateFromMetadata(b.Metadata),
+			Info:      infoFromPersistedBead(b),
+			Circuit:   CircuitStateFromMetadata(b.Metadata),
+			Persisted: PersistedResponseFromBead(b),
 		})
 	}
 	return out
@@ -298,8 +304,9 @@ func (s *Store) ListAllForReconcileWithFingerprint(opts ListAllOptions) ([]Recon
 	out := make([]ReconcileSession, 0, len(rows))
 	for _, b := range rows {
 		out = append(out, ReconcileSession{
-			Info:    infoFromPersistedBead(b),
-			Circuit: CircuitStateFromMetadata(b.Metadata),
+			Info:      infoFromPersistedBead(b),
+			Circuit:   CircuitStateFromMetadata(b.Metadata),
+			Persisted: PersistedResponseFromBead(b),
 		})
 	}
 	return out, fingerprint, err

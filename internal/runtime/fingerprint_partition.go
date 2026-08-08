@@ -27,7 +27,8 @@ import (
 // docs/architecture/worker-runtime-transport-unweld-v0.md §6):
 //
 //	PROVISION (box):  Env (allow-listed), FingerprintExtra, PreStart,
-//	                  OverlayDir, OverlayProviders, CopyFiles.
+//	                  OverlayDir, OverlayProviders, ProjectHooksForbidden,
+//	                  CopyFiles.
 //	LAUNCH (agent):   Command, Lifecycle, Upstream, MCPServers,
 //	                  AcceptStartupDialogs, MouseOn, SessionSetup,
 //	                  SessionSetupScript.
@@ -78,6 +79,15 @@ func hashProvisionFields(h hash.Hash, cfg Config) {
 	h.Write([]byte{0})              //nolint:errcheck // hash.Write never errors
 
 	hashOverlayProviders(h, OverlayProviderNames(cfg))
+
+	// ProjectHooksForbidden changes which files may be staged and requires a
+	// final filesystem preflight before launch. It therefore belongs to the box
+	// half: a policy change must re-provision the staged working directory, not
+	// merely relaunch the agent in the existing one. Match hashCoreFields'
+	// conditional framing so the zero value contributes no bytes.
+	if cfg.ProjectHooksForbidden {
+		hashBool(h, "project_hooks_forbidden", true)
+	}
 
 	for _, cf := range cfg.CopyFiles {
 		if cf.Probed {

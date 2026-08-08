@@ -152,6 +152,22 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 		return TemplateParams{}, fmt.Errorf("agent %q: %w", qualifiedName, err)
 	}
 	sessionTransport := config.ResolveSessionCreateTransport(cfgAgent.Session, resolved)
+	if cfgAgent.ForbidsProjectHooks() {
+		// Runtime selector names are configuration, not isolation capabilities.
+		// Keep this lower-level resolver fail-closed on the actual provider too;
+		// resolveTemplatePrepared performs the same check before preparation.
+		provider, ok := p.sp.(runtime.ProjectHookIsolationCapabilityProvider)
+		if !ok || !provider.SupportsProjectHookIsolation(strings.TrimSpace(sessionTransport)) {
+			transportLabel := strings.TrimSpace(sessionTransport)
+			if transportLabel == "" {
+				transportLabel = "default"
+			}
+			return TemplateParams{}, fmt.Errorf(
+				"agent %q: active session provider cannot attest project hook isolation for %q transport",
+				qualifiedName, transportLabel,
+			)
+		}
+	}
 	// Step 2: Validate session vs provider compatibility.
 	switch sessionTransport {
 	case config.SessionTransportACP:
@@ -197,7 +213,10 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 	if defaultArgs := resolved.ResolveDefaultArgs(); len(defaultArgs) > 0 {
 		command = command + " " + shellquote.Join(defaultArgs)
 	}
-	sa, err := ensureClaudeSettingsArgs(p.fs, p.cityPath, providerFamily, p.stderr)
+	var sa string
+	if !cfgAgent.ForbidsProjectHooks() {
+		sa, err = ensureClaudeSettingsArgs(p.fs, p.cityPath, providerFamily, p.stderr)
+	}
 	if err != nil {
 		return TemplateParams{}, fmt.Errorf("agent %q: %w", qualifiedName, err)
 	}
@@ -236,7 +255,9 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 			ContentHash: runtime.HashPathContentExcluding(scriptsDir, isOperationalScript),
 		})
 	}
-	copyFiles = stageHookFiles(copyFiles, p.cityPath, workDir, hookFileProvidersForResolved(resolved, installHooks, p.providers))
+	if !cfgAgent.ForbidsProjectHooks() {
+		copyFiles = stageHookFiles(copyFiles, p.cityPath, workDir, hookFileProvidersForResolved(resolved, installHooks, p.providers))
+	}
 
 	// Step 6: Compute session name.
 	// Uses bead-derived naming ("s-{beadID}") when a bead store is available,
@@ -679,6 +700,7 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 		PackOverlayDirs:        effectiveOverlayDirs(p.packOverlayDirs, p.rigOverlayDirs, rigName),
 		OverlayDir:             overlayDir,
 		CopyFiles:              copyFiles,
+		ProjectHooksForbidden:  cfgAgent.ForbidsProjectHooks(),
 	}
 
 	params := TemplateParams{

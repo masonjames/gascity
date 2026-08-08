@@ -164,11 +164,13 @@ func TestApplyAgentPatchCoversAllFields(t *testing.T) {
 	trueVal := true
 	strVal := func(s string) *string { return &s }
 	intVal := func(n int) *int { return &n }
+	projectHooksVal := ProjectHooksForbid
 
 	patch := AgentPatch{
 		Dir:                     "target-dir",
 		Name:                    "target-name",
 		WorkDir:                 strVal(".gc/agents/worker"),
+		ProjectHooks:            &projectHooksVal,
 		TmuxAlias:               strVal("worker--{{.Rig}}"),
 		Scope:                   strVal("city"),
 		Suspended:               &trueVal,
@@ -319,11 +321,13 @@ func TestApplyAgentOverrideCoversAllFields(t *testing.T) {
 	trueVal := true
 	strVal := func(s string) *string { return &s }
 	intVal := func(n int) *int { return &n }
+	projectHooksVal := ProjectHooksForbid
 
 	override := AgentOverride{
 		Agent:                   "target",
 		Dir:                     strVal("new-dir"),
 		WorkDir:                 strVal(".gc/agents/target"),
+		ProjectHooks:            &projectHooksVal,
 		TmuxAlias:               strVal("target--{{.Rig}}"),
 		Scope:                   strVal("city"),
 		Suspended:               &trueVal,

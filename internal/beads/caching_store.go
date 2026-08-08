@@ -84,6 +84,7 @@ type CachingStore struct {
 var (
 	_ ConditionalAssignmentReleaser = (*CachingStore)(nil)
 	_ AtomicTxStore                 = (*CachingStore)(nil)
+	_ StoreIdentityTargeter         = (*CachingStore)(nil)
 )
 
 type cacheState int
@@ -1156,6 +1157,16 @@ func (c *CachingStore) IsLive() bool {
 
 // Backing returns the underlying store.
 func (c *CachingStore) Backing() Store { return c.backing }
+
+// StoreIdentityTarget declares that a cache and its backing store share one
+// ownership identity. This does not authorize bypassing the cache for reads or
+// writes; ResolveStoreIdentity uses the target only for identity comparison.
+func (c *CachingStore) StoreIdentityTarget() Store {
+	if c == nil {
+		return nil
+	}
+	return c.backing
+}
 
 func (c *CachingStore) markFreshLocked(now time.Time) {
 	c.lastFreshAt = now

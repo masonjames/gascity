@@ -34,6 +34,32 @@ func closeSessionBeadIfUnassigned(
 	if stderr == nil {
 		stderr = io.Discard
 	}
+	boundary := captureReconcilerMutationBoundary(sessionpkg.InfoFromPersistedBead(session), cfg, session.Revision).lifecycleMutation()
+	closed := false
+	ran, boundaryErr := boundary.run(store, nil, func(current sessionpkg.Info, _ *sessionpkg.Store) error {
+		fresh, err := store.Get(current.ID)
+		if err != nil {
+			return err
+		}
+		closed = closeSessionBeadIfUnassignedCurrent(store, rigStores, cfg, fresh, reason, now, stderr)
+		return nil
+	})
+	if boundaryErr != nil {
+		fmt.Fprintf(stderr, "session work guard: refusing close for %s: %v\n", session.ID, boundaryErr) //nolint:errcheck
+		return false
+	}
+	return ran && closed
+}
+
+func closeSessionBeadIfUnassignedCurrent(
+	store beads.Store,
+	rigStores map[string]beads.Store,
+	cfg *config.City,
+	session beads.Bead,
+	reason string,
+	now time.Time,
+	stderr io.Writer,
+) bool {
 	hasAssignedWork, err := sessionHasOpenAssignedWorkForConfig(store, rigStores, session, cfg)
 	if err != nil {
 		fmt.Fprintf(stderr, "session work guard: checking assigned work for %s: %v\n", session.ID, err) //nolint:errcheck
@@ -43,9 +69,9 @@ func closeSessionBeadIfUnassigned(
 		return false
 	}
 	if isFailedCreateSessionBead(session) {
-		return closeFailedCreateBead(sessionFrontDoor(store), session.ID, now, stderr)
+		return closeBeadWithConfig(store, cfg, session.ID, string(sessionpkg.StateFailedCreate), now, stderr)
 	}
-	return closeBead(store, session.ID, reason, now, stderr)
+	return closeBeadWithConfig(store, cfg, session.ID, reason, now, stderr)
 }
 
 // closeSessionInfoIfUnassigned is the session.Info form of
@@ -63,10 +89,37 @@ func closeSessionInfoIfUnassigned(
 	reason string,
 	now time.Time,
 	stderr io.Writer,
+	boundaries ...reconcilerMutationBoundary,
 ) bool {
 	if stderr == nil {
 		stderr = io.Discard
 	}
+	boundary := selectedReconcilerMutationBoundary(info, cfg, boundaries...).lifecycleMutation()
+	if err := boundary.legacyAutomaticRuntimeEffectError(); err != nil {
+		fmt.Fprintf(stderr, "session work guard: refusing strict reachable-store close for %s: %v\n", info.ID, err) //nolint:errcheck
+		return false
+	}
+	closed := false
+	ran, boundaryErr := boundary.run(store, nil, func(current sessionpkg.Info, _ *sessionpkg.Store) error {
+		closed = closeSessionInfoIfUnassignedCurrent(store, rigStores, cfg, current, reason, now, stderr)
+		return nil
+	})
+	if boundaryErr != nil {
+		fmt.Fprintf(stderr, "session work guard: refusing close for %s: %v\n", info.ID, boundaryErr) //nolint:errcheck
+		return false
+	}
+	return ran && closed
+}
+
+func closeSessionInfoIfUnassignedCurrent(
+	store beads.Store,
+	rigStores map[string]beads.Store,
+	cfg *config.City,
+	info sessionpkg.Info,
+	reason string,
+	now time.Time,
+	stderr io.Writer,
+) bool {
 	hasAssignedWork, err := sessionHasOpenAssignedWorkForConfigInfo(store, rigStores, info, cfg)
 	if err != nil {
 		fmt.Fprintf(stderr, "session work guard: checking assigned work for %s: %v\n", info.ID, err) //nolint:errcheck
@@ -76,9 +129,9 @@ func closeSessionInfoIfUnassigned(
 		return false
 	}
 	if isFailedCreateSessionInfo(info) {
-		return closeFailedCreateBead(sessionFrontDoor(store), info.ID, now, stderr)
+		return closeBeadWithConfig(store, cfg, info.ID, string(sessionpkg.StateFailedCreate), now, stderr)
 	}
-	return closeBead(store, info.ID, reason, now, stderr)
+	return closeBeadWithConfig(store, cfg, info.ID, reason, now, stderr)
 }
 
 // closeSessionBeadIfReachableStoreUnassigned closes a session bead only when
@@ -108,10 +161,37 @@ func closeSessionBeadIfReachableStoreUnassigned(
 	now time.Time,
 	stderr io.Writer,
 	excludeOwnDrainStep bool,
+	boundaries ...reconcilerMutationBoundary,
 ) bool {
 	if stderr == nil {
 		stderr = io.Discard
 	}
+	boundary := selectedReconcilerMutationBoundary(info, cfg, boundaries...).lifecycleMutation()
+	closed := false
+	ran, boundaryErr := boundary.run(store, nil, func(current sessionpkg.Info, _ *sessionpkg.Store) error {
+		closed = closeSessionBeadIfReachableStoreUnassignedCurrent(
+			cityPath, cfg, store, rigStores, current, reason, now, stderr, excludeOwnDrainStep,
+		)
+		return nil
+	})
+	if boundaryErr != nil {
+		fmt.Fprintf(stderr, "session work guard: refusing reachable-store close for %s: %v\n", info.ID, boundaryErr) //nolint:errcheck
+		return false
+	}
+	return ran && closed
+}
+
+func closeSessionBeadIfReachableStoreUnassignedCurrent(
+	cityPath string,
+	cfg *config.City,
+	store beads.Store,
+	rigStores map[string]beads.Store,
+	info sessionpkg.Info,
+	reason string,
+	now time.Time,
+	stderr io.Writer,
+	excludeOwnDrainStep bool,
+) bool {
 	assignedWorkProbe := sessionHasOpenAssignedWorkForReachableStore
 	if excludeOwnDrainStep {
 		assignedWorkProbe = sessionHasOpenAssignedWorkForReachableStoreForCloseGate
@@ -125,7 +205,7 @@ func closeSessionBeadIfReachableStoreUnassigned(
 		return false
 	}
 	if isFailedCreateSessionInfo(info) {
-		return closeFailedCreateBead(sessionFrontDoor(store), info.ID, now, stderr)
+		return closeBeadWithConfig(store, cfg, info.ID, string(sessionpkg.StateFailedCreate), now, stderr)
 	}
-	return closeBead(store, info.ID, reason, now, stderr)
+	return closeBeadWithConfig(store, cfg, info.ID, reason, now, stderr)
 }

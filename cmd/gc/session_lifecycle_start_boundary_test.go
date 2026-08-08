@@ -116,3 +116,43 @@ func TestStartPreparedStartCandidateUsesWorkerBoundaryForRuntimeOnlyTarget(t *te
 		t.Fatalf("start command = %q, want claude --resume seeded", start.Config.Command)
 	}
 }
+
+func TestStartPreparedStartCandidateRejectsForbiddenRuntimeOnlyTargetBeforeProviderObservation(t *testing.T) {
+	sp := runtime.NewFake()
+	const name = "strict-runtime-only"
+	if err := sp.Start(context.Background(), name, runtime.Config{Command: "legacy"}); err != nil {
+		t.Fatalf("seed runtime: %v", err)
+	}
+	sp.Zombies[name] = true
+	baseline := len(sp.SnapshotCalls())
+
+	usedWorker, err := startPreparedStartCandidate(
+		context.Background(),
+		preparedStart{
+			candidate: startCandidate{
+				info: sessionpkg.Info{SessionName: name, SessionNameMetadata: name},
+				tp:   TemplateParams{TemplateName: "strict"},
+			},
+			cfg: runtime.Config{
+				Command:               "codex --model gpt-5.6-sol",
+				WorkDir:               t.TempDir(),
+				ProjectHooksForbidden: true,
+			},
+		},
+		"",
+		nil,
+		sp,
+		nil,
+		nil,
+		nil,
+	)
+	if err == nil {
+		t.Fatal("startPreparedStartCandidate error = nil, want bead-backed ownership refusal")
+	}
+	if usedWorker {
+		t.Fatal("usedWorker = true, want false before any worker/provider boundary")
+	}
+	if calls := sp.SnapshotCalls()[baseline:]; len(calls) != 0 {
+		t.Fatalf("provider calls after strict start attempt = %+v, want none", calls)
+	}
+}

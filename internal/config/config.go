@@ -670,6 +670,8 @@ type AgentOverride struct {
 	// WorkDir overrides the agent's working directory without changing
 	// its qualified identity or rig association.
 	WorkDir *string `toml:"work_dir,omitempty"`
+	// ProjectHooks overrides the project-scoped hook discovery policy.
+	ProjectHooks *ProjectHooksPolicy `toml:"project_hooks,omitempty" jsonschema:"enum=inherit,enum=forbid"`
 	// TmuxAlias overrides the tmux session name template
 	// (see Agent.TmuxAlias for semantics).
 	TmuxAlias *string `toml:"tmux_alias,omitempty"`
@@ -3127,6 +3129,20 @@ const (
 	AgentLifecycleOneShot = "one_shot"
 )
 
+// ProjectHooksPolicy controls whether a session may inherit project-scoped
+// provider hooks discovered from its filesystem context.
+type ProjectHooksPolicy string
+
+const (
+	// ProjectHooksInherit preserves the provider's normal project-hook
+	// discovery behavior. It is also the effective value when project_hooks is
+	// omitted.
+	ProjectHooksInherit ProjectHooksPolicy = "inherit"
+	// ProjectHooksForbid requires the session creation path to prevent project
+	// hook discovery before starting the provider.
+	ProjectHooksForbid ProjectHooksPolicy = "forbid"
+)
+
 // Agent defines a configured agent in the city.
 type Agent struct {
 	// Name is the unique identifier for this agent.
@@ -3140,6 +3156,10 @@ type Agent struct {
 	// agent's qualified identity. Relative paths resolve against city root
 	// and may use the same template placeholders as session_setup.
 	WorkDir string `toml:"work_dir,omitempty"`
+	// ProjectHooks controls whether sessions inherit project-scoped provider
+	// hooks discovered from their filesystem context. Empty is equivalent to
+	// "inherit"; "forbid" requires a pre-start isolation fence.
+	ProjectHooks ProjectHooksPolicy `toml:"project_hooks,omitempty" jsonschema:"enum=inherit,enum=forbid"`
 	// TmuxAlias overrides the tmux session_name for pool and factory-created
 	// manual sessions of this agent. When unset, sessions fall back to the
 	// universal derivation ("s-<beadID>" for ad-hoc sessions,
@@ -3519,6 +3539,21 @@ func (a Agent) Clone() Agent {
 	out.DefaultSlingFormula = copyStringPtr(a.DefaultSlingFormula)
 	out.InheritedDefaultSlingFormula = copyStringPtr(a.InheritedDefaultSlingFormula)
 	return out
+}
+
+// EffectiveProjectHooksPolicy returns the configured project hook policy,
+// treating an omitted value as inherit for backwards compatibility.
+func (a Agent) EffectiveProjectHooksPolicy() ProjectHooksPolicy {
+	if a.ProjectHooks == "" {
+		return ProjectHooksInherit
+	}
+	return a.ProjectHooks
+}
+
+// ForbidsProjectHooks reports whether the agent requires project hook
+// isolation at session creation.
+func (a Agent) ForbidsProjectHooks() bool {
+	return a.EffectiveProjectHooksPolicy() == ProjectHooksForbid
 }
 
 // agentSource enumerates the configuration origins recognized by
@@ -4039,6 +4074,22 @@ func ValidateAgents(agents []Agent) error {
 		default:
 			return fmt.Errorf("agent %q: lifecycle must be %q or empty, got %q", a.QualifiedName(), AgentLifecycleOneShot, a.Lifecycle)
 		}
+		// ProjectHooks enum and conflicts. A forbidden session cannot also
+		// declare project hooks as installed or request their installation.
+		switch a.ProjectHooks {
+		case "", ProjectHooksInherit, ProjectHooksForbid:
+			// valid
+		default:
+			return fmt.Errorf("agent %q: project_hooks must be %q, %q, or empty, got %q", a.QualifiedName(), ProjectHooksInherit, ProjectHooksForbid, a.ProjectHooks)
+		}
+		if a.ProjectHooks == ProjectHooksForbid {
+			if a.HooksInstalled != nil && *a.HooksInstalled {
+				return fmt.Errorf("agent %q: project_hooks=%q conflicts with hooks_installed=true", a.QualifiedName(), ProjectHooksForbid)
+			}
+			if len(a.InstallAgentHooks) > 0 {
+				return fmt.Errorf("agent %q: project_hooks=%q conflicts with nonempty install_agent_hooks", a.QualifiedName(), ProjectHooksForbid)
+			}
+		}
 		// PromptFlag required when prompt_mode = "flag".
 		if a.PromptMode == "flag" && a.PromptFlag == "" {
 			return fmt.Errorf("agent %q: prompt_flag is required when prompt_mode = \"flag\"", a.QualifiedName())
@@ -4075,6 +4126,36 @@ func ValidateAgents(agents []Agent) error {
 		return err
 	}
 
+	return nil
+}
+
+// ValidateCityAgents validates composed agents together with workspace-level
+// defaults that can change their effective behavior. In particular, an agent
+// that forbids project hooks must not inherit an install_agent_hooks writer
+// from the workspace after its own Agent fields have passed ValidateAgents.
+func ValidateCityAgents(cfg *City) error {
+	if cfg == nil {
+		return fmt.Errorf("city config is nil")
+	}
+	if err := ValidateAgents(cfg.Agents); err != nil {
+		return err
+	}
+	for i := range cfg.Agents {
+		agent := &cfg.Agents[i]
+		if !agent.ForbidsProjectHooks() || IsDeterministicControlDispatcher(agent) {
+			continue
+		}
+		// A non-empty agent list is already rejected by ValidateAgents above.
+		// Empty means ResolveInstallHooks would otherwise fall back to the
+		// workspace list, so reject that composed contradiction explicitly.
+		if len(agent.InstallAgentHooks) == 0 && len(cfg.Workspace.InstallAgentHooks) > 0 {
+			return fmt.Errorf(
+				"agent %q: project_hooks=%q conflicts with workspace install_agent_hooks",
+				agent.QualifiedName(),
+				ProjectHooksForbid,
+			)
+		}
+	}
 	return nil
 }
 

@@ -42,6 +42,64 @@ func (h *SessionHandle) LiveObservation(_ context.Context) (LiveObservation, err
 		return LiveObservation{}, err
 	}
 	runtimeObs := h.manager.ObserveRuntimeForInfo(info, h.runtimeHints().ProcessNames)
+	return liveObservationFromSession(info, runtimeObs), nil
+}
+
+// ObserveSessionForReconciler observes a bead-backed session only while the
+// reconciler's originally captured trigger witness remains current and
+// wake-eligible. The manager reloads and validates the persisted row under the
+// session mutation lock before any repair, provider routing, or observation.
+func (f *Factory) ObserveSessionForReconciler(
+	ctx context.Context,
+	id string,
+	processNames []string,
+	witness sessionpkg.LiveBoundaryWitness,
+) (LiveObservation, error) {
+	if err := ctx.Err(); err != nil {
+		return LiveObservation{}, err
+	}
+	info, runtimeObs, err := f.manager.ObserveRuntimeForReconcilerWithWitness(id, processNames, witness)
+	if err != nil {
+		return LiveObservation{}, err
+	}
+	return liveObservationFromSession(info, runtimeObs), nil
+}
+
+// ObserveSessionForReconcilerLifecycle observes an exact bead-backed session
+// for automatic drain/stop/retirement work. It retains the captured trigger
+// witness while allowing that exact session to be suspended.
+func (f *Factory) ObserveSessionForReconcilerLifecycle(
+	ctx context.Context,
+	id string,
+	processNames []string,
+	witness sessionpkg.LiveBoundaryWitness,
+) (LiveObservation, error) {
+	if err := ctx.Err(); err != nil {
+		return LiveObservation{}, err
+	}
+	info, runtimeObs, err := f.manager.ObserveRuntimeForReconcilerLifecycleWithWitness(id, processNames, witness)
+	if err != nil {
+		return LiveObservation{}, err
+	}
+	return liveObservationFromSession(info, runtimeObs), nil
+}
+
+// PeekSessionForReconciler captures provider output only while the
+// reconciler's originally captured trigger witness remains current and
+// wake-eligible.
+func (f *Factory) PeekSessionForReconciler(
+	ctx context.Context,
+	id string,
+	lines int,
+	witness sessionpkg.LiveBoundaryWitness,
+) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	return f.manager.PeekForReconcilerWithWitness(id, lines, witness)
+}
+
+func liveObservationFromSession(info sessionpkg.Info, runtimeObs sessionpkg.RuntimeObservation) LiveObservation {
 	obs := LiveObservation{
 		Running:          runtimeObs.Running,
 		Alive:            runtimeObs.Alive,
@@ -55,5 +113,5 @@ func (h *SessionHandle) LiveObservation(_ context.Context) (LiveObservation, err
 		last := runtimeObs.LastActive
 		obs.LastActivity = &last
 	}
-	return obs, nil
+	return obs
 }

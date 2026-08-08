@@ -975,6 +975,7 @@ type AgentPatch struct {
 	Pool                    PoolOverride      `json:"Pool"`
 	PreStart                *[]string         `json:"PreStart"`
 	PreStartAppend          *[]string         `json:"PreStartAppend"`
+	ProjectHooks            *string           `json:"ProjectHooks"`
 	PromptTemplate          *string           `json:"PromptTemplate"`
 	Provider                *string           `json:"Provider"`
 	ResumeCommand           *string           `json:"ResumeCommand"`

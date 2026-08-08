@@ -142,6 +142,9 @@ func AgentProcessNames(cfg *City, agent Agent, lookPath LookPathFunc) []string {
 // Agent-level overrides workspace-level (replace, not additive).
 // Returns nil if neither specifies hooks.
 func ResolveInstallHooks(agent *Agent, ws *Workspace) []string {
+	if agent != nil && agent.ForbidsProjectHooks() {
+		return nil
+	}
 	if IsDeterministicControlDispatcher(agent) {
 		return nil
 	}
@@ -733,6 +736,9 @@ func completeResolvedProviderResumeCommand(rp *ResolvedProvider) {
 // is only correct when the caller is certain no wrapped alias is in
 // play.
 func AgentHasHooks(agent *Agent, ws *Workspace, providerName string, cityProviders map[string]ProviderSpec) bool {
+	if agent != nil && agent.ForbidsProjectHooks() {
+		return false
+	}
 	// 1. Explicit override wins.
 	if agent.HooksInstalled != nil {
 		return *agent.HooksInstalled

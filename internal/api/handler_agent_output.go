@@ -205,17 +205,29 @@ func (s *Server) peekFallbackOutput(ctx context.Context, w http.ResponseWriter, 
 	})
 }
 
-// resolveAgentWorkDir returns the absolute working directory for an agent,
-// honoring work_dir template expansion.
+// resolveAgentWorkDir returns the configured working directory for read-only
+// API projections of an existing agent session. Session launch authorization
+// must use the strict workdir resolver instead.
 func (s *Server) resolveAgentWorkDir(a config.Agent, qualifiedName string) string {
 	cfg := s.state.Config()
-	return workdirutil.ResolveWorkDirPath(
+	if cfg == nil {
+		return ""
+	}
+	return resolveConfiguredAgentWorkDir(
 		s.state.CityPath(),
 		workdirutil.CityName(s.state.CityPath(), cfg),
 		qualifiedName,
 		a,
 		cfg.Rigs,
 	)
+}
+
+func resolveConfiguredAgentWorkDir(cityPath, cityName, qualifiedName string, a config.Agent, rigs []config.Rig) string {
+	path, err := workdirutil.ResolveConfiguredWorkDirPath(cityPath, cityName, qualifiedName, a, rigs)
+	if err != nil {
+		return ""
+	}
+	return path
 }
 
 func (s *Server) agentWorkerHandle(name string, cfg *config.City) agentPeekHandle {

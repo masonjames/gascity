@@ -435,6 +435,18 @@ func TestConfigFingerprintIncludesCopyFiles(t *testing.T) {
 	}
 }
 
+func TestConfigFingerprintIncludesProjectHooksForbidden(t *testing.T) {
+	inherited := Config{Command: "agent"}
+	forbidden := inherited
+	forbidden.ProjectHooksForbidden = true
+	if CoreFingerprint(inherited) == CoreFingerprint(forbidden) {
+		t.Fatal("ProjectHooksForbidden must participate in the core fingerprint")
+	}
+	if got := CoreFingerprintDriftFields(CoreFingerprintBreakdown(inherited), forbidden); len(got) != 1 || got[0] != "ProjectHooksForbidden" {
+		t.Fatalf("drift fields = %v, want [ProjectHooksForbidden]", got)
+	}
+}
+
 func TestConfigFingerprintPreStartOrderMatters(t *testing.T) {
 	a := Config{Command: "claude", PreStart: []string{"a", "b"}}
 	b := Config{Command: "claude", PreStart: []string{"b", "a"}}

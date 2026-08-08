@@ -1,11 +1,13 @@
 package worker
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/pricing"
 	"github.com/gastownhall/gascity/internal/runtime"
@@ -20,7 +22,14 @@ type SessionRuntimeResolver func(info sessionpkg.Info, sessionKind string, metad
 // FactoryConfig constructs worker-owned session handles and catalogs without
 // leaking session.Manager setup into higher layers.
 type FactoryConfig struct {
-	Store                 beads.Store
+	Store beads.Store
+	// CityConfig is the current resolved city configuration used to
+	// conservatively re-resolve persisted session identity inside automatic
+	// provider-effect leases. Nil makes automatic effects fail closed.
+	CityConfig *config.City
+	// CanonicalCityStore is the physical city work store. Strict live-boundary
+	// policy compares it with Store instead of trusting a textual store ref.
+	CanonicalCityStore    beads.Store
 	Provider              runtime.Provider
 	CityPath              string
 	SearchPaths           []string
@@ -28,6 +37,9 @@ type FactoryConfig struct {
 	UsageSink             usage.Sink
 	ResolveTransport      func(template, provider string) string
 	ResolveSessionRuntime SessionRuntimeResolver
+	// AuthorizeLaunch supplies the role-neutral live-boundary policy threaded
+	// into every session-backed handle produced by this factory.
+	AuthorizeLaunch LaunchAuthorizer
 	// StaleKeyDetectionWaiter supplies the session lifecycle signal used before
 	// a keyed start is probed for stale resume-key failure. Nil preserves the
 	// session package production timer.
@@ -42,11 +54,14 @@ type FactoryConfig struct {
 type Factory struct {
 	manager               *sessionpkg.Manager
 	store                 beads.Store
+	cityConfig            *config.City
 	provider              runtime.Provider
 	searchPaths           []string
 	recorder              events.Recorder
 	usageSink             usage.Sink
 	resolveSessionRuntime SessionRuntimeResolver
+	authorizeLaunch       LaunchAuthorizer
+	canonicalCityStore    beads.Store
 	pricing               *pricing.Registry
 }
 
@@ -64,16 +79,16 @@ func NewFactory(cfg FactoryConfig) (*Factory, error) {
 		opts = append(opts, sessionpkg.WithStaleKeyDetectionWaiter(cfg.StaleKeyDetectionWaiter))
 	}
 	manager := sessionpkg.NewManagerWithOptions(cfg.Store, cfg.Provider, opts...)
-	return newFactory(manager, cfg.Store, cfg.Provider, cfg.SearchPaths, cfg.Recorder, cfg.UsageSink, cfg.ResolveSessionRuntime, cfg.Pricing)
+	return newFactory(manager, cfg.Store, cfg.CanonicalCityStore, cfg.Provider, cfg.CityConfig, cfg.SearchPaths, cfg.Recorder, cfg.UsageSink, cfg.ResolveSessionRuntime, cfg.AuthorizeLaunch, cfg.Pricing)
 }
 
 // NewFactoryFromManager wraps an already-constructed session manager behind the
 // worker boundary. Primarily useful in tests.
 func NewFactoryFromManager(manager *sessionpkg.Manager, searchPaths []string) (*Factory, error) {
-	return newFactory(manager, nil, nil, searchPaths, nil, nil, nil, nil)
+	return newFactory(manager, nil, nil, nil, nil, searchPaths, nil, nil, nil, nil, nil)
 }
 
-func newFactory(manager *sessionpkg.Manager, store beads.Store, provider runtime.Provider, searchPaths []string, recorder events.Recorder, usageSink usage.Sink, resolveRuntime SessionRuntimeResolver, registry *pricing.Registry) (*Factory, error) {
+func newFactory(manager *sessionpkg.Manager, store, canonicalCityStore beads.Store, provider runtime.Provider, cityConfig *config.City, searchPaths []string, recorder events.Recorder, usageSink usage.Sink, resolveRuntime SessionRuntimeResolver, authorizeLaunch LaunchAuthorizer, registry *pricing.Registry) (*Factory, error) {
 	if manager == nil {
 		return nil, fmt.Errorf("%w: manager is required", ErrHandleConfig)
 	}
@@ -83,11 +98,14 @@ func newFactory(manager *sessionpkg.Manager, store beads.Store, provider runtime
 	return &Factory{
 		manager:               manager,
 		store:                 store,
+		cityConfig:            cityConfig,
 		provider:              provider,
+		canonicalCityStore:    canonicalCityStore,
 		searchPaths:           append([]string(nil), searchPaths...),
 		recorder:              recorder,
 		usageSink:             usageSink,
 		resolveSessionRuntime: resolveRuntime,
+		authorizeLaunch:       authorizeLaunch,
 		pricing:               registry,
 	}, nil
 }
@@ -111,12 +129,15 @@ func (f *Factory) UsageSink() usage.Sink {
 // session manager and transcript search paths.
 func (f *Factory) Session(spec SessionSpec) (*SessionHandle, error) {
 	return NewSessionHandle(SessionHandleConfig{
-		Manager:     f.manager,
-		SearchPaths: append([]string(nil), f.searchPaths...),
-		Recorder:    f.recorder,
-		UsageSink:   f.usageSink,
-		Session:     spec,
-		Pricing:     f.pricing,
+		Manager:            f.manager,
+		SearchPaths:        append([]string(nil), f.searchPaths...),
+		Recorder:           f.recorder,
+		UsageSink:          f.usageSink,
+		Session:            spec,
+		SessionStore:       f.store,
+		CanonicalCityStore: f.canonicalCityStore,
+		AuthorizeLaunch:    f.authorizeLaunch,
+		Pricing:            f.pricing,
 	})
 }
 
@@ -127,16 +148,26 @@ func (f *Factory) SessionByID(id string) (Handle, error) {
 	return f.SessionByHandle(id)
 }
 
-// SessionByHandle rebuilds a session-backed worker handle from a bead-id handle:
-// one session.Store.GetPersistedResponse fetch (the same single-fetch cost as
-// the retired Manager.GetWithBead) for the persisted Info + PersistedResponse,
-// the read-path empty-type heal, and the runtime overlay (EnrichInfo), then the
-// spec build off (Info, PersistedResponse). No raw beads.Bead crosses the
-// boundary.
+// SessionByHandle rebuilds a session-backed worker handle from a bead-id handle.
+// A configured launch authorizer sees the raw persisted record before the
+// legacy empty-type heal or runtime enrichment can write, route, or probe. A
+// strict exact-trigger record stays on the side-effect-free persisted model;
+// inherit/no-agent records preserve the established enriched read behavior.
 func (f *Factory) SessionByHandle(id string) (Handle, error) {
-	info, pr, err := sessionRecordViaManager(f.manager, id)
+	info, pr, err := f.manager.PersistedStore().GetPersistedResponse(id)
+	if err != nil {
+		return nil, bridgeSessionRecordError(id, err)
+	}
+	authorization, err := f.authorizePersistedRecord(info, pr)
 	if err != nil {
 		return nil, err
+	}
+	if strings.TrimSpace(authorization.TriggerBeadID) == "" && strings.TrimSpace(authorization.TriggerBeadStoreRef) == "" {
+		if info.Type == "" {
+			f.manager.PersistedStore().RepairTypeBestEffort(id)
+			info.Type = sessionpkg.BeadType
+		}
+		info = f.manager.EnrichInfo(info)
 	}
 	return f.sessionFromRecord(info, pr)
 }
@@ -155,7 +186,40 @@ func (f *Factory) SessionByHandle(id string) (Handle, error) {
 // and would force a hidden re-Get; PersistedResponse.Metadata is the documented
 // typed envelope for exactly this.
 func (f *Factory) SessionByRecord(info sessionpkg.Info, pr sessionpkg.PersistedResponse) (Handle, error) {
-	return f.sessionFromRecord(f.manager.EnrichInfo(info), pr)
+	authorization, err := f.authorizePersistedRecord(info, pr)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(authorization.TriggerBeadID) == "" && strings.TrimSpace(authorization.TriggerBeadStoreRef) == "" {
+		info = f.manager.EnrichInfo(info)
+	}
+	return f.sessionFromRecord(info, pr)
+}
+
+func (f *Factory) authorizePersistedRecord(info sessionpkg.Info, pr sessionpkg.PersistedResponse) (LaunchAuthorization, error) {
+	return f.authorizePersistedRecordWithContext(context.Background(), info, pr)
+}
+
+func (f *Factory) authorizePersistedRecordWithContext(ctx context.Context, info sessionpkg.Info, pr sessionpkg.PersistedResponse) (LaunchAuthorization, error) {
+	if f.authorizeLaunch == nil {
+		return LaunchAuthorization{}, nil
+	}
+	infoCopy := info
+	return f.authorizeLaunch(ctx, LaunchAuthorizationRequest{
+		Session: SessionSpec{
+			ID:       info.ID,
+			Template: info.Template,
+			Title:    info.Title,
+			Alias:    info.Alias,
+			Command:  info.Command,
+			Provider: info.Provider,
+			WorkDir:  info.WorkDir,
+		},
+		Info:               &infoCopy,
+		Metadata:           cloneStringMap(pr.Metadata),
+		SessionStore:       f.store,
+		CanonicalCityStore: f.canonicalCityStore,
+	})
 }
 
 func (f *Factory) sessionFromRecord(info sessionpkg.Info, pr sessionpkg.PersistedResponse) (Handle, error) {

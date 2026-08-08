@@ -941,6 +941,9 @@ func requestManagedNudgeWake(target nudgeTarget, sessFront *session.Store) error
 }
 
 func workerHandleForNudgeTarget(target nudgeTarget, store beads.Store, sp runtime.Provider) (worker.Handle, error) {
+	if target.agent.ForbidsProjectHooks() && strings.TrimSpace(target.sessionID) == "" {
+		return nil, fmt.Errorf("%w: project-hook-isolated nudge target requires a persisted session row", worker.ErrLaunchUnauthorized)
+	}
 	if target.sessionName != "" {
 		if target.sessionID != "" || target.continuationEpoch != "" {
 			obs, err := workerObserveSessionTargetWithConfig(target.cityPath, store, sp, target.cfg, target.sessionName)
@@ -952,13 +955,24 @@ func workerHandleForNudgeTarget(target nudgeTarget, store beads.Store, sp runtim
 				if !matches {
 					return nil, fmt.Errorf("%w: live runtime %q no longer matches session generation %q", runtime.ErrSessionNotFound, target.sessionName, target.pollerKey())
 				}
-				if !obs.Running && target.sessionID != "" {
+				// A persisted session identity always stays on the bead-backed
+				// worker boundary, even while its runtime is already live. Returning
+				// a RuntimeHandle here bypasses launch authorization and the exact
+				// trigger witness for live-only nudge delivery. RuntimeHandle is
+				// reserved for genuinely beadless legacy sessions below.
+				if target.sessionID != "" {
 					return workerHandleForSessionWithConfig(target.cityPath, store, sp, target.cfg, target.sessionID)
 				}
 			}
 			if err != nil && !errors.Is(err, runtime.ErrSessionNotFound) && !errors.Is(err, session.ErrSessionNotFound) {
 				return nil, err
 			}
+		}
+		// A known persisted identity must never degrade to the beadless runtime
+		// path, including when observation reports that its row disappeared.
+		// The bead-backed constructor then fails closed on the authoritative row.
+		if target.sessionID != "" {
+			return workerHandleForSessionWithConfig(target.cityPath, store, sp, target.cfg, target.sessionID)
 		}
 		handle, err := runtimeWorkerHandleWithConfig(
 			target.cityPath,

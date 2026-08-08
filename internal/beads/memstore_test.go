@@ -45,6 +45,16 @@ func TestMemStoreConditionalWriterConformance(t *testing.T) {
 	)
 }
 
+func TestMemStoreAssignmentClaimConformance(t *testing.T) {
+	beadstest.RunGuardedAssignmentClaimConformance(t, "MemStore",
+		func(_ *testing.T) beads.Store { return beads.NewMemStore() })
+}
+
+func TestMemStoreAssignmentReleaseConformance(t *testing.T) {
+	beadstest.RunAssignmentReleaseConformance(t, "MemStore",
+		func(_ *testing.T) beads.Store { return beads.NewMemStore() })
+}
+
 func TestMemStoreSetMetadata(t *testing.T) {
 	s := beads.NewMemStore()
 	b, err := s.Create(beads.Bead{Title: "test"})

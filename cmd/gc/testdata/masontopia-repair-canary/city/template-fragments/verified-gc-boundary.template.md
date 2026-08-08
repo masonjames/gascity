@@ -1,0 +1,1 @@
+Frozen verified-boundary fixture.

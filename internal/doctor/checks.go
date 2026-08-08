@@ -100,7 +100,7 @@ func (c *CityConfigCheck) CanFix() bool { return false }
 // Fix is a no-op.
 func (c *CityConfigCheck) Fix(_ *CheckContext) error { return nil }
 
-// ConfigValidCheck runs ValidateAgents and ValidateRigs.
+// ConfigValidCheck validates agents and their city-level defaults, then rigs.
 type ConfigValidCheck struct {
 	cfg *config.City
 }
@@ -116,7 +116,7 @@ func (c *ConfigValidCheck) Name() string { return "config-valid" }
 // Run validates agents and rigs in the config.
 func (c *ConfigValidCheck) Run(_ *CheckContext) *CheckResult {
 	r := &CheckResult{Name: c.Name()}
-	if err := config.ValidateAgents(c.cfg.Agents); err != nil {
+	if err := config.ValidateCityAgents(c.cfg); err != nil {
 		r.Status = StatusError
 		r.Message = fmt.Sprintf("agent validation: %v", err)
 		return r

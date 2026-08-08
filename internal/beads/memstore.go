@@ -98,7 +98,11 @@ func cloneBead(b Bead) Bead {
 func (m *MemStore) Create(b Bead) (Bead, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.createLocked(b), nil
+}
 
+// createLocked persists b while m.mu is held.
+func (m *MemStore) createLocked(b Bead) Bead {
 	m.seq++
 	prefix := m.IDPrefix
 	if prefix == "" {
@@ -132,7 +136,7 @@ func (m *MemStore) Create(b Bead) (Bead, error) {
 			Type:        depType,
 		})
 	}
-	return cloneBead(stored), nil
+	return cloneBead(stored)
 }
 
 // indexOfLocked returns the slice index of the bead with the given ID, or -1 if
@@ -426,6 +430,9 @@ func (m *MemStore) readyLocked(ctx context.Context, q ReadyQuery) ([]Bead, error
 			continue
 		}
 		if q.Assignee != "" && b.Assignee != q.Assignee {
+			continue
+		}
+		if q.excludesAnyLabel(b.Labels) {
 			continue
 		}
 		blocked := false

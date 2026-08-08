@@ -77,8 +77,11 @@ type NudgesStore struct {
 // conditional-writes resolution target, so ResolveConditionalWriter works on
 // a typed handle without the caller remembering to unwrap — the one optional
 // capability where forgetting the unwrap would not fail loudly but silently
-// resolve unset→legacy (fatal under require). All other optional capabilities
-// keep the assert-on-.Store convention above.
+// resolve unset→legacy (fatal under require). They also declare the wrapped
+// store as their ownership identity and delegate guarded assignment capability
+// resolution: assignment callers must fail closed when the underlying backend
+// cannot make the complete claim atomic. All other optional capabilities keep
+// the assert-on-.Store convention above.
 
 // ConditionalWritesResolveTarget declares the wrapped store as the
 // conditional-writes resolution target.
@@ -104,11 +107,167 @@ func (s OrdersStore) ConditionalWritesResolveTarget() Store { return s.Store }
 // conditional-writes resolution target.
 func (s NudgesStore) ConditionalWritesResolveTarget() Store { return s.Store }
 
+// StoreIdentityTarget declares the wrapped store as the work store's ownership
+// identity.
+func (s WorkStore) StoreIdentityTarget() Store { return s.Store }
+
+// StoreIdentityTarget declares the wrapped store as the graph store's ownership
+// identity.
+func (s GraphStore) StoreIdentityTarget() Store { return s.Store }
+
+// StoreIdentityTarget declares the wrapped store as the session store's
+// ownership identity.
+func (s SessionStore) StoreIdentityTarget() Store { return s.Store }
+
+// StoreIdentityTarget declares the wrapped store as the mail store's ownership
+// identity.
+func (s MailStore) StoreIdentityTarget() Store { return s.Store }
+
+// StoreIdentityTarget declares the wrapped store as the orders store's
+// ownership identity.
+func (s OrdersStore) StoreIdentityTarget() Store { return s.Store }
+
+// StoreIdentityTarget declares the wrapped store as the nudges store's
+// ownership identity.
+func (s NudgesStore) StoreIdentityTarget() Store { return s.Store }
+
+// GuardedAssignmentClaimerHandle delegates exact guarded assignments to the
+// wrapped work store when that backend supports them.
+func (s WorkStore) GuardedAssignmentClaimerHandle() (GuardedAssignmentClaimer, bool) {
+	return GuardedAssignmentClaimerFor(s.Store)
+}
+
+// GuardedAssignmentClaimerHandle delegates exact guarded assignments to the
+// wrapped graph store when that backend supports them.
+func (s GraphStore) GuardedAssignmentClaimerHandle() (GuardedAssignmentClaimer, bool) {
+	return GuardedAssignmentClaimerFor(s.Store)
+}
+
+// GuardedAssignmentClaimerHandle delegates exact guarded assignments to the
+// wrapped session store when that backend supports them.
+func (s SessionStore) GuardedAssignmentClaimerHandle() (GuardedAssignmentClaimer, bool) {
+	return GuardedAssignmentClaimerFor(s.Store)
+}
+
+// GuardedAssignmentClaimerHandle delegates exact guarded assignments to the
+// wrapped mail store when that backend supports them.
+func (s MailStore) GuardedAssignmentClaimerHandle() (GuardedAssignmentClaimer, bool) {
+	return GuardedAssignmentClaimerFor(s.Store)
+}
+
+// GuardedAssignmentClaimerHandle delegates exact guarded assignments to the
+// wrapped orders store when that backend supports them.
+func (s OrdersStore) GuardedAssignmentClaimerHandle() (GuardedAssignmentClaimer, bool) {
+	return GuardedAssignmentClaimerFor(s.Store)
+}
+
+// GuardedAssignmentClaimerHandle delegates exact guarded assignments to the
+// wrapped nudges store when that backend supports them.
+func (s NudgesStore) GuardedAssignmentClaimerHandle() (GuardedAssignmentClaimer, bool) {
+	return GuardedAssignmentClaimerFor(s.Store)
+}
+
+// CreateAssignmentClaimerHandle delegates atomic fresh-witness assignments to
+// the wrapped work store when supported.
+func (s WorkStore) CreateAssignmentClaimerHandle() (CreateAssignmentClaimer, bool) {
+	return CreateAssignmentClaimerFor(s.Store)
+}
+
+// CreateAssignmentClaimerHandle delegates atomic fresh-witness assignments to
+// the wrapped graph store when supported.
+func (s GraphStore) CreateAssignmentClaimerHandle() (CreateAssignmentClaimer, bool) {
+	return CreateAssignmentClaimerFor(s.Store)
+}
+
+// CreateAssignmentClaimerHandle delegates atomic fresh-witness assignments to
+// the wrapped session store when supported.
+func (s SessionStore) CreateAssignmentClaimerHandle() (CreateAssignmentClaimer, bool) {
+	return CreateAssignmentClaimerFor(s.Store)
+}
+
+// CreateAssignmentClaimerHandle delegates atomic fresh-witness assignments to
+// the wrapped mail store when supported.
+func (s MailStore) CreateAssignmentClaimerHandle() (CreateAssignmentClaimer, bool) {
+	return CreateAssignmentClaimerFor(s.Store)
+}
+
+// CreateAssignmentClaimerHandle delegates atomic fresh-witness assignments to
+// the wrapped orders store when supported.
+func (s OrdersStore) CreateAssignmentClaimerHandle() (CreateAssignmentClaimer, bool) {
+	return CreateAssignmentClaimerFor(s.Store)
+}
+
+// CreateAssignmentClaimerHandle delegates atomic fresh-witness assignments to
+// the wrapped nudges store when supported.
+func (s NudgesStore) CreateAssignmentClaimerHandle() (CreateAssignmentClaimer, bool) {
+	return CreateAssignmentClaimerFor(s.Store)
+}
+
+// AssignmentReleaserHandle delegates atomic assignment release to the wrapped
+// work store when supported.
+func (s WorkStore) AssignmentReleaserHandle() (AssignmentReleaser, bool) {
+	return AssignmentReleaserFor(s.Store)
+}
+
+// AssignmentReleaserHandle delegates atomic assignment release to the wrapped
+// graph store when supported.
+func (s GraphStore) AssignmentReleaserHandle() (AssignmentReleaser, bool) {
+	return AssignmentReleaserFor(s.Store)
+}
+
+// AssignmentReleaserHandle delegates atomic assignment release to the wrapped
+// session store when supported.
+func (s SessionStore) AssignmentReleaserHandle() (AssignmentReleaser, bool) {
+	return AssignmentReleaserFor(s.Store)
+}
+
+// AssignmentReleaserHandle delegates atomic assignment release to the wrapped
+// mail store when supported.
+func (s MailStore) AssignmentReleaserHandle() (AssignmentReleaser, bool) {
+	return AssignmentReleaserFor(s.Store)
+}
+
+// AssignmentReleaserHandle delegates atomic assignment release to the wrapped
+// orders store when supported.
+func (s OrdersStore) AssignmentReleaserHandle() (AssignmentReleaser, bool) {
+	return AssignmentReleaserFor(s.Store)
+}
+
+// AssignmentReleaserHandle delegates atomic assignment release to the wrapped
+// nudges store when supported.
+func (s NudgesStore) AssignmentReleaserHandle() (AssignmentReleaser, bool) {
+	return AssignmentReleaserFor(s.Store)
+}
+
 var (
-	_ ConditionalWritesResolveTargeter = WorkStore{}
-	_ ConditionalWritesResolveTargeter = GraphStore{}
-	_ ConditionalWritesResolveTargeter = SessionStore{}
-	_ ConditionalWritesResolveTargeter = MailStore{}
-	_ ConditionalWritesResolveTargeter = OrdersStore{}
-	_ ConditionalWritesResolveTargeter = NudgesStore{}
+	_ ConditionalWritesResolveTargeter       = WorkStore{}
+	_ ConditionalWritesResolveTargeter       = GraphStore{}
+	_ ConditionalWritesResolveTargeter       = SessionStore{}
+	_ ConditionalWritesResolveTargeter       = MailStore{}
+	_ ConditionalWritesResolveTargeter       = OrdersStore{}
+	_ ConditionalWritesResolveTargeter       = NudgesStore{}
+	_ StoreIdentityTargeter                  = WorkStore{}
+	_ StoreIdentityTargeter                  = GraphStore{}
+	_ StoreIdentityTargeter                  = SessionStore{}
+	_ StoreIdentityTargeter                  = MailStore{}
+	_ StoreIdentityTargeter                  = OrdersStore{}
+	_ StoreIdentityTargeter                  = NudgesStore{}
+	_ GuardedAssignmentClaimerHandleProvider = WorkStore{}
+	_ GuardedAssignmentClaimerHandleProvider = GraphStore{}
+	_ GuardedAssignmentClaimerHandleProvider = SessionStore{}
+	_ GuardedAssignmentClaimerHandleProvider = MailStore{}
+	_ GuardedAssignmentClaimerHandleProvider = OrdersStore{}
+	_ GuardedAssignmentClaimerHandleProvider = NudgesStore{}
+	_ CreateAssignmentClaimerHandleProvider  = WorkStore{}
+	_ CreateAssignmentClaimerHandleProvider  = GraphStore{}
+	_ CreateAssignmentClaimerHandleProvider  = SessionStore{}
+	_ CreateAssignmentClaimerHandleProvider  = MailStore{}
+	_ CreateAssignmentClaimerHandleProvider  = OrdersStore{}
+	_ CreateAssignmentClaimerHandleProvider  = NudgesStore{}
+	_ AssignmentReleaserHandleProvider       = WorkStore{}
+	_ AssignmentReleaserHandleProvider       = GraphStore{}
+	_ AssignmentReleaserHandleProvider       = SessionStore{}
+	_ AssignmentReleaserHandleProvider       = MailStore{}
+	_ AssignmentReleaserHandleProvider       = OrdersStore{}
+	_ AssignmentReleaserHandleProvider       = NudgesStore{}
 )

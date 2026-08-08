@@ -18,9 +18,10 @@ import (
 // restart — the in-memory grace map of the reverted #312 nudger did not, which
 // is precisely why that one re-nudge-stormed on every restart (test-5il).
 const (
-	idleClaimNudgeTriggerKey = "idle_claim_nudge_trigger" // trigger bead id last acted on
-	idleClaimNudgeCountKey   = "idle_claim_nudge_count"   // delivery attempts reserved for that trigger
-	idleClaimNudgeAtKey      = "idle_claim_nudge_at"      // RFC3339 of last attempt / first observation
+	idleClaimNudgeTriggerKey         = "idle_claim_nudge_trigger"           // trigger bead id last acted on
+	idleClaimNudgeTriggerStoreRefKey = "idle_claim_nudge_trigger_store_ref" // exact store scope of that trigger
+	idleClaimNudgeCountKey           = "idle_claim_nudge_count"             // delivery attempts reserved for that trigger
+	idleClaimNudgeAtKey              = "idle_claim_nudge_at"                // RFC3339 of last attempt / first observation
 )
 
 // Session-bead metadata keys for the post-step continuation-claim backstop.
@@ -83,6 +84,33 @@ func nudgeStalledPoolClaims(
 	claimWorkStoreRefs []string,
 	now time.Time,
 	stdout io.Writer,
+	cityPaths ...string,
+) {
+	nudgeStalledPoolClaimsWithCanonicalWorkStore(
+		sp,
+		cfg,
+		store,
+		canonicalSessionWorkStore(store, cfg),
+		sessionBeads,
+		claimWork,
+		claimWorkStoreRefs,
+		now,
+		stdout,
+		cityPaths...,
+	)
+}
+
+func nudgeStalledPoolClaimsWithCanonicalWorkStore(
+	sp runtime.Provider,
+	cfg *config.City,
+	store beads.Store,
+	canonicalWorkStore beads.Store,
+	sessionBeads []beads.Bead,
+	claimWork []beads.Bead,
+	claimWorkStoreRefs []string,
+	now time.Time,
+	stdout io.Writer,
+	cityPaths ...string,
 ) {
 	if sp == nil || cfg == nil || store == nil {
 		return // hot reconcile path: never panic on a half-built dependency
@@ -96,7 +124,11 @@ func nudgeStalledPoolClaims(
 	// The shared engine keys work by bead ID alone, which cannot tell two
 	// same-ID beads in different stores apart, so this predicate carries its own
 	// store-scoped snapshot and leaves the engine's ID map empty.
-	runNudgeBackstop(sp, store, sessionBeads, nil, now, stdout, "idle-claim-nudge", poolClaimBackstop{
+	cityPath := ""
+	if len(cityPaths) > 0 {
+		cityPath = cityPaths[0]
+	}
+	runNudgeBackstop(sp, cfg, cityPath, store, canonicalWorkStore, sessionBeads, nil, now, stdout, "idle-claim-nudge", poolClaimBackstop{
 		cfg:  cfg,
 		work: newIdleClaimWorkSnapshot(claimWork, claimWorkStoreRefs),
 	})
@@ -124,6 +156,33 @@ func nudgeStalledPoolContinuations(
 	snapshotPartial bool,
 	now time.Time,
 	stdout io.Writer,
+	cityPaths ...string,
+) {
+	nudgeStalledPoolContinuationsWithCanonicalWorkStore(
+		sp,
+		cfg,
+		store,
+		canonicalSessionWorkStore(store, cfg),
+		sessionBeads,
+		candidates,
+		snapshotPartial,
+		now,
+		stdout,
+		cityPaths...,
+	)
+}
+
+func nudgeStalledPoolContinuationsWithCanonicalWorkStore(
+	sp runtime.Provider,
+	cfg *config.City,
+	store beads.Store,
+	canonicalWorkStore beads.Store,
+	sessionBeads []beads.Bead,
+	candidates []ContinuationClaimCandidate,
+	snapshotPartial bool,
+	now time.Time,
+	stdout io.Writer,
+	cityPaths ...string,
 ) {
 	if sp == nil || cfg == nil || store == nil || snapshotPartial {
 		return
@@ -131,9 +190,16 @@ func nudgeStalledPoolContinuations(
 	if sess, ok := store.(beads.SessionStore); ok && sess.Store == nil {
 		return
 	}
+	cityPath := ""
+	if len(cityPaths) > 0 {
+		cityPath = cityPaths[0]
+	}
 	runNudgeBackstop(
 		sp,
+		cfg,
+		cityPath,
 		store,
+		canonicalWorkStore,
 		sessionBeads,
 		nil,
 		now,
@@ -254,6 +320,10 @@ func (p poolContinuationBackstop) observe(store beads.Store, s *beads.Bead, targ
 
 func (p poolContinuationBackstop) reserve(store beads.Store, s *beads.Bead, target backstopTarget, attempts int, now time.Time, stdout io.Writer) bool {
 	return writeContinuationClaimMarker(store, s, target, attempts, now, stdout)
+}
+
+func (p poolContinuationBackstop) reservationPatch(target backstopTarget, attempts int, now time.Time) map[string]string {
+	return continuationClaimMarkerPatch(target, attempts, now)
 }
 
 func (p poolContinuationBackstop) exhausted(_ beads.Store, _ *beads.Bead, _ io.Writer) {
@@ -387,19 +457,23 @@ func (p poolClaimBackstop) governs(s beads.Bead) bool {
 // rig's copy, not a same-ID bead in another store.
 func (p poolClaimBackstop) resolve(s beads.Bead, _ map[string]beads.Bead, sessName string) (backstopTarget, backstopResolution) {
 	triggerID := strings.TrimSpace(s.Metadata[beadmeta.TriggerBeadIDMetadataKey])
+	triggerStoreRef := strings.TrimSpace(s.Metadata[beadmeta.TriggerBeadStoreRefMetadataKey])
 	if triggerID == "" {
 		return backstopTarget{}, backstopResolutionClear
 	}
-	w, ok := p.work.lookup(triggerID, s.Metadata[beadmeta.TriggerBeadStoreRefMetadataKey])
+	w, ok := p.work.lookup(triggerID, triggerStoreRef)
 	if !ok || !isUnclaimedTrigger(w, sessName) {
 		return backstopTarget{}, backstopResolutionClear
 	}
-	return backstopTarget{ID: triggerID}, backstopResolutionOutstanding
+	return backstopTarget{ID: triggerID, StoreRef: triggerStoreRef}, backstopResolutionOutstanding
 }
 
 func (p poolClaimBackstop) state(s beads.Bead, target backstopTarget) (same bool, attempts int, last time.Time) {
 	marked := strings.TrimSpace(s.Metadata[idleClaimNudgeTriggerKey])
-	return marked == target.ID, atoiOr0(s.Metadata[idleClaimNudgeCountKey]), parseRFC3339OrZero(s.Metadata[idleClaimNudgeAtKey])
+	markedStoreRef := strings.TrimSpace(s.Metadata[idleClaimNudgeTriggerStoreRefKey])
+	return marked == target.ID && markedStoreRef == target.StoreRef,
+		atoiOr0(s.Metadata[idleClaimNudgeCountKey]),
+		parseRFC3339OrZero(s.Metadata[idleClaimNudgeAtKey])
 }
 
 func (p poolClaimBackstop) content(s beads.Bead) string {
@@ -411,11 +485,15 @@ func (p poolClaimBackstop) revalidate(_ backstopTarget) backstopResolution {
 }
 
 func (p poolClaimBackstop) observe(store beads.Store, s *beads.Bead, target backstopTarget, now time.Time, stdout io.Writer) {
-	writeIdleClaimMarker(store, s, target.ID, 0, now, stdout)
+	writeIdleClaimMarker(store, s, target, 0, now, stdout)
 }
 
 func (p poolClaimBackstop) reserve(store beads.Store, s *beads.Bead, target backstopTarget, attempts int, now time.Time, stdout io.Writer) bool {
-	return writeIdleClaimMarker(store, s, target.ID, attempts, now, stdout)
+	return writeIdleClaimMarker(store, s, target, attempts, now, stdout)
+}
+
+func (p poolClaimBackstop) reservationPatch(target backstopTarget, attempts int, now time.Time) map[string]string {
+	return idleClaimMarkerPatch(target, attempts, now)
 }
 
 // exhausted is a deliberate no-op: manual re-nudge remains the pool escape
@@ -516,12 +594,8 @@ func claimNudgeFor(cfg *config.City, session beads.Bead) string {
 // writeIdleClaimMarker persists the backstop state machine onto the session
 // bead and mirrors it into the in-memory snapshot so the rest of this tick
 // reads the just-written values.
-func writeIdleClaimMarker(store beads.Store, s *beads.Bead, triggerID string, attempts int, now time.Time, stdout io.Writer) bool {
-	kvs := map[string]string{
-		idleClaimNudgeTriggerKey: triggerID,
-		idleClaimNudgeCountKey:   strconv.Itoa(attempts),
-		idleClaimNudgeAtKey:      now.UTC().Format(time.RFC3339),
-	}
+func writeIdleClaimMarker(store beads.Store, s *beads.Bead, target backstopTarget, attempts int, now time.Time, stdout io.Writer) bool {
+	kvs := idleClaimMarkerPatch(target, attempts, now)
 	if err := store.SetMetadataBatch(s.ID, kvs); err != nil {
 		fmt.Fprintf(stdout, "idle-claim-nudge: marking %s failed: %v\n", s.ID, err) //nolint:errcheck // best-effort
 		return false
@@ -535,19 +609,30 @@ func writeIdleClaimMarker(store beads.Store, s *beads.Bead, triggerID string, at
 	return true
 }
 
+func idleClaimMarkerPatch(target backstopTarget, attempts int, now time.Time) map[string]string {
+	return map[string]string{
+		idleClaimNudgeTriggerKey:         target.ID,
+		idleClaimNudgeTriggerStoreRefKey: target.StoreRef,
+		idleClaimNudgeCountKey:           strconv.Itoa(attempts),
+		idleClaimNudgeAtKey:              now.UTC().Format(time.RFC3339),
+	}
+}
+
 // clearIdleClaimMarker wipes the marker once the slot no longer has unclaimed
 // work, so the next assignment starts its grace clock fresh. No-op (no store
 // write) when there is nothing to clear, so steady-state ticks stay silent.
 func clearIdleClaimMarker(store beads.Store, s *beads.Bead, stdout io.Writer) {
 	if s.Metadata[idleClaimNudgeTriggerKey] == "" &&
+		s.Metadata[idleClaimNudgeTriggerStoreRefKey] == "" &&
 		s.Metadata[idleClaimNudgeCountKey] == "" &&
 		s.Metadata[idleClaimNudgeAtKey] == "" {
 		return
 	}
 	kvs := map[string]string{
-		idleClaimNudgeTriggerKey: "",
-		idleClaimNudgeCountKey:   "",
-		idleClaimNudgeAtKey:      "",
+		idleClaimNudgeTriggerKey:         "",
+		idleClaimNudgeTriggerStoreRefKey: "",
+		idleClaimNudgeCountKey:           "",
+		idleClaimNudgeAtKey:              "",
 	}
 	if err := store.SetMetadataBatch(s.ID, kvs); err != nil {
 		fmt.Fprintf(stdout, "idle-claim-nudge: clearing %s failed: %v\n", s.ID, err) //nolint:errcheck // best-effort
@@ -566,14 +651,7 @@ func writeContinuationClaimMarker(
 	now time.Time,
 	stdout io.Writer,
 ) bool {
-	kvs := map[string]string{
-		continuationClaimNudgeWorkKey:       target.ID,
-		continuationClaimNudgeRootKey:       target.RootID,
-		continuationClaimNudgeStoreRefKey:   target.StoreRef,
-		continuationClaimNudgeGenerationKey: target.Generation,
-		continuationClaimNudgeCountKey:      strconv.Itoa(attempts),
-		continuationClaimNudgeAtKey:         now.UTC().Format(time.RFC3339),
-	}
+	kvs := continuationClaimMarkerPatch(target, attempts, now)
 	if err := store.SetMetadataBatch(s.ID, kvs); err != nil {
 		fmt.Fprintf(stdout, "continuation-claim-nudge: marking %s failed: %v\n", s.ID, err) //nolint:errcheck // best-effort
 		return false
@@ -585,6 +663,17 @@ func writeContinuationClaimMarker(
 		s.Metadata[key] = value
 	}
 	return true
+}
+
+func continuationClaimMarkerPatch(target backstopTarget, attempts int, now time.Time) map[string]string {
+	return map[string]string{
+		continuationClaimNudgeWorkKey:       target.ID,
+		continuationClaimNudgeRootKey:       target.RootID,
+		continuationClaimNudgeStoreRefKey:   target.StoreRef,
+		continuationClaimNudgeGenerationKey: target.Generation,
+		continuationClaimNudgeCountKey:      strconv.Itoa(attempts),
+		continuationClaimNudgeAtKey:         now.UTC().Format(time.RFC3339),
+	}
 }
 
 func clearContinuationClaimMarker(store beads.Store, s *beads.Bead, stdout io.Writer) {

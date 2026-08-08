@@ -73,6 +73,19 @@ var ErrRuntimeUnavailable = errors.New("runtime unavailable: liveness observatio
 // support relaunch; the reconciler treats it as "fall back to full Stop+Start".
 var ErrRelaunchUnsupported = errors.New("runtime does not support warm-box relaunch")
 
+// ErrIncarnationMismatch reports that an exact automatic provider effect
+// found a different runtime incarnation than its caller selected. Providers
+// implementing ExactIncarnationProvider return this without applying the
+// effect; a sequential GetMeta followed by a name-only effect is not enough.
+var ErrIncarnationMismatch = errors.New("runtime incarnation mismatch")
+
+// ErrExactIncarnationUnsupported reports that an exact-incarnation method was
+// reached through a wrapper whose selected backend cannot implement the exact
+// effect. The method must return this before dispatching any provider effect.
+// Automatic callers may then release their authorization lease instead of
+// preserving it as an ambiguous post-dispatch outcome.
+var ErrExactIncarnationUnsupported = errors.New("runtime exact-incarnation effect unsupported")
+
 // IsSessionGone reports whether err represents a "the session is not
 // there" condition — either ErrSessionNotFound or the legacy provider
 // phrasings that predate the sentinel (tmux/subprocess providers may
@@ -302,6 +315,15 @@ type TransportCapabilityProvider interface {
 	SupportsTransport(transport string) bool
 }
 
+// ProjectHookIsolationCapabilityProvider is an optional provider extension for
+// launchers that can omit project hook artifacts and attest the final real cwd
+// immediately before starting a session. Callers enforcing project-hook
+// isolation must fail closed when the active provider does not implement this
+// interface or returns false for the selected transport.
+type ProjectHookIsolationCapabilityProvider interface {
+	SupportsProjectHookIsolation(transport string) bool
+}
+
 // ImmediateNudgeProvider is an optional extension for runtimes that can inject
 // input immediately without performing their own wait-idle heuristic first.
 type ImmediateNudgeProvider interface {
@@ -344,6 +366,108 @@ type InterruptBoundaryWaitProvider interface {
 // back to Stop+Start for a welded pack. See worker-runtime-transport-unweld-v0.md.
 type RelaunchProvider interface {
 	Relaunch(ctx context.Context, name string, cfg Config) error
+}
+
+// Incarnation identifies the exact runtime process authorized for one
+// automatic provider effect. OperationToken is required for compensation of a
+// newly started or relaunched process and empty for an existing incarnation.
+type Incarnation struct {
+	SessionID      string
+	InstanceToken  string
+	Epoch          string
+	OperationToken string
+	// Transport selects the authoritative backend inside a routing provider.
+	// Empty means that provider's default transport; exact methods must not
+	// consult mutable name-route state when this captured selector is present.
+	Transport string
+}
+
+// ExactIncarnationProvider atomically compares provider-owned incarnation
+// metadata and applies an effect to that same runtime. Implementations must not
+// emulate this contract with a separate GetMeta followed by a name-only call:
+// replacement between those operations would target an unauthorized runtime.
+// Routing/composite providers must resolve and fence their backend inside each
+// exact method; callers do not mutate a name-only route before the effect.
+type ExactIncarnationProvider interface {
+	RunLiveExact(name string, expected Incarnation, cfg Config) error
+	NudgeExact(name string, expected Incarnation, content []ContentBlock) error
+	StopExact(name string, expected Incarnation) error
+}
+
+// ExactIncarnationStart is an atomic provider start bound to one concrete
+// backend. It creates a fresh immutable runtime carrying desired and must not
+// reuse, archive, stop, or otherwise mutate any same-name runtime. Providers
+// that cannot guarantee fresh exact creation return
+// [ErrExactIncarnationUnsupported] before any effect.
+type ExactIncarnationStart func(ctx context.Context, name string, desired Incarnation, cfg Config) error
+
+// ExactIncarnationStartProvider creates fresh automatic runtimes with an exact
+// desired incarnation. An ordinary Provider.Start is never a valid fallback.
+type ExactIncarnationStartProvider interface {
+	StartExact(ctx context.Context, name string, desired Incarnation, cfg Config) error
+}
+
+// ExactIncarnationStartResolver binds an exact start to the concrete backend
+// selected by a routing provider. Resolution itself must have no side effects.
+type ExactIncarnationStartResolver interface {
+	ResolveExactIncarnationStart(name, transport string, cfg Config) (ExactIncarnationStart, error)
+}
+
+// ResolveExactIncarnationStart resolves one side-effect-free exact-start
+// handle. Direct providers must implement ExactIncarnationStartProvider;
+// composites recursively bind their selected backend through a resolver.
+func ResolveExactIncarnationStart(provider Provider, name, transport string, cfg Config) (ExactIncarnationStart, error) {
+	if provider == nil {
+		return nil, ErrExactIncarnationUnsupported
+	}
+	if resolver, ok := provider.(ExactIncarnationStartResolver); ok {
+		return resolver.ResolveExactIncarnationStart(name, transport, cfg)
+	}
+	starter, ok := provider.(ExactIncarnationStartProvider)
+	if !ok {
+		return nil, ErrExactIncarnationUnsupported
+	}
+	return starter.StartExact, nil
+}
+
+// IncarnationObservation is a provider-native read of one exact immutable
+// runtime. Attachment and activity may be zero when the provider cannot
+// safely derive them from the same exact snapshot.
+type IncarnationObservation struct {
+	Running      bool
+	Alive        bool
+	Attached     bool
+	LastActivity time.Time
+}
+
+// ExactIncarnationObserver reads liveness and optional activity only from the
+// exact immutable runtime selected by expected. It returns ErrSessionNotFound
+// when that incarnation is absent and ErrIncarnationMismatch when the name is
+// occupied only by another incarnation.
+type ExactIncarnationObserver interface {
+	ObserveExact(name string, expected Incarnation, processNames []string) (IncarnationObservation, error)
+}
+
+// ExactIncarnationPeekProvider reads output only from the exact immutable
+// runtime selected by expected. It must not fall back to a name-only read.
+type ExactIncarnationPeekProvider interface {
+	PeekExact(name string, expected Incarnation, lines int) (string, error)
+}
+
+// ExactIncarnationMetadataProvider atomically compares provider-owned
+// incarnation metadata and mutates a metadata key on that same runtime. It is
+// intentionally separate from ExactIncarnationProvider so automatic callers
+// can fail closed instead of falling back to name-only SetMeta or RemoveMeta.
+type ExactIncarnationMetadataProvider interface {
+	SetMetaExact(name string, expected Incarnation, key, value string) error
+	RemoveMetaExact(name string, expected Incarnation, key string) error
+}
+
+// ExactIncarnationRelaunchProvider atomically compares and warm-relaunches one
+// runtime incarnation. It is separate because not every provider supports a
+// warm-box relaunch at all.
+type ExactIncarnationRelaunchProvider interface {
+	RelaunchExact(ctx context.Context, name string, expected Incarnation, cfg Config) error
 }
 
 // LiveRuntime identifies a single agent runtime process discovered via
@@ -650,6 +774,12 @@ type Config struct {
 	// files are copied to workDir; for remote providers, files are
 	// transported into the session environment.
 	CopyFiles []CopyEntry
+
+	// ProjectHooksForbidden requires local staging and launch providers to
+	// omit project-scoped provider hook artifacts and fail closed if the real
+	// cwd or any ancestor can expose one. Only providers that can attest the
+	// target filesystem may accept this policy.
+	ProjectHooksForbidden bool
 
 	// FingerprintExtra carries additional config data that should
 	// participate in fingerprint comparison but isn't part of the session

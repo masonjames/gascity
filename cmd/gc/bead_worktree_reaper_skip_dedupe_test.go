@@ -27,7 +27,7 @@ func skipReasonsFor(t *testing.T, fake *events.Fake, worktreePath string) []stri
 		if err := json.Unmarshal(e.Payload, &p); err != nil {
 			t.Fatalf("unmarshal reap_skipped payload: %v", err)
 		}
-		if p.Path == worktreePath {
+		if pathutil.SamePath(p.Path, worktreePath) {
 			reasons = append(reasons, p.Reason)
 		}
 	}
@@ -38,10 +38,20 @@ func skipReasonsFor(t *testing.T, fake *events.Fake, worktreePath string) []stri
 // for worktreePath, so the log sink can be asserted on the same edge as the
 // event sink.
 func countStderrProtecting(stderr string, worktreePath string) int {
+	aliases := []string{worktreePath}
+	if resolved, err := filepath.EvalSymlinks(worktreePath); err == nil && resolved != worktreePath {
+		aliases = append(aliases, resolved)
+	}
 	n := 0
 	for _, line := range strings.Split(stderr, "\n") {
-		if strings.Contains(line, "protecting") && strings.Contains(line, worktreePath) {
-			n++
+		if !strings.Contains(line, "protecting") {
+			continue
+		}
+		for _, alias := range aliases {
+			if strings.Contains(line, alias) {
+				n++
+				break
+			}
 		}
 	}
 	return n

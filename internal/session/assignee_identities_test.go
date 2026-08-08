@@ -168,3 +168,105 @@ func TestAssigneeIdentifier(t *testing.T) {
 		})
 	}
 }
+
+func TestGuardedAssignmentCoLocatedWitnessUsesRawIdentityAndIncarnation(t *testing.T) {
+	info := Info{
+		ID:                      "session-1",
+		Type:                    BeadType,
+		Template:                "fixture/worker",
+		Alias:                   "worker-1",
+		SessionNameMetadata:     "session-worker-1",
+		ConfiguredNamedIdentity: "",
+		MetadataState:           "creating",
+		InstanceToken:           "instance-1",
+		Labels:                  []string{LabelSession, "agent:worker-1"},
+	}
+
+	got, err := GuardedAssignmentCoLocatedWitness(info)
+	if err != nil {
+		t.Fatalf("GuardedAssignmentCoLocatedWitness: %v", err)
+	}
+	want := &beads.AssignmentClaimCoLocatedWitness{
+		ID:             "session-1",
+		ExpectedStatus: "open",
+		ExpectedType:   BeadType,
+		RequiredLabels: []string{LabelSession},
+		ExpectedMetadata: map[string]string{
+			"instance_token": "instance-1",
+			"session_name":   "session-worker-1",
+			"state":          "creating",
+			"template":       "fixture/worker",
+			"alias":          "worker-1",
+		},
+		AbsentOrEmptyMetadata: []string{NamedSessionIdentityMetadata},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("witness = %#v, want %#v", got, want)
+	}
+}
+
+func TestGuardedAssignmentCoLocatedWitnessRejectsIncompleteSession(t *testing.T) {
+	valid := Info{
+		ID:                  "session-1",
+		Type:                BeadType,
+		Template:            "fixture/worker",
+		SessionNameMetadata: "session-worker-1",
+		MetadataState:       "creating",
+		InstanceToken:       "instance-1",
+		Labels:              []string{LabelSession},
+	}
+	tests := []struct {
+		name   string
+		mutate func(*Info)
+	}{
+		{name: "closed", mutate: func(i *Info) { i.Closed = true }},
+		{name: "wrong type", mutate: func(i *Info) { i.Type = "task" }},
+		{name: "missing session label", mutate: func(i *Info) { i.Labels = nil }},
+		{name: "missing template", mutate: func(i *Info) { i.Template = "" }},
+		{name: "missing session name", mutate: func(i *Info) { i.SessionNameMetadata = "" }},
+		{name: "missing instance token", mutate: func(i *Info) { i.InstanceToken = "" }},
+		{name: "missing lifecycle state", mutate: func(i *Info) { i.MetadataState = "" }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			info := valid
+			tt.mutate(&info)
+			if witness, err := GuardedAssignmentCoLocatedWitness(info); err == nil || witness != nil {
+				t.Fatalf("witness=%#v err=%v, want nil error result", witness, err)
+			}
+		})
+	}
+}
+
+func TestAssignmentReleaseCoLocatedMatchConfinesEverySessionIdentitySource(t *testing.T) {
+	got, err := AssignmentReleaseCoLocatedMatch("  worker-1  ")
+	if err != nil {
+		t.Fatalf("AssignmentReleaseCoLocatedMatch: %v", err)
+	}
+	want := &beads.CoLocatedMatchPredicate{
+		ExpectedStatus: "open",
+		ClassAnyOf: []beads.CoLocatedClassPredicate{
+			{ExpectedType: BeadType},
+			{RequiredLabels: []string{LabelSession}},
+		},
+		MatchValue: "worker-1",
+		MatchID:    true,
+		MetadataKeys: []string{
+			"session_name",
+			NamedSessionIdentityMetadata,
+			"alias",
+		},
+		DelimitedMetadataKeys: map[string]string{
+			aliasHistoryMetadataKey: ",",
+		},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("match = %#v, want %#v", got, want)
+	}
+}
+
+func TestAssignmentReleaseCoLocatedMatchRejectsEmptyAssignee(t *testing.T) {
+	if got, err := AssignmentReleaseCoLocatedMatch(" \t "); err == nil || got != nil {
+		t.Fatalf("match=%#v err=%v, want nil error result", got, err)
+	}
+}

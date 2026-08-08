@@ -267,6 +267,9 @@ func (c *CachingStore) cachedReadyCompleteOnly(ctx context.Context, query ReadyQ
 		if query.Assignee != "" && b.Assignee != query.Assignee {
 			continue
 		}
+		if query.excludesAnyLabel(b.Labels) {
+			continue
+		}
 		openBeads = append(openBeads, cloneBead(b))
 	}
 	depsByID := make(map[string][]Dep, len(openBeads))
@@ -298,6 +301,9 @@ func (c *CachingStore) cachedReadyLocked(query ReadyQuery) ([]Bead, error) {
 			continue
 		}
 		if query.Assignee != "" && b.Assignee != query.Assignee {
+			continue
+		}
+		if query.excludesAnyLabel(b.Labels) {
 			continue
 		}
 		openBeads = append(openBeads, cloneBead(b))

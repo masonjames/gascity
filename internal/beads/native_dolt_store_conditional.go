@@ -47,6 +47,7 @@ func (s *NativeDoltStore) CompareAndSetMetadataKey(id, key, expected, next strin
 	swapped := false
 	commitMsg := fmt.Sprintf("gc: compare-and-set metadata %s on bead %s", key, id)
 	err = storage.RunInTransaction(ctx, commitMsg, func(tx beadslib.Transaction) error {
+		swapped = false
 		issue, err := tx.GetIssue(ctx, id)
 		if err != nil {
 			return nativeStoreError(id, err)

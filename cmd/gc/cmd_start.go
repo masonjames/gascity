@@ -54,6 +54,24 @@ func standaloneBuildAgentsFnWithSessionBeads(
 	}
 }
 
+func standaloneBuildAgentsFnWithStores(
+	cityName, cityPath string,
+	beaconTime time.Time,
+	stderr io.Writer,
+) func(*config.City, runtime.Provider, beads.SessionStore, beads.WorkStore, map[string]beads.Store, *sessionBeadSnapshot, *sessionReconcilerTraceCycle) DesiredStateResult {
+	return func(
+		c *config.City,
+		currentSP runtime.Provider,
+		sessionStore beads.SessionStore,
+		canonicalWorkStore beads.WorkStore,
+		rigStores map[string]beads.Store,
+		sessionBeads *sessionBeadSnapshot,
+		trace *sessionReconcilerTraceCycle,
+	) DesiredStateResult {
+		return buildDesiredStateWithStores(cityName, cityPath, beaconTime, c, currentSP, sessionStore, canonicalWorkStore, rigStores, sessionBeads, trace, stderr)
+	}
+}
+
 // computeSuspendedNames builds a set of session names for agents marked
 // suspended in the config or runtime state, or belonging to suspended
 // rigs. Also includes all agents when the city itself is suspended.
@@ -836,7 +854,7 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 	})
 
 	// Validate agents.
-	if err := config.ValidateAgents(cfg.Agents); err != nil {
+	if err := config.ValidateCityAgents(cfg); err != nil {
 		fmt.Fprintf(stderr, "gc start: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
@@ -903,7 +921,7 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 	buildAgents := func(c *config.City, currentSP runtime.Provider, store beads.Store) DesiredStateResult {
 		return buildDesiredState(cityName, cityPath, beaconTime, c, currentSP, store, stderr)
 	}
-	buildAgentsWithSessionBeads := standaloneBuildAgentsFnWithSessionBeads(cityName, cityPath, beaconTime, stderr)
+	buildAgentsWithStores := standaloneBuildAgentsFnWithStores(cityName, cityPath, beaconTime, stderr)
 
 	recorder := events.Discard
 	var eventProv events.Provider // nil when events disabled or FileRecorder fails
@@ -932,7 +950,7 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 		poolDeathHandlers := computePoolDeathHandlers(cfg, cityName, cityPath, sp, stderr)
 		watchTargets := config.WatchTargets(prov, cfg, cityPath)
 		configRev := config.Revision(fsys.OSFS{}, prov, cfg, cityPath)
-		return runController(cityPath, tomlPath, cfg, configRev, buildAgents, buildAgentsWithSessionBeads, sp,
+		return runController(cityPath, tomlPath, cfg, configRev, buildAgents, buildAgentsWithStores, sp,
 			newDrainOps(sp), poolSessions, poolDeathHandlers, watchTargets, recorder, eventProv, stdout, stderr)
 	}
 
@@ -953,7 +971,7 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 		// Run adoption barrier before sync. The adoption barrier is purely
 		// session-class, so route it through the session coordination-class store,
 		// the same way the reconcile cascade's session arm routes via sessStore below.
-		result, passed := runAdoptionBarrier(cityPath, cliSessionFrontDoor(store, cfg, cityPath), sp, cfg, cityName, clock.Real{}, stderr, false)
+		result, passed := runAdoptionBarrierWithWorkStore(cityPath, cliSessionFrontDoor(store, cfg, cityPath), beads.WorkStore{Store: store}, sp, cfg, cityName, clock.Real{}, stderr, false)
 		if result.Adopted > 0 {
 			fmt.Fprintf(stdout, "Adopted %d running session(s) into bead store.\n", result.Adopted) //nolint:errcheck
 		}
@@ -967,23 +985,10 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 	}
 	rigStores := buildStandaloneRigStores(cfg, cityPath, stderr)
 
-	// Route the reconcile cascade's SESSION arm through the session coordination-class
-	// store so a [beads.classes.sessions] relocation reaches standalone start the same
-	// way it reaches the running controller — "same code path as the daemon"
-	// (CityRuntime.buildDesiredState / controlDispatcherTick, city_runtime.go), which
-	// passes sessionsBeadStore().Store as the LEADING store of
-	// buildDesiredStateWithSessionBeads and to loadSessionBeadSnapshot /
-	// syncSessionBeadsWithSnapshotAndRigStores / reconcileSessionBeadsAtPathWithNamedDemand,
-	// with rigStores as the per-rig WORK tail. That leading store is
-	// agentBuildParams.beadStore (creates/updates session beads) and the
-	// collectAllOpenSessionInfos "city" arm; it also still carries the city-work "city"
-	// arm (collectAssignedWorkBeadsWithStores / cold-wake scale-check probes) — a dual
-	// role the daemon routes to the session store today too, tracked as a shared E2
-	// two-store split. Identity to oneShotStore at the single-store backend, so
-	// byte-identical today. releaseOrphanedPoolAssignmentsWhenSnapshotsComplete keeps
-	// the plain oneShotStore, matching the daemon's cityBeadStore() there (its lone
-	// liveOpenSessionAssignmentExists session read is a shared work-release-boundary
-	// follow-up).
+	// Keep the SESSION and canonical city WORK class handles distinct through the
+	// standalone convergence cascade. They usually wrap one store, but a relocated
+	// session class must not turn matching bead IDs in independent stores into a
+	// strict ownership witness.
 	sessStore := cliSessionStore(oneShotStore, cfg, cityPath)
 
 	// One-shot bead reconciliation: same code path as the daemon.
@@ -994,37 +999,48 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 		sessionBeads = nil
 		sessionQueryPartial = true
 	}
-	dsResult := buildDesiredStateWithSessionBeads(cityName, cityPath, beaconTime, cfg, sp, sessStore, rigStores, sessionBeads, nil, stderr)
+	typedSessionStore := beads.SessionStore{Store: sessStore}
+	typedWorkStore := beads.WorkStore{Store: oneShotStore}
+	ownershipSessionBeads := filterStrictUnauthorizedSessionSnapshot(
+		cfg, cityPath, cityName, typedSessionStore, typedWorkStore, sessionBeads,
+	)
+	dsResult := buildDesiredStateWithStores(cityName, cityPath, beaconTime, cfg, sp, typedSessionStore, typedWorkStore, rigStores, ownershipSessionBeads, nil, stderr)
 	dsResult.SessionQueryPartial = dsResult.SessionQueryPartial || sessionQueryPartial
 	ds := dsResult.State
 	cfgNames := configuredSessionNamesWithSnapshot(cfg, cityName, sessionBeads)
-	_, sessionBeads = syncSessionBeadsWithSnapshotAndRigStores(
-		cityPath, beads.SessionStore{Store: sessStore}, rigStores, ds, sp, cfgNames, cfg, clock.Real{}, stderr, true, sessionBeads,
+	_, sessionBeads = syncSessionBeadsWithStores(
+		cityPath, typedSessionStore, typedWorkStore, rigStores, ds, sp, cfgNames, cfg, clock.Real{}, stderr, true, sessionBeads,
 	)
 
-	if released := releaseOrphanedPoolAssignmentsWhenSnapshotsComplete(oneShotStore, cfg, cityPath, sessionBeads.OpenInfos(), dsResult, rigStores); len(released) > 0 {
+	if released := releaseOrphanedPoolAssignmentsWhenSnapshotsCompleteWithStores(typedSessionStore, typedWorkStore, cfg, cityPath, sessionBeads.OpenInfos(), dsResult, rigStores); len(released) > 0 {
 		for _, r := range released {
 			fmt.Fprintf(stderr, "released orphaned pool work: %s\n", r.ID) //nolint:errcheck
 		}
 		// Standalone start has no follow-up patrol tick, so after reopening
 		// orphaned pool work we must immediately rebuild demand and sync once
 		// more so replacement session beads can be materialized in this run.
-		dsResult = buildDesiredStateWithSessionBeads(cityName, cityPath, beaconTime, cfg, sp, sessStore, rigStores, sessionBeads, nil, stderr)
+		ownershipSessionBeads = filterStrictUnauthorizedSessionSnapshot(
+			cfg, cityPath, cityName, typedSessionStore, typedWorkStore, sessionBeads,
+		)
+		dsResult = buildDesiredStateWithStores(cityName, cityPath, beaconTime, cfg, sp, typedSessionStore, typedWorkStore, rigStores, ownershipSessionBeads, nil, stderr)
 		ds = dsResult.State
 		cfgNames = configuredSessionNamesWithSnapshot(cfg, cityName, sessionBeads)
-		_, sessionBeads = syncSessionBeadsWithSnapshotAndRigStores(
-			cityPath, beads.SessionStore{Store: sessStore}, rigStores, ds, sp, cfgNames, cfg, clock.Real{}, stderr, true, sessionBeads,
+		_, sessionBeads = syncSessionBeadsWithStores(
+			cityPath, typedSessionStore, typedWorkStore, rigStores, ds, sp, cfgNames, cfg, clock.Real{}, stderr, true, sessionBeads,
 		)
 	}
 
 	dt := newDrainTracker()
-	openInfos := sessionBeads.OpenInfos()
+	ownershipSessionBeads = filterStrictUnauthorizedSessionSnapshot(
+		cfg, cityPath, cityName, typedSessionStore, typedWorkStore, sessionBeads,
+	)
+	openInfos := ownershipSessionBeads.OpenInfos()
 	poolWorkBeads := filterAssignedWorkBeadsForPoolDemand(cfg, cityPath, openInfos, dsResult.AssignedWorkBeads, dsResult.AssignedWorkStoreRefs)
 	poolDesired := retainScaleCheckPartialPoolDesired(
 		cfg,
 		PoolDesiredCounts(ComputePoolDesiredStates(
 			cfg, poolWorkBeads, openInfos, dsResult.ScaleCheckCounts)),
-		sessionBeads,
+		ownershipSessionBeads,
 		effectivePoolPartialRetentionTemplates(dsResult),
 	)
 	if poolDesired == nil {
@@ -1033,7 +1049,7 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 	mergeNamedSessionDemand(poolDesired, dsResult.NamedSessionDemand, cfg)
 	awakeAssignedWorkBeads, awakeAssignedStoreRefs := filterAssignedWorkBeadsForSessionWake(cfg, cityPath, openInfos, dsResult.AssignedWorkBeads, dsResult.AssignedWorkStoreRefs)
 	reconcileSessionBeadsAtPathWithNamedDemand(
-		sigCtx, cityPath, sessionBeads.OpenForReconcile(), sessionBeads, ds, cfgNames, cfg, sp, sessStore,
+		sigCtx, cityPath, ownershipSessionBeads.OpenForReconcile(), sessionBeads, ds, cfgNames, cfg, sp, sessStore,
 		nil, awakeAssignedWorkBeads, rigStores, nil, dt, nil, poolDesired,
 		dsResult.NamedSessionDemand,
 		dsResult.NamedSessionRoutedDemand,
@@ -1042,6 +1058,7 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 		nil, clock.Real{}, recorder, cfg.Session.StartupTimeoutDuration(), 0,
 		stdout, stderr,
 		withReadyAssignedFlags(readyAssignedFlagsForBeads(dsResult.ReadyAssigned, awakeAssignedWorkBeads, awakeAssignedStoreRefs)),
+		withCanonicalCityWorkStore(beads.WorkStore{Store: oneShotStore}),
 	)
 
 	// Post-reconcile sync: update bead state to reflect post-start reality.
@@ -1050,11 +1067,14 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 		fmt.Fprintf(stderr, "gc start: loading session beads: %v\n", err) //nolint:errcheck
 		sessionBeads = nil
 	}
-	dsResult = buildDesiredStateWithSessionBeads(cityName, cityPath, beaconTime, cfg, sp, sessStore, rigStores, sessionBeads, nil, stderr)
+	ownershipSessionBeads = filterStrictUnauthorizedSessionSnapshot(
+		cfg, cityPath, cityName, typedSessionStore, typedWorkStore, sessionBeads,
+	)
+	dsResult = buildDesiredStateWithStores(cityName, cityPath, beaconTime, cfg, sp, typedSessionStore, typedWorkStore, rigStores, ownershipSessionBeads, nil, stderr)
 	ds = dsResult.State
 	cfgNames = configuredSessionNamesWithSnapshot(cfg, cityName, sessionBeads)
-	syncSessionBeadsWithSnapshotAndRigStores(
-		cityPath, beads.SessionStore{Store: sessStore}, rigStores, ds, sp, cfgNames, cfg, clock.Real{}, stderr, false, sessionBeads,
+	syncSessionBeadsWithStores(
+		cityPath, typedSessionStore, typedWorkStore, rigStores, ds, sp, cfgNames, cfg, clock.Real{}, stderr, false, sessionBeads,
 	)
 
 	fmt.Fprintln(stdout, "City started.") //nolint:errcheck // best-effort stdout
@@ -1227,13 +1247,18 @@ func stageHookFiles(copyFiles []runtime.CopyEntry, cityPath, workDir string, hoo
 		}
 	}
 
-	providerSet := hookProviderSet(hookProviders)
-	// workDir-based hooks: gemini, codex, antigravity, opencode, mimocode, copilot, cursor, pi, omp, kimi.
-	for _, provider := range orderedWorkDirHookProviders {
-		if !providerSet[provider.name] {
+	seenPaths := make(map[string]bool)
+	// Workdir-based hooks come from hooks' canonical artifact registry. Claude
+	// is handled below because its active settings source is city-scoped.
+	for _, provider := range hookProviders {
+		if strings.TrimSpace(provider) == "claude" {
 			continue
 		}
-		for _, rel := range provider.relPaths {
+		for _, rel := range hooks.ProjectHookArtifactPaths(provider) {
+			if seenPaths[rel] {
+				continue
+			}
+			seenPaths[rel] = true
 			abs := filepath.Join(workDir, rel)
 			if _, err := os.Stat(abs); err == nil {
 				copyFiles = append(copyFiles, runtime.CopyEntry{
@@ -1280,30 +1305,6 @@ func stageHookFiles(copyFiles []runtime.CopyEntry, cityPath, workDir string, hoo
 	return copyFiles
 }
 
-type workDirHookProvider struct {
-	name     string
-	relPaths []string
-}
-
-var orderedWorkDirHookProviders = []workDirHookProvider{
-	{name: "gemini", relPaths: []string{path.Join(".gemini", "settings.json")}},
-	{name: "codex", relPaths: []string{path.Join(".codex", "hooks.json")}},
-	{name: "antigravity", relPaths: []string{path.Join(".agents", "hooks.json")}},
-	{name: "opencode", relPaths: []string{path.Join(".opencode", "plugins", "gascity.js")}},
-	{name: "mimocode", relPaths: []string{path.Join(".mimocode", "plugin", "gascity.js")}},
-	{name: "copilot", relPaths: []string{
-		path.Join(".github", "hooks", "gascity.json"),
-		path.Join(".github", "copilot-instructions.md"),
-	}},
-	{name: "cursor", relPaths: []string{path.Join(".cursor", "hooks.json")}},
-	{name: "pi", relPaths: []string{path.Join(".pi", "extensions", "gc-hooks.js")}},
-	{name: "omp", relPaths: []string{path.Join(".omp", "hooks", "gc-hook.ts")}},
-	{name: "kimi", relPaths: []string{
-		path.Join(".kimi", "config.toml"),
-		path.Join(".kimi", "hooks", "gascity-session-start.py"),
-	}},
-}
-
 func hookFileProvidersForResolved(resolved *config.ResolvedProvider, installHooks []string, providers map[string]config.ProviderSpec) []string {
 	var out []string
 	appendProvider := func(name string) {
@@ -1325,17 +1326,6 @@ func hookFileProvidersForResolved(resolved *config.ResolvedProvider, installHook
 	for _, hook := range installHooks {
 		appendProvider(hook)
 		appendProvider(config.BuiltinFamily(hook, providers))
-	}
-	return out
-}
-
-func hookProviderSet(providers []string) map[string]bool {
-	out := make(map[string]bool, len(providers))
-	for _, provider := range providers {
-		provider = strings.TrimSpace(provider)
-		if provider != "" {
-			out[provider] = true
-		}
 	}
 	return out
 }
@@ -1383,7 +1373,14 @@ func resolveConfiguredWorkDir(cityPath, cityName, qualifiedName string, a *confi
 	if strings.TrimSpace(qualifiedName) == "" {
 		qualifiedName = a.QualifiedName()
 	}
-	workDir, err := workdirutil.ResolveWorkDirPathStrict(cityPath, cityName, qualifiedName, *a, rigs)
+	var forbiddenDiscoveryRoots []string
+	if a.ForbidsProjectHooks() {
+		// Supplying a locally attested discovery root opts the workdir package
+		// into canonical external/per-instance isolation. The helper also adds
+		// every city, rig, agent-dir, and enclosing repository root.
+		forbiddenDiscoveryRoots = []string{cityPath}
+	}
+	workDir, err := workdirutil.ResolveWorkDirPathStrict(cityPath, cityName, qualifiedName, *a, rigs, forbiddenDiscoveryRoots...)
 	if err != nil {
 		return "", err
 	}

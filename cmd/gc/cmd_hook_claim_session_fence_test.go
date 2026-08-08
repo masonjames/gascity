@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/session"
 )
@@ -27,6 +28,21 @@ name = "test-city"
 
 [[agent]]
 name = "worker"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return cityDir
+}
+
+func writeFenceTestForbidCity(t *testing.T) string {
+	t.Helper()
+	cityDir := writeFenceTestCity(t)
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(`[workspace]
+name = "test-city"
+
+[[agent]]
+name = "worker"
+project_hooks = "forbid"
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -86,6 +102,22 @@ func setFenceClaimEnv(t *testing.T, cityDir, sessionID, instanceToken string) {
 	t.Setenv("GC_SESSION_NAME", "worker-1")
 	t.Setenv("GC_SESSION_ORIGIN", "ephemeral")
 	t.Setenv("GC_INSTANCE_TOKEN", instanceToken)
+	t.Setenv("GC_TRIGGER_BEAD_ID", "")
+	t.Setenv("GC_TRIGGER_BEAD_STORE_REF", "")
+}
+
+func setFenceSessionTrigger(t *testing.T, cityDir, sessionID, beadID, storeRef string) {
+	t.Helper()
+	store, err := openCityStoreAt(cityDir)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	if err := store.Update(sessionID, beads.UpdateOpts{Metadata: map[string]string{
+		beadmeta.TriggerBeadIDMetadataKey:       beadID,
+		beadmeta.TriggerBeadStoreRefMetadataKey: storeRef,
+	}}); err != nil {
+		t.Fatalf("persist session trigger: %v", err)
+	}
 }
 
 // TestHookCommandClaimStaleSessionDrainsBeforeWorkQuery proves a definitively
@@ -288,14 +320,13 @@ func TestHookCommandClaimAbsentSessionBeadDrainsStale(t *testing.T) {
 	}
 }
 
-// TestHookCommandClaimFailsOpenOnSessionStoreError proves a GENUINE session-store
-// fault — here a corrupt/unreadable store file, so the fence's store open itself
-// fails — is NOT mislabeled as a stale session: the fence fails open and lets the
-// normal claim path run, which surfaces and escalates its own store errors. This
-// is the counterpart to the absent-bead case above: a confirmed-missing bead
-// drains stale, but an infrastructure fault must never refuse a possibly-healthy
-// worker.
-func TestHookCommandClaimFailsOpenOnSessionStoreError(t *testing.T) {
+// TestHookCommandClaimFailsClosedOnSessionStoreError proves a GENUINE
+// session-store fault — here a corrupt/unreadable store file, so the fence's
+// store open itself fails — stops before the work query. A runtime that cannot
+// authoritatively prove its current session incarnation must not mutate work.
+// Unlike a confirmed stale session, this operational refusal emits no terminal
+// drain or drain acknowledgement; the caller may retry once the store recovers.
+func TestHookClaimSessionFenceStoreErrorFailsClosedBeforeWorkQuery(t *testing.T) {
 	clearGCEnv(t)
 	disableManagedDoltRecoveryForTest(t)
 	t.Setenv("GC_BEADS", "file")
@@ -312,23 +343,144 @@ func TestHookCommandClaimFailsOpenOnSessionStoreError(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := cmdHookWithOptions(nil, hookCommandOptions{Claim: true, JSON: true}, &stdout, &stderr)
 
-	if _, err := os.Stat(queryMarker); err != nil {
-		t.Fatalf("fail-open did not reach the work query: %v; stderr=%s", err, stderr.String())
+	if _, err := os.Stat(queryMarker); !os.IsNotExist(err) {
+		t.Fatalf("session-store error reached the work query; stat error=%v; stderr=%s", err, stderr.String())
 	}
 	if strings.Contains(stderr.String(), "refusing stale session") {
 		t.Fatalf("store fault was mislabeled as a stale session: %s", stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "session fence unavailable") {
-		t.Fatalf("stderr = %q, want fence-unavailable diagnostic", stderr.String())
+	if !strings.Contains(stderr.String(), "session fence unavailable") ||
+		!strings.Contains(stderr.String(), "refusing claim") {
+		t.Fatalf("stderr = %q, want fail-closed fence-unavailable diagnostic", stderr.String())
 	}
 	if code != 1 {
 		t.Fatalf("code = %d, want 1 (JSON no-work drain without --drain-ack)", code)
 	}
 }
 
+func TestHookCommandClaimPersistedTriggerMissingFromEnvironmentStopsBeforeWorkQuery(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+	t.Setenv("GC_BEADS", "file")
+	cityDir := writeFenceTestForbidCity(t)
+	sessionID := newFenceSessionBead(t, cityDir, session.StateActive, "current-token")
+	setFenceSessionTrigger(t, cityDir, sessionID, "work-expected", "city:test-city")
+	queryMarker := installFenceWorkQueryProbe(t)
+	setFenceClaimEnv(t, cityDir, sessionID, "current-token")
+
+	var stdout, stderr bytes.Buffer
+	code := cmdHookWithOptions(nil, hookCommandOptions{Claim: true, DrainAck: true, JSON: true}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("code = %d, want 1; stdout=%q stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want no drain result or acknowledgement", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "persisted trigger is missing from the runtime environment") {
+		t.Fatalf("stderr = %q, want missing-trigger refusal", stderr.String())
+	}
+	if _, err := os.Stat(queryMarker); !os.IsNotExist(err) {
+		t.Fatalf("missing trigger reached the work query; stat error=%v", err)
+	}
+}
+
+func TestHookCommandClaimProjectHooksForbidTokenlessSessionStopsBeforeQueryOrMutation(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+	t.Setenv("GC_BEADS", "file")
+	cityDir := writeFenceTestForbidCity(t)
+	sessionID := newFenceSessionBead(t, cityDir, session.StateActive, "")
+	store, err := openCityStoreAt(cityDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	work, err := store.Create(beads.Bead{
+		ID:     "work-tokenless-forbid",
+		Title:  "routed work must remain untouched",
+		Type:   "task",
+		Status: "open",
+		Metadata: map[string]string{
+			beadmeta.RoutedToMetadataKey: "worker",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeWork, err := store.Get(work.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeSession, err := store.Get(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	queryMarker := installFenceWorkQueryProbe(t)
+	setFenceClaimEnv(t, cityDir, sessionID, "")
+
+	var stdout, stderr bytes.Buffer
+	code := cmdHookWithOptions(nil, hookCommandOptions{Claim: true, DrainAck: true, JSON: true}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("code = %d, want fail-closed 1; stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want no claim or drain result", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "project_hooks=forbid") || !strings.Contains(stderr.String(), "exact trigger") {
+		t.Fatalf("stderr = %q, want forbid exact-trigger refusal", stderr.String())
+	}
+	if _, err := os.Stat(queryMarker); !os.IsNotExist(err) {
+		t.Fatalf("tokenless forbid session reached work query: stat err=%v", err)
+	}
+	afterWork, err := store.Get(work.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterWork.Revision != beforeWork.Revision || afterWork.Status != beforeWork.Status || afterWork.Assignee != beforeWork.Assignee {
+		t.Fatalf("routed work mutated: before=%+v after=%+v", beforeWork, afterWork)
+	}
+	afterSession, err := store.Get(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterSession.Revision != beforeSession.Revision {
+		t.Fatalf("session mutated by refusal: before revision=%d after=%d", beforeSession.Revision, afterSession.Revision)
+	}
+}
+
+func TestHookCommandClaimInheritSessionHonorsPersistedTriggerBeforeGenericQuery(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+	t.Setenv("GC_BEADS", "file")
+	cityDir := writeFenceTestCity(t)
+	sessionID := newFenceSessionBead(t, cityDir, session.StateActive, "current-token")
+	setFenceSessionTrigger(t, cityDir, sessionID, "work-controller-selected", "city:test-city")
+	queryMarker := installFenceWorkQueryProbe(t)
+	setFenceClaimEnv(t, cityDir, sessionID, "current-token")
+	t.Setenv("GC_TRIGGER_BEAD_ID", "work-controller-selected")
+	t.Setenv("GC_TRIGGER_BEAD_STORE_REF", "city:test-city")
+
+	var stdout, stderr bytes.Buffer
+	code := cmdHookWithOptions(nil, hookCommandOptions{Claim: true, JSON: true}, &stdout, &stderr)
+
+	if _, err := os.Stat(queryMarker); !os.IsNotExist(err) {
+		t.Fatalf("inherit session ran generic work query instead of exact trigger path: stat err=%v", err)
+	}
+	if !strings.Contains(stderr.String(), "refusing trigger work-controller-selected in city:test-city") || !strings.Contains(stderr.String(), "bead not found") {
+		t.Fatalf("stderr = %q, want exact trigger lookup refusal", stderr.String())
+	}
+	if code != 1 {
+		t.Fatalf("code = %d, want exact-trigger refusal 1; stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want no generic no-work result", stdout.String())
+	}
+}
+
 // TestClassifyHookClaimSessionLookupError exercises the error taxonomy that
 // decides whether a failed session lookup is a definitive identity failure
-// (stale, drain) or a transient store fault (unavailable, fail open). The two
+// (stale, drain) or a transient store fault (unavailable, fail closed). The two
 // confirmed-identity errors mirror the documented session.Store.Get contract: a
 // confirmed-absent id wraps beads.ErrNotFound, a present-but-non-session id is
 // session.ErrSessionNotFound.
@@ -352,7 +504,7 @@ func TestClassifyHookClaimSessionLookupError(t *testing.T) {
 			wantMsg: "non-session",
 		},
 		{
-			name:    "genuine store read fault fails open",
+			name:    "genuine store read fault is unavailable",
 			err:     fmt.Errorf("loading session %q: %w", "s", errors.New("dial tcp: connection refused")),
 			want:    hookClaimSessionStoreUnavailable,
 			wantMsg: "loading session bead",

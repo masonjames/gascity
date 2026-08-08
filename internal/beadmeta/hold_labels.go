@@ -19,3 +19,17 @@ const (
 // ready) are hold-transparent by design and must never filter on this list
 // (ga-5736js).
 var DispatchHoldLabels = []string{HoldMayorLabel, HoldExternalLabel}
+
+// HasDispatchHoldLabel reports whether labels contain a canonical hold that
+// suppresses route-scoped, unassigned automatic dispatch. Callers use this
+// role-neutral predicate instead of branching on a particular hold actor.
+func HasDispatchHoldLabel(labels []string) bool {
+	for _, candidate := range labels {
+		for _, hold := range DispatchHoldLabels {
+			if candidate == hold {
+				return true
+			}
+		}
+	}
+	return false
+}
